@@ -1,0 +1,33 @@
+# Extended US ETF universe — core ETFs plus a few communication, international,
+# and mid-duration bond ETFs. Useful as a slightly broader test universe.
+name: us_core_etfs_extended
+description: "Extended US-ETF list with communication, international, and mid-term bond ETFs. Test universe."
+timeframe: 1d
+provider: openbb_yfinance
+# Inherits the survivorship characteristics of us_core_etfs plus a handful of
+# international and mid-term-bond ETFs that are also currently listed.
+delisted_included: true
+point_in_time: false
+symbols:
+  # Core us_core_etfs
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - XLK
+  - XLF
+  - XLE
+  - XLV
+  - XLI
+  - XLY
+  - XLP
+  - XLU
+  - XLB
+  - XLRE
+  - GLD
+  - TLT
+  # Additions
+  - XLC   # Communication Services (sector gap)
+  - EFA   # MSCI EAFE (Europe, Australasia, Asia) — international
+  - EEM   # MSCI Emerging Markets — diversification
+  - IEF   # 7-10y Treasuries — mid duration between TLT and SHY

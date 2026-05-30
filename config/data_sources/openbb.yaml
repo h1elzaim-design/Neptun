@@ -1,0 +1,24 @@
+# OpenBB Provider-Konfiguration. API-Keys kommen aus .env, nicht hierher.
+
+default_provider: yfinance
+
+providers:
+  yfinance:
+    notes: "Kostenlos, kein Key. Gut für Prototyping. Nicht für Produktion."
+    adjusted: true
+    rate_limit_per_minute: 2000
+
+  fmp:
+    notes: "Financial Modeling Prep. Brauchbar für Aktien und Fundamentals."
+    requires_env: OPENBB_FMP_API_KEY
+    adjusted: true
+
+  polygon:
+    notes: "Höhere Datenqualität, Intraday möglich. Bezahlt."
+    requires_env: OPENBB_POLYGON_API_KEY
+    adjusted: true
+
+  intrinio:
+    notes: "Saubere Tick-Daten. Bezahlt."
+    requires_env: OPENBB_INTRINIO_API_KEY
+    adjusted: true

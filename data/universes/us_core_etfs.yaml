@@ -1,0 +1,33 @@
+# Kern-Universum für Phase 1. Breite US-ETFs, hochliquide, saubere Daten.
+name: us_core_etfs
+description: "Breite US-Aktien-ETFs für robuste Daily-Strategien."
+timeframe: 1d
+provider: openbb_yfinance
+# All 16 listed are still trading at the time of audit. Survivorship bias is
+# negligible for the broad-market and sector-SPDR ETFs (no major ETF in this
+# basket has been liquidated in the relevant backtest window 2005-2024).
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-05-15
+source_notes: |
+  US ETF basket — historically stable, no liquidations among the listed
+  symbols in the backtest period. point_in_time is false because constituents
+  of the underlying indices have rotated over time; if you need that level of
+  fidelity, use a Russell PIT universe.
+symbols:
+  - SPY   # S&P 500
+  - QQQ   # Nasdaq 100
+  - IWM   # Russell 2000
+  - DIA   # Dow Jones
+  - XLK   # Tech
+  - XLF   # Financials
+  - XLE   # Energy
+  - XLV   # Health Care
+  - XLI   # Industrials
+  - XLY   # Consumer Discretionary
+  - XLP   # Consumer Staples
+  - XLU   # Utilities
+  - XLB   # Materials
+  - XLRE  # Real Estate
+  - GLD   # Gold
+  - TLT   # Long Bonds

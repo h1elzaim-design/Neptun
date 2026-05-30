@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Envs
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Databases — never commit dumps or local DB files
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+
+# Editor temp/backup files
+*~
+.*.swp
+.*.swo
+*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Data — never commit market data or generated artifacts
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+backtests/results/*
+!backtests/results/.gitkeep
+reports/*
+!reports/.gitkeep
+strategies/generated/*
+!strategies/generated/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

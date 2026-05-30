@@ -1,0 +1,146 @@
+# Strategy catalog — metadata for the textbook templates shipped with Neptun.
+#
+# Every entry here maps to a public, published-literature template in
+# strategies/templates/. Nothing in this file is proprietary: these are the
+# standard, well-documented strategies any quant textbook describes. Add an
+# entry when you add a new *public* template; keep private strategies out.
+#
+# Schema per entry:
+#   display_name / category / description / tags
+#   parameters: [{name, type, default, range, help}]
+#   presets:    [{name, params, note}]
+
+sma_crossover:
+  display_name: "SMA Crossover"
+  category: trend
+  description: >-
+    Classic trend follower: go long when the fast SMA crosses above the slow
+    SMA, exit on the cross down. Works in clear trends, whipsaws in chop.
+  tags: [trend, classic, beginner]
+  parameters:
+    - { name: fast, type: int, default: 50, range: [5, 200], help: "Fast SMA period" }
+    - { name: slow, type: int, default: 200, range: [50, 400], help: "Slow SMA period" }
+  presets:
+    - { name: "Classic 50/200", params: { fast: 50, slow: 200 }, note: "Textbook, slow but robust" }
+    - { name: "Short-term 5/20", params: { fast: 5, slow: 20 }, note: "Reacts fast, more whipsaws" }
+
+ema_crossover:
+  display_name: "EMA Crossover"
+  category: trend
+  description: >-
+    Like SMA crossover but exponentially weighted, so it reacts faster to trend
+    changes (and whipsaws more at small fast periods).
+  tags: [trend, classic, beginner]
+  parameters:
+    - { name: fast, type: int, default: 12, range: [3, 100], help: "Fast EMA span" }
+    - { name: slow, type: int, default: 26, range: [10, 300], help: "Slow EMA span" }
+  presets:
+    - { name: "MACD-style 12/26", params: { fast: 12, slow: 26 }, note: "Faster than SMA 50/200" }
+
+macd:
+  display_name: "MACD"
+  category: trend
+  description: >-
+    Long when the MACD line (EMA fast - EMA slow) crosses above its signal EMA,
+    exit on the cross down. Standard 12/26/9.
+  tags: [trend, classic, momentum]
+  parameters:
+    - { name: fast, type: int, default: 12, range: [3, 50], help: "Fast EMA span" }
+    - { name: slow, type: int, default: 26, range: [10, 200], help: "Slow EMA span" }
+    - { name: signal, type: int, default: 9, range: [3, 50], help: "Signal EMA span" }
+  presets:
+    - { name: "Classic 12/26/9", params: { fast: 12, slow: 26, signal: 9 }, note: "Textbook setup" }
+
+rsi_2:
+  display_name: "RSI(2) Mean Reversion"
+  category: mean_reversion
+  description: >-
+    Larry Connors setup: long when RSI(2) is oversold, exit when it recovers.
+    An optional SMA(200) trend filter cuts false signals in bear markets.
+  tags: [mean_reversion, short_term, connors]
+  parameters:
+    - { name: period, type: int, default: 2, range: [2, 14], help: "RSI period" }
+    - { name: entry_rsi, type: float, default: 10.0, range: [5.0, 40.0], help: "Long-entry RSI threshold" }
+    - { name: exit_rsi, type: float, default: 70.0, range: [50.0, 95.0], help: "Exit RSI threshold" }
+    - { name: trend_sma, type: int, default: 200, range: [0, 400], help: "Trend filter SMA (0 = off)" }
+  presets:
+    - { name: "Connors RSI(2) Classic", params: { period: 2, entry_rsi: 10.0, exit_rsi: 70.0, trend_sma: 200 }, note: "Original with trend filter" }
+
+bollinger_bands:
+  display_name: "Bollinger Bands"
+  category: mean_reversion
+  description: >-
+    Long when close < lower band (SMA - k*StdDev), exit on touch of the middle.
+    Classic volatility mean-reversion.
+  tags: [mean_reversion, volatility, classic]
+  parameters:
+    - { name: lookback, type: int, default: 20, range: [5, 100], help: "SMA / StdDev period" }
+    - { name: k, type: float, default: 2.0, range: [1.0, 4.0], help: "Std deviations for the bands" }
+  presets:
+    - { name: "Classic 20/2", params: { lookback: 20, k: 2.0 }, note: "Textbook setup" }
+
+mean_reversion:
+  display_name: "Mean Reversion (Z-Score)"
+  category: mean_reversion
+  description: >-
+    Bets that extreme prices revert to the mean. Long below the lower z-band,
+    exit at the middle. Works in range-bound markets, dangerous in strong trends.
+  tags: [mean_reversion, volatility, intermediate]
+  parameters:
+    - { name: lookback, type: int, default: 20, range: [5, 100], help: "Window for mean + StdDev" }
+    - { name: entry_z, type: float, default: 2.0, range: [0.5, 4.0], help: "Z-score entry threshold" }
+    - { name: exit_z, type: float, default: 0.0, range: [-1.0, 1.0], help: "Z-score to close (0 = mean)" }
+  presets:
+    - { name: "Conservative 20/2σ", params: { lookback: 20, entry_z: 2.0, exit_z: 0.0 }, note: "Classic" }
+
+donchian_breakout:
+  display_name: "Donchian Breakout"
+  category: breakout
+  description: >-
+    Long on a break above the N-day high, exit on a break below the N-day low.
+    The classic Turtle Traders trend-following approach.
+  tags: [breakout, trend, turtle]
+  parameters:
+    - { name: entry_period, type: int, default: 20, range: [10, 100], help: "N-day high for entry" }
+    - { name: exit_period, type: int, default: 10, range: [5, 50], help: "N-day low for exit" }
+  presets:
+    - { name: "Turtle Classic 20/10", params: { entry_period: 20, exit_period: 10 }, note: "Original Turtle system" }
+
+atr_breakout:
+  display_name: "ATR Channel Breakout"
+  category: breakout
+  description: >-
+    Long when close > SMA(n) + k*ATR(n), exit when close < SMA(n) - k*ATR(n).
+    More robust than Donchian because channels adapt to volatility.
+  tags: [breakout, volatility, intermediate]
+  parameters:
+    - { name: lookback, type: int, default: 20, range: [5, 100], help: "SMA and ATR period" }
+    - { name: k, type: float, default: 2.0, range: [0.5, 4.0], help: "ATR multiplier for channels" }
+  presets:
+    - { name: "Keltner-style 20/2", params: { lookback: 20, k: 2.0 }, note: "Similar to Keltner channels" }
+
+momentum_12_1:
+  display_name: "Cross-Sectional Momentum (12-1)"
+  category: factor
+  description: >-
+    Jegadeesh/Titman momentum: long the top X% of assets by return over the
+    lookback minus the most recent skip window. Needs a universe of >= 10 names.
+  tags: [momentum, factor, cross_sectional]
+  parameters:
+    - { name: lookback, type: int, default: 252, range: [60, 504], help: "Lookback in trading days (252 = 12m)" }
+    - { name: skip, type: int, default: 21, range: [0, 63], help: "Skip window in days (21 = 1m reversal filter)" }
+    - { name: top_quantile, type: float, default: 0.3, range: [0.1, 0.5], help: "Top fraction to go long" }
+  presets:
+    - { name: "Classic 12-1 Top30%", params: { lookback: 252, skip: 21, top_quantile: 0.3 }, note: "Standard academic setup" }
+
+buy_and_hold:
+  display_name: "Buy & Hold (Baseline)"
+  category: baseline
+  description: >-
+    Mandatory benchmark: buy on day one, hold to the end. If your "edge" can't
+    beat buy & hold, it isn't an edge. Use it for clean Sharpe / CAGR / MaxDD
+    comparisons.
+  tags: [baseline, benchmark, mandatory]
+  parameters: []
+  presets:
+    - { name: "Default", params: {}, note: "No parameters — pure hold" }

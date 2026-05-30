@@ -1,0 +1,33 @@
+# governance.yaml — EXAMPLE evaluation config for the Neptun framework.
+#
+# These are ILLUSTRATIVE defaults so the engine runs out of the box. They are
+# NOT a recommendation and NOT anyone's production thresholds. The weights and
+# targets you actually use to judge strategies are part of your private research
+# edge — keep your real ones in your own private config, not in a public repo.
+#
+# Schema consumed by quantrace/evaluation.py:
+#   score_weights : relative weight of each of the six score dimensions
+#   targets       : reference points used to normalize each dimension
+#   guardrails    : hard pass/fail thresholds
+
+score_weights:
+  performance: 0.25
+  risk: 0.20
+  stability: 0.15
+  realism: 0.10
+  generalization: 0.20
+  simplicity: 0.10
+
+targets:
+  sharpe: 1.0
+  cagr: 0.10
+  max_drawdown: -0.30
+  min_fees_bps: 2.0
+  min_slippage_bps: 3.0
+  max_params: 6
+
+guardrails:
+  min_sharpe: 0.5
+  min_trades: 30
+  max_drawdown_floor: -0.6
+  require_oos: true
