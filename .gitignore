@@ -52,3 +52,7 @@ strategies/generated/*
 # OS
 .DS_Store
 Thumbs.db
+
+# Obsidian — plugin state that carries secrets must never be tracked:
+# obsidian-local-rest-api's data.json holds the REST API key + a TLS private key.
+.obsidian/plugins/*/data.json

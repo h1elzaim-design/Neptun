@@ -19,7 +19,8 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from quantrace.data_agent import load_universe
+from quantrace import strategy_registry
+from quantrace.data_agent import close_prices, load_universe
 from quantrace.models import BacktestConfig, StrategySpec, Timeframe, WalkForwardResult
 from quantrace.sweep import SweepResult
 from quantrace.sweep import sweep as run_sweep
@@ -42,7 +43,10 @@ def fetch(
     universe: str = typer.Option(..., help="Name in data/universes/*.yaml"),
     start: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
     end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
-    provider: str = typer.Option("yfinance"),
+    provider: str | None = typer.Option(
+        None,
+        help="OpenBB-Provider: yfinance, tiingo, fmp, polygon. Default: TIINGO_TOKEN gesetzt → tiingo, sonst yfinance.",
+    ),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """Lädt ein Universum über OpenBB und cached es."""
@@ -64,18 +68,44 @@ def fetch(
 
 @app.command()
 def backtest(
-    strategy: str = typer.Option(..., help="z.B. sma_crossover, mean_reversion"),
+    strategy: str = typer.Option(
+        "", help="z.B. sma_crossover, mean_reversion, buy_and_hold"
+    ),
+    graph_spec: str = typer.Option(
+        "",
+        "--graph-spec",
+        help="Slug einer Graph-Strategie aus 02 Strategien/ (visueller Builder). "
+        "Alternative zu --strategy.",
+    ),
     universe: str = typer.Option(...),
     start: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
     end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
-    fast: int = typer.Option(20),
-    slow: int = typer.Option(100),
-    lookback: int = typer.Option(20),
-    entry_z: float = typer.Option(2.0),
-    exit_z: float = typer.Option(0.0),
+    fast: int = typer.Option(20, hidden=True),
+    slow: int = typer.Option(100, hidden=True),
+    lookback: int = typer.Option(20, hidden=True),
+    entry_z: float = typer.Option(2.0, hidden=True),
+    exit_z: float = typer.Option(0.0, hidden=True),
+    param_json: str = typer.Option(
+        "",
+        "--params",
+        help='JSON-Strategie-Params, z.B. \'{"fast": 20, "slow": 100}\'. '
+        "Überschreibt die typisierten Optionen und gilt für alle Strategien.",
+    ),
+    cost_model: str = typer.Option(
+        "flat",
+        help="Kostenmodell: 'flat' (fees/slippage global) oder "
+        "'per_asset_class' (config/costs.yaml, pro Symbol)",
+    ),
+    capital_model: str = typer.Option(
+        "shared",
+        help="Kapitalmodell: 'shared' (ein Konto, Equal-Weight über aktive "
+        "Positionen) oder 'independent' (Alt: unabhängige Sleeves, Mittelwert)",
+    ),
     out: Path = typer.Option(Path("backtests/results"), help="Ergebnis-Verzeichnis"),
 ) -> None:
     """Führt einen Backtest aus und schreibt das Ergebnis als JSON."""
+    import json as _json
+
     from quantrace.backtest_runner import run_backtest
 
     cfg = _load_universe_yaml(universe)
@@ -87,8 +117,22 @@ def backtest(
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
     )
 
-    strategy_id, spec = _build_spec(strategy, universe, cfg, fast, slow, lookback, entry_z, exit_z)
-    result = run_backtest(spec, md, BacktestConfig())
+    if param_json:
+        params = _json.loads(param_json)
+    else:
+        params = _legacy_params(strategy, fast, slow, lookback, entry_z, exit_z)
+    strategy_id, spec = _resolve_spec(strategy, graph_spec, universe, cfg, params)
+    result = run_backtest(spec, md, _backtest_config(cost_model, capital_model))
+
+    # Attach regime-conditioned performance metrics while equity_curve is in memory.
+    if result.equity_curve is not None:
+        try:
+            from quantrace.regime.backtesting import regime_conditioned_metrics
+
+            rm = regime_conditioned_metrics(result.equity_curve, close_prices(md))
+            result = result.model_copy(update={"regime_metrics": rm})
+        except Exception as _re:
+            logging.getLogger(__name__).warning("regime metrics skipped: %s", _re)
 
     out.mkdir(parents=True, exist_ok=True)
     result_path = out / f"{strategy_id}__{start.date()}__{end.date()}.json"
@@ -101,7 +145,13 @@ def backtest(
 
 @app.command()
 def sweep(
-    strategy: str = typer.Option(..., help="z.B. sma_crossover, mean_reversion"),
+    strategy: str = typer.Option("", help="z.B. sma_crossover, mean_reversion"),
+    graph_spec: str = typer.Option(
+        "",
+        "--graph-spec",
+        help="Slug einer Graph-Strategie aus 02 Strategien/ (visueller Builder). "
+        "Alternative zu --strategy.",
+    ),
     universe: str = typer.Option(...),
     start: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
     end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
@@ -112,6 +162,14 @@ def sweep(
         "",
         "--params",
         help='JSON param_space, z.B. \'{"fast": [10,20,50], "slow": [100,200]}\'',
+    ),
+    cost_model: str = typer.Option(
+        "flat",
+        help="Kostenmodell: 'flat' oder 'per_asset_class' (config/costs.yaml)",
+    ),
+    capital_model: str = typer.Option(
+        "shared",
+        help="Kapitalmodell: 'shared' (ein Konto) oder 'independent' (Alt-Semantik)",
     ),
     out: Path = typer.Option(Path("backtests/sweeps"), help="Ergebnis-Verzeichnis"),
 ) -> None:
@@ -128,49 +186,71 @@ def sweep(
     )
 
     # param_space entweder aus --params JSON oder vordefinierte Defaults
+    label, spec = _resolve_spec(strategy, graph_spec, universe, cfg, {})
     if param_space_json:
         param_space = _json.loads(param_space_json)
+    elif graph_spec:
+        # Graph-Grids stehen im Frontmatter der Note (dotted "<node>.<param>").
+        param_space = spec.param_space
+        if not param_space:
+            raise typer.BadParameter(
+                f"Graph-Spec '{graph_spec}' hat kein `param_space` im Frontmatter — "
+                "Grid mit --params angeben oder im Builder setzen."
+            )
     else:
         param_space = _default_param_space(strategy)
 
-    _, spec = _build_spec(strategy, universe, cfg, 20, 100, 20, 2.0, 0.0)
     spec = spec.model_copy(update={"param_space": param_space})
 
     console.print(
-        f"[bold]Sweep:[/bold] {strategy} × {sum(1 for _ in __import__('itertools').product(*param_space.values()))}"
+        f"[bold]Sweep:[/bold] {label} × {sum(1 for _ in __import__('itertools').product(*param_space.values()))}"
         f" Kombinationen, rank_by={rank_by}"
     )
 
-    result = run_sweep(spec, md, rank_by=rank_by)
+    result = run_sweep(
+        spec, md, config=_backtest_config(cost_model, capital_model), rank_by=rank_by
+    )
 
     _print_sweep_result(result)
 
     # Ergebnis speichern
     out.mkdir(parents=True, exist_ok=True)
-    result_path = out / f"sweep_{strategy}__{start.date()}__{end.date()}.json"
+    result_path = out / f"sweep_{label}__{start.date()}__{end.date()}.json"
     result_path.write_text(
         _json.dumps(result.model_dump(mode="json", exclude_none=True), indent=2, default=str)
     )
     console.print(f"[blue]→[/blue] {result_path}")
 
 
-def _default_param_space(strategy: str) -> dict:
-    """Vordefinierte Sweep-Grids für bekannte Strategien."""
-    if strategy == "sma_crossover":
-        return {
-            "fast": [5, 10, 15, 20, 30, 50],
-            "slow": [50, 100, 150, 200],
-        }
-    elif strategy == "mean_reversion":
-        return {
-            "lookback": [10, 15, 20, 30, 50],
-            "entry_z": [1.5, 2.0, 2.5, 3.0],
-            "exit_z": [-0.5, 0.0, 0.5],
-        }
-    else:
+def _backtest_config(cost_model: str, capital_model: str = "shared") -> BacktestConfig:
+    """BacktestConfig aus CLI-Optionen — validiert Kosten- + Kapitalmodell früh."""
+    from quantrace.models import CAPITAL_MODELS, COST_MODELS
+
+    if cost_model not in COST_MODELS:
         raise typer.BadParameter(
-            f"Kein Default-param_space für '{strategy}'. Nutze --params mit JSON."
+            f"Unbekanntes Kostenmodell '{cost_model}'. Erlaubt: {', '.join(COST_MODELS)}."
         )
+    if capital_model not in CAPITAL_MODELS:
+        raise typer.BadParameter(
+            f"Unbekanntes Kapitalmodell '{capital_model}'. Erlaubt: {', '.join(CAPITAL_MODELS)}."
+        )
+    return BacktestConfig(cost_model=cost_model, capital_model=capital_model)  # type: ignore[arg-type]
+
+
+def _default_param_space(strategy: str) -> dict:
+    """Vordefinierte Sweep-Grids aus der Registry."""
+    if not strategy_registry.is_registered(strategy):
+        raise typer.BadParameter(
+            f"Unbekannte Strategie '{strategy}'. Bekannt: "
+            f"{', '.join(strategy_registry.known_strategies())}"
+        )
+    space = strategy_registry.default_param_space(strategy)
+    if not space:
+        raise typer.BadParameter(
+            f"Strategie '{strategy}' hat keine tunebaren Parameter — Sweep/Walk-Forward "
+            "sind hier sinnlos. Nutze einen Single-Backtest oder --params mit JSON."
+        )
+    return space
 
 
 def _print_sweep_result(sr: SweepResult) -> None:
@@ -213,7 +293,13 @@ def _print_sweep_result(sr: SweepResult) -> None:
 
 @app.command()
 def walkforward(
-    strategy: str = typer.Option(..., help="z.B. sma_crossover, mean_reversion"),
+    strategy: str = typer.Option("", help="z.B. sma_crossover, mean_reversion"),
+    graph_spec: str = typer.Option(
+        "",
+        "--graph-spec",
+        help="Slug einer Graph-Strategie aus 02 Strategien/ (visueller Builder). "
+        "Alternative zu --strategy.",
+    ),
     universe: str = typer.Option(...),
     start: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
     end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
@@ -224,6 +310,14 @@ def walkforward(
         "",
         "--params",
         help='JSON param_space, z.B. \'{"fast": [10,20], "slow": [100]}\'',
+    ),
+    cost_model: str = typer.Option(
+        "flat",
+        help="Kostenmodell: 'flat' oder 'per_asset_class' (config/costs.yaml)",
+    ),
+    capital_model: str = typer.Option(
+        "shared",
+        help="Kapitalmodell: 'shared' (ein Konto) oder 'independent' (Alt-Semantik)",
     ),
     out: Path = typer.Option(Path("backtests/walkforward"), help="Ergebnis-Verzeichnis"),
 ) -> None:
@@ -239,25 +333,39 @@ def walkforward(
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
     )
 
+    label, spec = _resolve_spec(strategy, graph_spec, universe, cfg, {})
     if param_space_json:
         param_space = _json.loads(param_space_json)
+    elif graph_spec:
+        param_space = spec.param_space
+        if not param_space:
+            raise typer.BadParameter(
+                f"Graph-Spec '{graph_spec}' hat kein `param_space` im Frontmatter — "
+                "Grid mit --params angeben oder im Builder setzen."
+            )
     else:
         param_space = _default_param_space(strategy)
 
-    _, spec = _build_spec(strategy, universe, cfg, 20, 100, 20, 2.0, 0.0)
     spec = spec.model_copy(update={"param_space": param_space})
 
     console.print(
-        f"[bold]Walk-Forward:[/bold] {strategy} über {folds} Folds (train={train_ratio:.0%})"
+        f"[bold]Walk-Forward:[/bold] {label} über {folds} Folds (train={train_ratio:.0%})"
     )
 
-    result = run_walk_forward(spec, md, n_folds=folds, train_ratio=train_ratio, rank_by=rank_by)
+    result = run_walk_forward(
+        spec,
+        md,
+        config=_backtest_config(cost_model, capital_model),
+        n_folds=folds,
+        train_ratio=train_ratio,
+        rank_by=rank_by,
+    )
 
     _print_walkforward_result(result)
 
     # Save to file
     out.mkdir(parents=True, exist_ok=True)
-    result_path = out / f"wf_{strategy}_{folds}folds__{start.date()}__{end.date()}.json"
+    result_path = out / f"wf_{label}_{folds}folds__{start.date()}__{end.date()}.json"
     result_path.write_text(
         _json.dumps(result.model_dump(mode="json", exclude_none=True), indent=2, default=str)
     )
@@ -294,38 +402,69 @@ def _print_walkforward_result(wf: WalkForwardResult) -> None:
     console.print(f"Degradation:     [{deg_color}]{wf.degradation:.2f}[/{deg_color}] (OOS / IS)")
 
 
+def _legacy_params(
+    strategy: str, fast: int, slow: int, lookback: int, entry_z: float, exit_z: float
+) -> dict:
+    """Mappt die typisierten CLI-Optionen auf die Param-Dicts der zwei Alt-Strategien.
+
+    Für alle anderen Strategien gilt ein leeres Dict → die Klassen-Defaults greifen
+    (siehe strategy_registry.build_spec). So müssen sma/mr ihre `--fast 20 --slow 1`
+    -Ergonomie nicht verlieren, während die übrigen 8 Strategien sauber über
+    `--params` oder ihre Defaults laufen.
+    """
+    if strategy == "sma_crossover":
+        return {"fast": fast, "slow": slow}
+    if strategy == "mean_reversion":
+        return {"lookback": lookback, "entry_z": entry_z, "exit_z": exit_z}
+    return {}
+
+
 def _build_spec(
     strategy: str,
     universe: str,
     cfg: dict,
-    fast: int,
-    slow: int,
-    lookback: int,
-    entry_z: float,
-    exit_z: float,
+    params: dict | None = None,
 ) -> tuple[str, StrategySpec]:
-    if strategy == "sma_crossover":
-        params = {"fast": fast, "slow": slow}
-        sid = f"sma_{fast}_{slow}"
-        class_path = "strategies.templates.sma_crossover:SmaCrossover"
-        klass = "trend_following"
-    elif strategy == "mean_reversion":
-        params = {"lookback": lookback, "entry_z": entry_z, "exit_z": exit_z}
-        sid = f"mr_{lookback}_{entry_z}_{exit_z}"
-        class_path = "strategies.templates.mean_reversion:MeanReversion"
-        klass = "mean_reversion"
-    else:
-        raise typer.BadParameter(f"Unbekannte Strategie: {strategy}")
+    try:
+        return strategy_registry.build_spec(
+            strategy, universe, Timeframe(cfg.get("timeframe", "1d")), params
+        )
+    except KeyError as e:
+        raise typer.BadParameter(str(e)) from e
 
-    return sid, StrategySpec(
-        strategy_id=sid,
-        name=f"{strategy} {params}",
-        class_path=class_path,
-        strategy_class=klass,
-        universe=universe,
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        params=params,
-    )
+
+def _resolve_spec(
+    strategy: str | None,
+    graph_spec: str | None,
+    universe: str,
+    cfg: dict,
+    params: dict | None = None,
+) -> tuple[str, StrategySpec]:
+    """Registry-Strategie ODER Graph-Spec aus dem Vault — genau eine von beiden.
+
+    Der Graph-Pfad (#188) lässt eine im visuellen Builder gebaute Strategie
+    durch denselben Runner laufen; die Registry bleibt die statische Whitelist
+    der Code-Strategien.
+    """
+    if bool(strategy) == bool(graph_spec):
+        raise typer.BadParameter(
+            "Genau eine von --strategy oder --graph-spec angeben."
+        )
+    if graph_spec:
+        from quantrace.graph import vault as graph_vault
+        from quantrace.graph.compiler import GraphValidationError
+
+        try:
+            return graph_vault.build_spec(
+                graph_spec, universe, Timeframe(cfg.get("timeframe", "1d")), params
+            )
+        except (FileNotFoundError, ValueError) as e:
+            raise typer.BadParameter(str(e)) from e
+        except GraphValidationError as e:
+            raise typer.BadParameter(
+                f"Graph-Spec '{graph_spec}' ist ungültig:\n" + "\n".join(e.errors)
+            ) from e
+    return _build_spec(strategy or "", universe, cfg, params)
 
 
 def _print_result(r) -> None:
@@ -588,6 +727,116 @@ def _render_markdown(rows: list[dict], sort_by: str, top: int, title: str) -> st
     lines.append("")
 
     return "\n".join(lines)
+
+
+@app.command()
+def paper_status() -> None:
+    """Verbindet sich mit Alpaca Paper-Account und gibt Kontoinfo + Positionen aus.
+
+    Smoke-Test für die Phase-2-Integration. Setze ALPACA_API_KEY und
+    ALPACA_SECRET_KEY in der Env, dann läuft das ohne weitere Konfiguration.
+    """
+    from quantrace.brokers import get_broker
+
+    try:
+        broker = get_broker("alpaca")
+        broker.connect()
+    except (RuntimeError, ImportError) as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    equity = broker.account_value()
+    positions = broker.positions()
+
+    console.print(f"[green]✓[/green] Alpaca paper account: equity=${equity:,.2f}")
+    if not positions:
+        console.print("[dim]Keine offenen Positionen.[/dim]")
+        return
+
+    t = Table(title="Offene Positionen")
+    t.add_column("Symbol")
+    t.add_column("Qty", justify="right")
+    t.add_column("Avg Cost", justify="right")
+    t.add_column("Market Value", justify="right")
+    for p in positions:
+        t.add_row(
+            p.symbol,
+            f"{p.quantity:.4f}",
+            f"${p.avg_cost:,.2f}",
+            f"${p.market_value:,.2f}",
+        )
+    console.print(t)
+
+
+@app.command()
+def regime(
+    universe: str = typer.Option(..., help="Name in data/universes/*.yaml"),
+    start: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
+    end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
+    n_states: int = typer.Option(3, help="Anzahl HMM-Regime (2–5)"),
+    feature_window: int = typer.Option(21, help="Trailing-Fenster für Trend/Vol-Features"),
+) -> None:
+    """Schätzt das Markt-Regime eines Universums per Hidden-Markov-Model.
+
+    Fittet ein Gaussian-HMM auf Trend-/Vol-Features des Equal-Weight-Benchmarks
+    und gibt das aktuelle (kausale) Regime, dessen Konfidenz, die Regime-
+    Verteilung über den Zeitraum und die geschätzten Regime-Charakteristika aus.
+    """
+    from quantrace.regime import RegimeDetector
+
+    cfg = _load_universe_yaml(universe)
+    md = load_universe(
+        universe=universe,
+        symbols=cfg["symbols"],
+        start=start.date(),
+        end=end.date(),
+        timeframe=Timeframe(cfg.get("timeframe", "1d")),
+    )
+
+    bench = close_prices(md).mean(axis=1)
+    det = RegimeDetector(n_states=n_states, feature_window=feature_window).fit(bench)
+    snap = det.current_regime(bench)
+    series = det.regime_series(bench)
+
+    emoji = {
+        "crisis": "🔴", "risk_off": "🟠", "neutral": "🟡",
+        "risk_on": "🟢", "euphoria": "🚀",
+    }
+    console.print(
+        f"\n[bold]Aktuelles Regime ({snap.as_of.date()}):[/bold] "
+        f"{emoji.get(snap.label, '•')} [bold]{snap.label}[/bold] "
+        f"([cyan]{snap.confidence:.0%}[/cyan] Konfidenz)"
+    )
+
+    prob_t = Table(title="Regime-Wahrscheinlichkeiten (heute)")
+    prob_t.add_column("Regime")
+    prob_t.add_column("P", justify="right")
+    for label in det.labels:
+        p = snap.probabilities.get(label, 0.0)
+        prob_t.add_row(f"{emoji.get(label, '•')} {label}", f"{p:.1%}")
+    console.print(prob_t)
+
+    dist = series.value_counts(normalize=True)
+    dist_t = Table(title=f"Regime-Verteilung {start.date()}..{end.date()}")
+    dist_t.add_column("Regime")
+    dist_t.add_column("Anteil Tage", justify="right")
+    for label in det.labels:
+        share = float(dist.get(label, 0.0))
+        dist_t.add_row(f"{emoji.get(label, '•')} {label}", f"{share:.1%}")
+    console.print(dist_t)
+
+    means = det.hmm.means_
+    char_t = Table(title="Regime-Charakteristik (annualisiert, geschätzt)")
+    char_t.add_column("Regime")
+    char_t.add_column("Trend μ", justify="right")
+    char_t.add_column("Vol σ", justify="right")
+    for state, label in sorted(det.state_to_label_.items(), key=lambda kv: det.labels.index(kv[1])):
+        char_t.add_row(
+            f"{emoji.get(label, '•')} {label}",
+            f"{means[state, 0]:+.1%}",
+            f"{means[state, 1]:.1%}",
+        )
+    console.print(char_t)
 
 
 @app.command()

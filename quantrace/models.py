@@ -3,6 +3,16 @@
 Alle Agenten (Data, Research, Backtest, Evaluation, Knowledge) sprechen
 ausschließlich über diese Modelle miteinander. Wenn ein Feld fehlt, ist das
 ein Architekturentscheid, kein Implementierungsdetail.
+
+Pandas-Import-Hinweis
+---------------------
+`pandas` wird hier NICHT auf Modul-Ebene importiert. Die API lädt models.py
+beim Router-Import (FastAPI); ein Top-Level `import pandas` würde ~150 MB RSS
+sofort allozieren und Render Free (512 MB) beim Start OOM-killen.
+
+pd.DataFrame bleibt als Laufzeit-Typ vollständig unterstützt — Code der
+eklatant mit MarketData.frame arbeitet, hat pandas sowieso installiert und
+importiert es selbst. Hier nur TYPE_CHECKING-Guard für Typ-Annotationen.
 """
 
 from __future__ import annotations
@@ -11,10 +21,12 @@ import hashlib
 import json
 from datetime import UTC, date, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    pass
 
 
 class Timeframe(str, Enum):
@@ -48,12 +60,12 @@ class MarketData(BaseModel):
     end: date
     provider: str = Field(..., description="OpenBB-Provider, z.B. 'yfinance', 'fmp'")
     adjusted: bool = True
-    frame: pd.DataFrame = Field(..., exclude=True)
+    frame: Any = Field(..., exclude=True)  # pd.DataFrame — lazy import, see module docstring
     content_hash: str = ""
 
     @field_validator("frame")
     @classmethod
-    def _frame_must_have_ohlcv(cls, v: pd.DataFrame) -> pd.DataFrame:
+    def _frame_must_have_ohlcv(cls, v: Any) -> Any:
         required = {"open", "high", "low", "close", "volume"}
         cols_lower = {
             c.lower() if isinstance(c, str) else c for c in v.columns.get_level_values(-1)
@@ -61,7 +73,9 @@ class MarketData(BaseModel):
         missing = required - cols_lower
         if missing:
             raise ValueError(f"MarketData.frame fehlt OHLCV-Spalten: {missing}")
-        if not isinstance(v.index, pd.DatetimeIndex):
+        # DatetimeIndex check — import pandas lazily only when validator actually runs
+        import pandas as _pd
+        if not isinstance(v.index, _pd.DatetimeIndex):
             raise ValueError("MarketData.frame muss DatetimeIndex haben")
         return v.sort_index()
 
@@ -95,17 +109,78 @@ class StrategySpec(BaseModel):
     status: StrategyStatus = StrategyStatus.DRAFT
 
 
+class SymbolCosts(BaseModel):
+    """Aufgelöste Kosten eines Symbols (pro Order-Seite, in Basispunkten).
+
+    Effektive Slippage pro Seite = ``slippage_bps + spread_bps / 2`` (Market-
+    Order kreuzt den halben Spread; slippage_bps ist der Impact obendrauf).
+    """
+
+    asset_class: str
+    fees_bps: float
+    slippage_bps: float
+    spread_bps: float
+
+    @property
+    def effective_slippage_bps(self) -> float:
+        return self.slippage_bps + self.spread_bps / 2.0
+
+    @property
+    def total_per_side_bps(self) -> float:
+        return self.fees_bps + self.effective_slippage_bps
+
+
+# Einzige Quelle der erlaubten Kostenmodelle — CLI und Pipeline validieren
+# gegen diese Konstante statt eigener String-Listen.
+COST_MODELS: tuple[str, ...] = ("flat", "per_asset_class")
+
+# Einzige Quelle der erlaubten Kapitalmodelle (gleiche Konvention wie COST_MODELS).
+CAPITAL_MODELS: tuple[str, ...] = ("shared", "independent")
+
+
 class BacktestConfig(BaseModel):
     """Reproduzierbare Backtest-Annahmen. Wer hier rumdreht, dreht am Ergebnis."""
 
     cash: float = 100_000.0
-    fees_bps: float = Field(2.0, description="Round-trip fee in basis points")
+    # Pro Order-Seite: vectorbt belastet `fees` bei Entry UND Exit — 2.0 hier
+    # heißt 4 bps round-trip. Gleiche Konvention wie SymbolCosts.
+    fees_bps: float = Field(2.0, description="Fee in basis points per order side")
     slippage_bps: float = 5.0
+    # "flat": fees_bps/slippage_bps für alle Symbole (bisheriges Verhalten).
+    # "per_asset_class": der Runner löst pro Symbol Fees/Slippage/Spread aus
+    # config/costs.yaml auf (Klassifikation + Profile) und rechnet mit
+    # per-Spalte-Kosten; die aufgelöste Tabelle landet in `symbol_costs`,
+    # damit das persistierte Ergebnis seine Kosten-Annahmen dokumentiert.
+    cost_model: Literal["flat", "per_asset_class"] = "flat"
+    # Vorbelegt → gewinnt gegen config/costs.yaml (explizites Override, z.B.
+    # für Stress-Szenarien); sonst füllt der Runner das Feld beim Auflösen.
+    symbol_costs: dict[str, SymbolCosts] | None = None
+    # "shared" (Default): EIN Konto für alle Symbole. Das Kapital konkurriert um
+    # einen Pool und wird gleichgewichtet über die gerade aktiven Positionen
+    # verteilt (k aktive → je size/k des Kontowerts; k=0 → Cash). Umgeschichtet
+    # wird nur, wenn sich die Signal-Mitgliedschaft ändert — dazwischen driften
+    # die Gewichte mit dem Markt. `size_type` ist in diesem Modell ohne Wirkung.
+    # "independent": Rollback auf die alte Semantik — jede Spalte backtestet mit
+    # dem vollen `cash` als eigenes Konto, Equity = Mittelwert der Sleeves
+    # (kein geteiltes Kapital, keine Kapazitäts-Restriktion). Siehe ADR-003.
+    capital_model: Literal["shared", "independent"] = "shared"
+    # Nur im independent-Modell (und für Einzel-Symbol-Läufe) wirksam.
     size_type: Literal["percent", "value", "shares"] = "percent"
+    # In beiden Modellen die investierte Obergrenze: shared hält 1−size als
+    # Cash-Puffer (Fees/Slippage), independent nutzt size pro Sleeve-Order.
     size: float = 0.95
     allow_shorts: bool = False
     freq: str = "1D"
     annualization: int = 252
+    execution_lag: int = Field(
+        1,
+        ge=0,
+        description=(
+            "Bars between signal and fill. 1 (default) means a signal derived "
+            "from bar t's close executes at t+1, eliminating same-bar "
+            "look-ahead. Set 0 only for signals already lagged upstream."
+        ),
+    )
 
 
 class TradeMetrics(BaseModel):
@@ -144,8 +219,19 @@ class BacktestResult(BaseModel):
     # Trades
     trades: TradeMetrics
 
+    # Annualisierter Turnover = Σ|gehandeltes Notional| / mittlerer Kontowert
+    # pro Jahr (one-way, gleiche Konvention wie quantrace.paper.rebalance).
+    # Der Haupttreiber der realisierten Kosten und der Nenner jeder
+    # Kapazitätsrechnung. None auf Ergebnissen von vor der Persistierung —
+    # die Capacity-Analytik fällt dann auf eine Schätzung aus der Trade-Zahl
+    # zurück und weist sie als solche aus.
+    turnover_annual: float | None = None
+
+    # Per-regime performance breakdown (written to JSON; computed at backtest time).
+    regime_metrics: dict[str, Any] | None = None
+
     # Rohartefakte (optional, nicht serialisiert in JSON)
-    equity_curve: pd.Series | None = Field(default=None, exclude=True)
+    equity_curve: Any | None = Field(default=None, exclude=True)  # pd.Series — lazy
     artifacts_path: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -187,6 +273,16 @@ class FoldResult(BaseModel):
     test_cagr: float = 0.0
     test_max_drawdown: float = 0.0
     test_n_trades: int = 0
+    # Annualisierter Turnover des OOS-Fensters (one-way). None auf alten
+    # Ergebnissen und wenn die Order-Records nicht auswertbar waren.
+    test_turnover_annual: float | None = None
+    # Multiple-testing-Statistik des OOS-Fensters (H0: true SR ≤ 0, Mertens-SE
+    # mit den echten Return-Momenten des Test-Fensters; q-Wert via
+    # Benjamini-Hochberg über alle Folds). None auf alten Ergebnissen.
+    test_n_obs: int | None = None
+    test_p_value: float | None = None
+    test_q_value: float | None = None
+    fdr_significant: bool | None = None
 
 
 class WalkForwardResult(BaseModel):
@@ -205,6 +301,24 @@ class WalkForwardResult(BaseModel):
         description="OOS/IS-Ratio. 1.0 = perfekt, <0.5 = Overfitting-Warnung",
     )
 
+    # Benjamini-Hochberg-Zusammenfassung über die OOS-Folds (method, alpha,
+    # n_tests, n_significant, all_significant). None auf alten Ergebnissen.
+    fdr: dict[str, Any] | None = None
+
+    # Inferenz über den *gestitchten* OOS-Pfad (alle Test-Fenster chronologisch
+    # konkateniert): annualisierter Sharpe + Stationary-Bootstrap-KI/p-Wert.
+    # Die Fold-Mittelung oben gewichtet jeden Fold gleich; der gestitchte Pfad
+    # ist die Rendite-Reihe, die ein Live-Deployment tatsächlich erlebt hätte.
+    # None auf alten Ergebnissen oder wenn die Test-Fenster zu kurz sind.
+    oos_inference: dict[str, Any] | None = None
+
+    # Der gestitchte OOS-Equity-Pfad selbst ([{date, value}], kettennormiert
+    # über die Fold-Grenzen). Persistiert, damit Downstream-Analysen (Portfolio-
+    # Uniqueness, Factor-Attribution, Bootstrap) auf dem Pfad rechnen können,
+    # den ein Deployment erlebt hätte — WF-Ergebnisse hatten bisher gar keinen
+    # Return-Pfad im JSON. None auf alten Ergebnissen.
+    oos_equity: list[dict[str, Any]] | None = None
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -221,6 +335,8 @@ class KnowledgeNote(BaseModel):
         "06 Rejected Ideas",
         "07 Regime Notes",
         "08 Decision Memos",
+        "11 Live Monitoring",
+        "12 News",
     ]
     title: str
     frontmatter: dict[str, Any]

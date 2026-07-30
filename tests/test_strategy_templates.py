@@ -16,9 +16,12 @@ from strategies.templates.atr_breakout import AtrBreakout
 from strategies.templates.bollinger_bands import BollingerBands
 from strategies.templates.buy_and_hold import BuyAndHold
 from strategies.templates.donchian_breakout import DonchianBreakout
+from strategies.templates.dual_momentum import DualMomentum
 from strategies.templates.ema_crossover import EmaCrossover
+from strategies.templates.kalman_trend import KalmanTrend
 from strategies.templates.macd import Macd
 from strategies.templates.momentum_12_1 import CrossSectionalMomentum
+from strategies.templates.regime_filter import RegimeFilter
 from strategies.templates.rsi_2 import Rsi2
 
 STRATEGIES = [
@@ -28,6 +31,9 @@ STRATEGIES = [
     Rsi2(),
     BollingerBands(),
     CrossSectionalMomentum(lookback=60, skip=5, top_quantile=0.5),
+    DualMomentum(lookback=60, top_quantile=0.5),
+    KalmanTrend(),
+    RegimeFilter(trend_lookback=50),
     AtrBreakout(),
     BuyAndHold(),
 ]

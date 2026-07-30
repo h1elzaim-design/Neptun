@@ -1,0 +1,31 @@
+# Europa-Exposure über US-gelistete ETFs — #35. Tiingo-EOD, kein OpenBB nötig.
+name: europe_etfs
+description: "Europa-Exposure via US-gelistete ETFs (breit, Eurozone, Länder, währungsgehedged)."
+timeframe: 1d
+provider: tiingo
+# Bewusst US-gelistete Europa-ETFs statt EU-domizilierter UCITS: sie handeln in
+# der US-Session mit sauberem Tiingo-EOD und laufen ohne OpenBB-Umweg im
+# bestehenden Lake. Underlying-Session ≠ US-Handelszeit → Premium/Discount-Risiko
+# (in config/costs.yaml als intl_equity_etf mit breiterem Spread abgebildet).
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-07-21
+source_notes: |
+  Europa in drei Granularitäten: breit (VGK/IEUR), Eurozone (EZU/FEZ),
+  währungsgehedged (HEDJ) und Einzelländer (DE/UK/FR/CH/ES/IT/NL). Alle
+  hochliquide iShares/Vanguard/SPDR/WisdomTree-Produkte. Für echte EU-
+  domizilierte UCITS (Xetra/LSE) bräuchte es einen OpenBB-Provider und einen
+  anderen Datenpfad — bewusst nicht Teil dieses Universums.
+symbols:
+  - VGK   # Vanguard FTSE Europe
+  - IEUR  # iShares Core MSCI Europe
+  - EZU   # iShares MSCI Eurozone
+  - FEZ   # SPDR Euro Stoxx 50
+  - HEDJ  # WisdomTree Europe Hedged Equity
+  - EWG   # iShares MSCI Germany
+  - EWU   # iShares MSCI United Kingdom
+  - EWQ   # iShares MSCI France
+  - EWL   # iShares MSCI Switzerland
+  - EWP   # iShares MSCI Spain
+  - EWI   # iShares MSCI Italy
+  - EWN   # iShares MSCI Netherlands

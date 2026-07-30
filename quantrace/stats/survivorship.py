@@ -60,6 +60,14 @@ PROVIDER_PROFILE: dict[str, dict[str, Any]] = {
         "point_in_time_capable": False,
         "trustworthy_for_pit": False,
     },
+    "tiingo": {
+        # Tiingo EOD covers currently-listed tickers (and some delisted ones
+        # only if queried by symbol); it carries no point-in-time index
+        # membership, so a static `symbols:` list is survivor-only by default.
+        "delivers_delisted_by_default": False,
+        "point_in_time_capable": False,
+        "trustworthy_for_pit": False,
+    },
     "manual": {
         "delivers_delisted_by_default": False,
         "point_in_time_capable": False,

@@ -76,6 +76,22 @@ class TestSurvivorshipAudit:
         )
         assert any("unknown to the survivorship audit table" in r for r in out.reasons)
 
+    def test_tiingo_is_a_known_provider(self):
+        # tiingo is the production provider — it must be recognised so the audit
+        # refines instead of bailing out with "unknown provider".
+        out = audit_universe(
+            "us_core_etfs",
+            {
+                "delisted_included": True,
+                "provider": "tiingo",
+                "last_audit_date": date.today().isoformat(),
+            },
+        )
+        assert not any("unknown to the survivorship audit table" in r for r in out.reasons)
+        # Not PIT-trustworthy → a declared-LOW universe is refined down to MEDIUM.
+        assert out.risk == "MEDIUM"
+        assert any("tiingo" in r for r in out.reasons)
+
     def test_deterministic(self):
         meta = {
             "delisted_included": False,

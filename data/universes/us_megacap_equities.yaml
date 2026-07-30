@@ -1,0 +1,34 @@
+# US-Mega-Cap-Einzelwerte: liquide Large-Caps für Stock-Level-Research.
+# Anders als die ETF-Universen erlaubt dieser Satz echte Cross-Sectional-
+# Momentum-/Dual-Momentum-Studien auf Einzelaktien (höhere Dispersion, echter
+# Faktor-Spread). Tiingo deckt US-Einzelwerte voll ab.
+name: us_megacap_equities
+description: "Liquide US-Mega-Cap-Einzelaktien für Stock-Level Cross-Sectional-Research."
+timeframe: 1d
+provider: tiingo
+delisted_included: false
+point_in_time: false
+last_audit_date: 2026-06-05
+source_notes: |
+  Survivorship-Hinweis: Dieser Satz listet *heutige* Mega-Caps — point_in_time
+  ist false und delisted_included ist false. Für Backtests ist das ein
+  Survivorship-Bias (nur Gewinner sind drin). Für Methoden-Research (Momentum-
+  Mechanik, Regime-Verhalten) ist das ok; für ehrliche Edge-Schätzung ein PIT-
+  Universum nutzen. quantrace.stats.survivorship quantifiziert den Effekt.
+symbols:
+  - AAPL  # Apple
+  - MSFT  # Microsoft
+  - GOOGL # Alphabet
+  - AMZN  # Amazon
+  - NVDA  # NVIDIA
+  - META  # Meta Platforms
+  - TSLA  # Tesla
+  - JPM   # JPMorgan
+  - JNJ   # Johnson & Johnson
+  - XOM   # Exxon Mobil
+  - WMT   # Walmart
+  - PG    # Procter & Gamble
+  - V     # Visa
+  - MA    # Mastercard
+  - HD    # Home Depot
+  - UNH   # UnitedHealth

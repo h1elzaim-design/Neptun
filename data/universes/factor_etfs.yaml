@@ -1,0 +1,25 @@
+# Faktor-/Smart-Beta-Universum: investierbare Faktor-Prämien als ETFs.
+# Gedacht für Faktor-Rotation, Cross-Sectional-Momentum und Regime-Studien
+# (welcher Faktor führt in welchem Regime?).
+name: factor_etfs
+description: "Investierbare Faktor-ETFs (Momentum, Value, Quality, Size, Low-Vol, …)."
+timeframe: 1d
+provider: tiingo
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-06-05
+source_notes: |
+  iShares/Invesco Faktor-ETFs auf den US-Large-Cap-Markt. Alle seit ≥2013
+  gelistet und liquide. MTUM/QUAL/VLUE/SIZE/USMV teilen denselben MSCI-USA-
+  Basisindex, was sie zu einem sauberen Faktor-Vergleich macht.
+symbols:
+  - MTUM  # Momentum (iShares MSCI USA Momentum)
+  - QUAL  # Quality (iShares MSCI USA Quality)
+  - VLUE  # Value (iShares MSCI USA Value)
+  - SIZE  # Size (iShares MSCI USA Size)
+  - USMV  # Min Volatility (iShares MSCI USA Min Vol)
+  - SPLV  # Low Volatility (Invesco S&P 500 Low Vol)
+  - SPHB  # High Beta (Invesco S&P 500 High Beta)
+  - VTV   # Large Value (Vanguard)
+  - VUG   # Large Growth (Vanguard)
+  - QQQ   # Growth/Tech-Proxy (Nasdaq 100) als Benchmark-Anker

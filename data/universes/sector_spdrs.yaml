@@ -1,0 +1,27 @@
+# Sektor-Rotations-Universum: die 11 SPDR-Select-Sektor-ETFs.
+# Reines Sektor-Set (ohne breite Indizes) — ideal für Cross-Sectional-Momentum,
+# Dual Momentum und Sektor-Rotations-Research.
+name: sector_spdrs
+description: "Die 11 SPDR-Select-Sektor-ETFs — Sektor-Rotation & Cross-Sectional-Research."
+timeframe: 1d
+provider: tiingo
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-06-05
+source_notes: |
+  Vollständiger GICS-Sektor-Satz via SPDR Select Sector ETFs. Alle 11 sind
+  hochliquide und seit ≥2018 (XLC seit 2018-06, XLRE seit 2015-10) durchgehend
+  gelistet. Für Backtests vor dem jeweiligen Auflagedatum eines ETFs fehlen die
+  frühen Ränder — das Data-Quality-Gate meldet das.
+symbols:
+  - XLK   # Technology
+  - XLF   # Financials
+  - XLE   # Energy
+  - XLV   # Health Care
+  - XLI   # Industrials
+  - XLY   # Consumer Discretionary
+  - XLP   # Consumer Staples
+  - XLU   # Utilities
+  - XLB   # Materials
+  - XLRE  # Real Estate
+  - XLC   # Communication Services

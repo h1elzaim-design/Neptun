@@ -1,0 +1,34 @@
+# Breites Ex-US-Universum (Developed + Emerging) — #35, "viele Daten".
+name: international_etfs
+description: "Breites Ex-US-Aktien-Universum: Developed + Emerging Markets, US-gelistet."
+timeframe: 1d
+provider: tiingo
+# Für Global-Macro-/Cross-Sectional-Strategien mit maximaler geografischer
+# Breite bei sauberem Tiingo-EOD. Alle US-gelistet. Underlying-Sessions liegen
+# teils außerhalb der US-Handelszeit → Premium/Discount-Risiko, in
+# config/costs.yaml als intl_equity_etf mit breiterem Spread berücksichtigt.
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-07-21
+source_notes: |
+  Ex-US-Breite in drei Blöcken: Developed-Aggregate (EFA/IEFA/VEA/VXUS/ACWX),
+  Emerging-Aggregate (EEM/IEMG/VWO) und Einzelländer (JP/CN/IN/KR/TW/BR/CA).
+  Bewusst redundante Aggregate (iShares vs. Vanguard) für Korrelations-/
+  Uniqueness-Analysen. point_in_time=false: Index-Konstituenten rotieren; die
+  Symbolliste ist survivor-only (Tiingo liefert keine PIT-Mitgliedschaft).
+symbols:
+  - EFA   # iShares MSCI EAFE
+  - IEFA  # iShares Core MSCI EAFE
+  - VEA   # Vanguard FTSE Developed Markets
+  - VXUS  # Vanguard Total International Stock
+  - ACWX  # iShares MSCI ACWI ex US
+  - EEM   # iShares MSCI Emerging Markets
+  - IEMG  # iShares Core MSCI Emerging Markets
+  - VWO   # Vanguard FTSE Emerging Markets
+  - EWJ   # iShares MSCI Japan
+  - MCHI  # iShares MSCI China
+  - INDA  # iShares MSCI India
+  - EWY   # iShares MSCI South Korea
+  - EWT   # iShares MSCI Taiwan
+  - EWZ   # iShares MSCI Brazil
+  - EWC   # iShares MSCI Canada

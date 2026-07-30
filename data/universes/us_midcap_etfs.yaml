@@ -1,0 +1,29 @@
+# US-Mid-Cap-ETFs — #35. Alle US-gelistet, hochliquide, sauberes Tiingo-EOD.
+name: us_midcap_etfs
+description: "US-Mid-Cap-ETFs (S&P 400 / Russell Midcap, inkl. Value/Growth-Tilts)."
+timeframe: 1d
+provider: tiingo
+# Alle 10 handeln zum Audit-Zeitpunkt. Mid-Cap-Index-ETFs (IJH/MDY seit 1995/2000,
+# VO/IWR seit 2004) sind über den Backtest-Zeitraum stabil — keine Liquidationen
+# im Korb. delisted_included wie bei den übrigen Tiingo-Universen: der Provider
+# liefert keine PIT-Index-Mitgliedschaft, die Symbolliste ist survivor-only.
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-07-21
+source_notes: |
+  US-Mid-Cap-Segment über liquide Index-ETFs. Kern (IJH, MDY, VO, IWR) plus
+  Value/Growth-Style-Splits (VOE/VOT, IJJ/IJK, IWS/IWP) für Cross-Sectional-
+  und Style-Rotation-Strategien. point_in_time=false: die zugrunde liegenden
+  Indizes rotieren Konstituenten über die Zeit; für PIT-Treue ein Russell-PIT-
+  Universum nutzen.
+symbols:
+  - IJH   # iShares Core S&P Mid-Cap
+  - MDY   # SPDR S&P MidCap 400
+  - VO    # Vanguard Mid-Cap
+  - IWR   # iShares Russell Mid-Cap
+  - VOE   # Vanguard Mid-Cap Value
+  - VOT   # Vanguard Mid-Cap Growth
+  - IJJ   # iShares S&P Mid-Cap 400 Value
+  - IJK   # iShares S&P Mid-Cap 400 Growth
+  - IWS   # iShares Russell Mid-Cap Value
+  - IWP   # iShares Russell Mid-Cap Growth

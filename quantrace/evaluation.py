@@ -190,23 +190,67 @@ def split_walk_forward(
     md_index: pd.DatetimeIndex,
     n_folds: int = 4,
     train_ratio: float = 0.6,
-) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-    """Liefert (train_start, train_end=test_start, test_end)-Tupel für Walk-Forward.
+    embargo: int = 0,
+) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+    """Liefert (train_start, train_end, test_start, test_end)-Tupel für Walk-Forward.
 
-    Trennt sauber, ohne Overlap. Test_end des Folds n ist Train_end des Folds n+1
-    nicht — wir nehmen disjunkte Test-Segmente.
+    Disziplin gegen Leakage:
+
+    * **Kein degenerierter Fold.** Das erste Test-Segment hat keine Historie
+      davor; statt es auf einem 1-Bar-Train laufen zu lassen (der alte Bug),
+      werden Folds ohne ausreichend langes Train-Fenster übersprungen. Die
+      zurückgegebene Liste kann daher **weniger** als ``n_folds`` Einträge haben.
+    * **Embargo.** Zwischen ``train_end`` und ``test_start`` liegt eine Lücke von
+      ``embargo`` Bars (plus dem ohnehin nötigen 1-Bar-Abstand). So kann ein
+      Indikator mit Lookback L am OOS-Rand nicht aus Train-Preisen berechnet
+      werden — der subtile Boundary-Leak, den ein reiner ``.loc``-Split übrig lässt.
+
+    Test-Segmente sind disjunkt und chronologisch. ``test_start`` ist explizit
+    im Tupel (nicht aus ``train_end`` abgeleitet), damit die Embargo-Lücke real
+    ist und nicht vom Wrapper wieder zugeschüttet wird.
     """
     if len(md_index) < 200:
         raise ValueError("Zu wenig Daten für Walk-Forward")
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError("train_ratio muss in (0, 1) liegen")
+    if embargo < 0:
+        raise ValueError("embargo darf nicht negativ sein")
+
     timestamps = md_index.sort_values()
-    fold_len = len(timestamps) // n_folds
-    out = []
+    n = len(timestamps)
+    fold_len = n // n_folds
+    if fold_len < 2:
+        raise ValueError("Zu wenig Daten für so viele Folds")
+
+    # Gewünschte Train-Spanne aus dem Ratio (wie zuvor: ratio/(1-ratio) · fold_len).
+    desired_train = int(round(fold_len * train_ratio / (1.0 - train_ratio)))
+    # Mindest-Train, damit der Fold nicht degeneriert ist und die Strategie ihre
+    # Lookbacks (≈ embargo) im Train überhaupt berechnen kann.
+    min_train = max(2 * embargo, 30)
+
+    out: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
     for k in range(n_folds):
-        test_start = timestamps[k * fold_len]
-        test_end = timestamps[min((k + 1) * fold_len - 1, len(timestamps) - 1)]
-        train_end = test_start
-        train_start = timestamps[
-            max(0, int(k * fold_len - fold_len * train_ratio / (1 - train_ratio)))
-        ]
-        out.append((train_start, train_end, test_end))
+        test_start_i = k * fold_len
+        test_end_i = min((k + 1) * fold_len - 1, n - 1)
+        train_end_i = test_start_i - 1 - embargo  # 1-Bar-Abstand + Embargo-Lücke
+        train_start_i = max(0, test_start_i - desired_train - embargo)
+        if train_end_i < 0:
+            continue  # kein OOS-Vorlauf (typischerweise der erste Fold)
+        train_len = train_end_i - train_start_i + 1
+        if train_len < min_train:
+            continue  # zu kurzes Train-Fenster → Fold überspringen statt verfälschen
+        out.append(
+            (
+                timestamps[train_start_i],
+                timestamps[train_end_i],
+                timestamps[test_start_i],
+                timestamps[test_end_i],
+            )
+        )
+
+    if not out:
+        raise ValueError(
+            "Kein gültiger Walk-Forward-Fold mit diesen Parametern "
+            "(Daten zu kurz für Train-Fenster + Embargo)."
+        )
     return out

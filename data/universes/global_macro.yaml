@@ -1,0 +1,25 @@
+# Global-Macro / GTAA-Universum: Multi-Asset über Aktien, Bonds, Rohstoffe, REITs.
+# Der klassische Asset-Allocation-Satz für Trend-, Dual-Momentum- und Regime-
+# Strategien, die über Anlageklassen hinweg rotieren.
+name: global_macro
+description: "Multi-Asset GTAA-Satz: globale Aktien, Treasuries, Gold, Rohstoffe, REITs."
+timeframe: 1d
+provider: tiingo
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-06-05
+source_notes: |
+  Breit gestreuter Multi-Asset-Korb im Stil von Faber's GTAA. Mischt
+  unkorrelierte Anlageklassen, damit Trend-/Momentum-Strategien echte
+  Rotation zeigen statt nur Beta. Alle ETFs seit ≥2007 (DBC seit 2006,
+  VNQ seit 2004) durchgehend liquide gelistet.
+symbols:
+  - SPY   # US Large Cap
+  - EFA   # Developed ex-US (MSCI EAFE)
+  - EEM   # Emerging Markets
+  - VNQ   # US REITs
+  - TLT   # 20y+ Treasuries
+  - IEF   # 7-10y Treasuries
+  - LQD   # Investment-Grade Credit
+  - GLD   # Gold
+  - DBC   # Broad Commodities

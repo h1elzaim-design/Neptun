@@ -151,6 +151,16 @@ def _sample_skew_kurt(r: np.ndarray) -> tuple[float, float]:
     return skew, kurt
 
 
+def sample_skew_kurt(returns: Sequence[float]) -> tuple[float, float]:
+    """Public: sample skewness γ₃ and non-excess kurtosis γ₄ (normal → 3).
+
+    Uses the same estimators the PSR/DSR Mertens variance expects, so a caller
+    can pre-compute a return series' moments (e.g. a sweep winner's) and feed
+    them into :func:`deflated_sharpe_from_summary` instead of the Gaussian null.
+    """
+    return _sample_skew_kurt(np.asarray(list(returns), dtype=float))
+
+
 # -----------------------------------------------------------------------------
 # Probabilistic Sharpe Ratio (PSR)
 # -----------------------------------------------------------------------------
@@ -187,6 +197,47 @@ class ProbabilisticSharpeResult:
     kurt: float
 
 
+def probabilistic_sharpe_from_summary(
+    *,
+    observed_sharpe_period: float,
+    n_obs: int,
+    benchmark_sharpe_period: float = 0.0,
+    skew: float = 0.0,
+    kurt: float = 3.0,
+) -> ProbabilisticSharpeResult:
+    """PSR from summary statistics, when the raw return series is unavailable.
+
+    Used for sweeps/grids whose persisted JSON keeps only scalar per-trial
+    metrics (Sharpe, CAGR, …) and no per-period return path. Callers that *do*
+    have returns should prefer :func:`probabilistic_sharpe_ratio`, which
+    estimates `skew`/`kurt` from the data instead of assuming normality.
+
+    All Sharpe inputs are **per-period**. With the default Gaussian moments
+    (γ₃=0, γ₄=3) the Mertens variance collapses to (1 + ½·SR̂²)/(T−1).
+    """
+    T = int(n_obs)  # noqa: N806
+    sr_hat = float(observed_sharpe_period)
+    sr_star = float(benchmark_sharpe_period)
+    if T < 3:
+        return ProbabilisticSharpeResult(sr_hat, sr_star, 0.0, 0.0, T, skew, kurt)
+
+    # Mertens variance: (1 − γ₃·SR̂ + (γ₄ − 1)/4·SR̂²) / (T − 1)
+    variance_term = 1.0 - skew * sr_hat + (kurt - 1.0) / 4.0 * sr_hat ** 2
+    variance_term = max(variance_term, 1e-12)
+    sigma_sr = math.sqrt(variance_term / (T - 1))
+
+    psr = _phi((sr_hat - sr_star) / sigma_sr)
+    return ProbabilisticSharpeResult(
+        sr_period_observed=sr_hat,
+        sr_period_benchmark=sr_star,
+        sigma_sr=sigma_sr,
+        psr=psr,
+        n_obs=T,
+        skew=skew,
+        kurt=kurt,
+    )
+
+
 def probabilistic_sharpe_ratio(
     returns: Sequence[float],
     *,
@@ -210,21 +261,12 @@ def probabilistic_sharpe_ratio(
 
     sr_hat = mu / sigma  # per-period
     sr_star = benchmark_sharpe_annual / math.sqrt(periods_per_year)
-
     skew, kurt = _sample_skew_kurt(r)
 
-    # Mertens variance: (1 − γ₃·SR̂ + (γ₄ − 1)/4·SR̂²) / (T − 1)
-    variance_term = 1.0 - skew * sr_hat + (kurt - 1.0) / 4.0 * sr_hat ** 2
-    variance_term = max(variance_term, 1e-12)
-    sigma_sr = math.sqrt(variance_term / (T - 1))
-
-    psr = _phi((sr_hat - sr_star) / sigma_sr)
-    return ProbabilisticSharpeResult(
-        sr_period_observed=sr_hat,
-        sr_period_benchmark=sr_star,
-        sigma_sr=sigma_sr,
-        psr=psr,
+    return probabilistic_sharpe_from_summary(
+        observed_sharpe_period=sr_hat,
         n_obs=T,
+        benchmark_sharpe_period=sr_star,
         skew=skew,
         kurt=kurt,
     )
@@ -332,3 +374,113 @@ def deflated_sharpe_ratio(
         cross_trial_sharpe_variance=cross_trial_sharpe_variance,
         psr_components=psr_result,
     )
+
+
+def deflated_sharpe_from_summary(
+    *,
+    observed_sharpe_period: float,
+    trial_sharpes_period: Sequence[float],
+    n_obs: int,
+    skew: float = 0.0,
+    kurt: float = 3.0,
+    n_trials: int | None = None,
+) -> DeflatedSharpeResult:
+    """Deflated Sharpe Ratio from summary statistics (no return series needed).
+
+    This is the sweep/grid counterpart to :func:`deflated_sharpe_ratio`. A
+    parameter sweep persists the Sharpe of every trial but not their return
+    paths, so the cross-trial variance V[SR] is estimated directly from the
+    observed trial Sharpes and the selected (winning) Sharpe is deflated
+    against the expected maximum under the null.
+
+    Parameters
+    ----------
+    observed_sharpe_period:
+        Per-period Sharpe of the *selected* trial (the sweep winner).
+    trial_sharpes_period:
+        Per-period Sharpe of every trial in the selection set. V[SR] is the
+        ddof=1 sample variance of these.
+    n_obs:
+        Number of return observations T behind the winning trial. Drives the
+        Mertens standard error of the Sharpe estimate.
+    skew, kurt:
+        Sample moments of the winner's returns. Default to the Gaussian null
+        (γ₃=0, γ₄=3) because the return path is not stored — callers should
+        disclose this assumption to the user.
+    n_trials:
+        Override for N when the true trial count exceeds the number of
+        *scored* trials supplied (e.g. some trials failed). Defaults to
+        ``len(trial_sharpes_period)``.
+
+    Notes
+    -----
+    More trials and tighter clustering of their Sharpes both raise the
+    expected-maximum bar SR★₀, so a winner that barely beats its neighbours
+    deflates hard — exactly the overfitting signal the DSR is meant to expose.
+    """
+    trials = np.asarray(list(trial_sharpes_period), dtype=float)
+    n = int(n_trials if n_trials is not None else trials.size)
+    if n < 2:
+        raise ValueError("n_trials must be ≥ 2 — DSR is undefined for a single trial")
+    if trials.size < 2:
+        raise ValueError("need ≥ 2 trial Sharpes to estimate cross-trial variance")
+
+    cross_trial_sharpe_variance = float(trials.var(ddof=1))
+    sr_star_period = _expected_max_sharpe_period(n, cross_trial_sharpe_variance)
+
+    psr_result = probabilistic_sharpe_from_summary(
+        observed_sharpe_period=observed_sharpe_period,
+        n_obs=n_obs,
+        benchmark_sharpe_period=sr_star_period,
+        skew=skew,
+        kurt=kurt,
+    )
+
+    return DeflatedSharpeResult(
+        expected_max_sharpe_period=sr_star_period,
+        psr=psr_result.psr,
+        dsr=psr_result.psr,
+        n_trials=n,
+        cross_trial_sharpe_variance=cross_trial_sharpe_variance,
+        psr_components=psr_result,
+    )
+
+
+def expected_max_sharpe(
+    trial_sharpes: Sequence[float],
+    *,
+    periods_per_year: float = 252.0,
+    n_trials: int | None = None,
+) -> float:
+    """Expected maximum *annualised* Sharpe under the null (Bailey & LdP 2014).
+
+    The selection-bias bar is estimated from the **observed dispersion** of the
+    trial Sharpes themselves, not from an assumed per-trial standard error. This
+    is what makes correlated sweep combinations count for less: configs whose
+    return streams move together produce similar Sharpes, shrinking V[SR] and
+    therefore the expected maximum — so a 200-combo grid of near-duplicates is
+    deflated far more gently than 200 genuinely independent bets would be
+    ("effective" rather than nominal trials).
+
+    Parameters
+    ----------
+    trial_sharpes:
+        Annualised Sharpe of every trial in the selection set.
+    periods_per_year:
+        Annualisation factor used to move between annual and per-period units.
+    n_trials:
+        Override for N (e.g. when failed trials are excluded from
+        `trial_sharpes`). Defaults to ``len(trial_sharpes)``.
+
+    Returns
+    -------
+    The expected maximum annualised Sharpe under the SR=0 null. ``0.0`` for
+    fewer than two trials or zero dispersion (no selection effect).
+    """
+    arr = np.asarray(list(trial_sharpes), dtype=float)
+    n = int(n_trials if n_trials is not None else arr.size)
+    if n < 2 or arr.size < 2:
+        return 0.0
+    rt = math.sqrt(periods_per_year)
+    variance_period = float((arr / rt).var(ddof=1))
+    return _expected_max_sharpe_period(n, variance_period) * rt

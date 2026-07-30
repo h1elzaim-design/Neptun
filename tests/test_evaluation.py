@@ -71,6 +71,30 @@ def test_evaluate_rejects_when_no_oos():
 def test_walk_forward_split():
     idx = pd.bdate_range("2018-01-01", "2023-12-31")
     folds = split_walk_forward(idx, n_folds=4)
-    assert len(folds) == 4
-    for train_start, train_end, test_end in folds:
-        assert train_start <= train_end <= test_end
+    # The degenerate first fold (no preceding history) is skipped, so fewer
+    # than n_folds may come back — but every emitted fold is well-formed.
+    assert 1 <= len(folds) <= 4
+    for train_start, train_end, test_start, test_end in folds:
+        # train strictly before test (no same-bar overlap) and chronological.
+        assert train_start <= train_end < test_start <= test_end
+
+
+def test_walk_forward_split_embargo_gap():
+    idx = pd.bdate_range("2018-01-01", "2023-12-31")
+    embargo = 21
+    folds = split_walk_forward(idx, n_folds=4, embargo=embargo)
+    pos = {ts: i for i, ts in enumerate(idx)}
+    for _train_start, train_end, test_start, _test_end in folds:
+        # At least `embargo` bars sit between the last train bar and the first
+        # OOS bar, so a lookback indicator can't straddle the boundary.
+        gap = pos[test_start] - pos[train_end] - 1
+        assert gap >= embargo
+
+
+def test_walk_forward_split_no_degenerate_fold():
+    idx = pd.bdate_range("2018-01-01", "2023-12-31")
+    folds = split_walk_forward(idx, n_folds=4)
+    pos = {ts: i for i, ts in enumerate(idx)}
+    for train_start, train_end, _test_start, _test_end in folds:
+        train_len = pos[train_end] - pos[train_start] + 1
+        assert train_len >= 30  # never the old 1-bar train set
