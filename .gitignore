@@ -26,6 +26,11 @@ env/
 *.sqlite
 *.sqlite3
 *.sql
+# ...aber Schema-Migrationen sind Quellcode, kein Dump. Ohne diese Ausnahme
+# verschluckt `*.sql` jede neue Datei unter db/migrations/ still — genau so
+# fehlen die Migrationen für `instruments` (#176) und `watchlists` (#178) im
+# Repo, obwohl der Code sie namentlich referenziert.
+!db/migrations/*.sql
 
 # Editor temp/backup files
 *~
@@ -56,3 +61,7 @@ Thumbs.db
 # Obsidian — plugin state that carries secrets must never be tracked:
 # obsidian-local-rest-api's data.json holds the REST API key + a TLS private key.
 .obsidian/plugins/*/data.json
+# workspace.json ist reiner Maschinen-UI-Zustand (offene Tabs, Pane-Layout).
+# Obsidian schreibt sie bei jedem Öffnen neu; getrackt erzeugt sie nur Diff-Rauschen
+# und veraltete Verweise auf längst gelöschte Notes.
+.obsidian/workspace.json
