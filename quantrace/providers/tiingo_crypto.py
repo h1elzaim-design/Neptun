@@ -16,11 +16,16 @@ und jeder davon ist eine Fehlerquelle, wenn man ihn übersieht:
    wie bei Aktien. Ein eigenes Speicherformat für Crypto wäre die naheliegende
    Alternative und würde jede Leseschicht zwingen, zwei Fälle zu kennen.
 
-**Was ich hier nicht verifizieren konnte:** die echte API. Die Tests fahren
-gegen aufgezeichnete Antwortformen; ob Tiingo sich exakt so verhält, zeigt
-erst der erste Fetch mit Token. Die Parser sind deshalb defensiv — eine
-unerwartete Form ergibt einen leeren Frame (und damit einen sichtbaren
-Lake-Miss), keine halb geparsten Kurse.
+**Gegen die echte API geprüft am 2026-08-03.** Alle vier Punkte oben haben
+gehalten. Zwei Dinge, die dabei *nicht* gehalten haben, stehen als Warnung hier:
+
+- ``_MAX_TICKERS_PER_REQUEST`` stand auf 20 — geraten, mit einer erfundenen
+  Begründung („URL zu lang"). Tiingo erlaubt 5 und sagt das im Fehler-Body.
+- Ein gescheiterter Block ließ **alle** seine Ticker leer ausgehen, obwohl
+  jeder einzelne abrufbar war. Deshalb jetzt der Rückfall auf Einzelabrufe.
+
+Die Parser bleiben defensiv: eine unerwartete Form ergibt einen leeren Frame
+(und damit einen sichtbaren Lake-Miss), keine halb geparsten Kurse.
 """
 
 from __future__ import annotations
@@ -41,10 +46,17 @@ log = logging.getLogger(__name__)
 
 _BASE = "https://api.tiingo.com/tiingo/crypto/prices"
 
-#: Wie viele Ticker pro Request. Der Endpunkt kann mehrere gleichzeitig, was
-#: das 50-req/h-Limit von Tiingo-Free schont — aber eine zu lange URL wird
-#: abgewiesen, und ein Fehler beträfe dann den ganzen Block.
-_MAX_TICKERS_PER_REQUEST = 20
+#: Wie viele Ticker pro Request — **von Tiingo vorgegeben**, nicht geschätzt.
+#:
+#: Der erste echte Lauf am 2026-08-03 mit neun Tickern ergab:
+#:
+#:     400  {"detail":"Error: A limit of 5 tickers may be requested at a time"}
+#:
+#: Hier stand vorher 20, mit der Begründung „eine zu lange URL wird abgewiesen".
+#: Beides war geraten und beides war falsch. Die Zahl gehört zur API und nicht
+#: zu unserer Vorstellung von ihr — wer sie erhöht, muss die Antwort oben
+#: widerlegen können.
+_MAX_TICKERS_PER_REQUEST = 5
 
 
 def _price_rows(payload: Any, ticker: str) -> list[dict[str, Any]]:
@@ -105,13 +117,60 @@ def fetch_symbol_raw(
     return frames.get(symbol, pd.DataFrame())
 
 
+def _params(tickers: list[str], start: date, end: date) -> dict[str, str]:
+    return {
+        "tickers": ",".join(s.lower() for s in tickers),
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "resampleFreq": "1day",
+    }
+
+
+def _harvest(
+    payload: Any, tickers: list[str], out: dict[str, pd.DataFrame]
+) -> None:
+    for sym in tickers:
+        frame = _to_raw_frame(_price_rows(payload, sym))
+        if not frame.empty:
+            out[sym] = frame
+
+
+def _one_by_one(
+    client: httpx.Client,
+    tickers: list[str],
+    start: date,
+    end: date,
+    headers: dict[str, str],
+    out: dict[str, pd.DataFrame],
+) -> None:
+    """Rückfall nach einem gescheiterten Block: jeden Ticker einzeln.
+
+    Fällt selbst **nicht** weiter zurück — ein einzelner Ticker, der scheitert,
+    ist das Ende der Fahnenstange und wird übersprungen.
+    """
+    for sym in tickers:
+        try:
+            payload = _get_with_retry(client, _BASE, _params([sym], start, end), headers)
+        except Exception as exc:  # noqa: BLE001 — ein Symbol darf den Rest nicht kippen
+            log.warning("Tiingo-Crypto: %s einzeln fehlgeschlagen: %s", sym, exc)
+            continue
+        _harvest(payload, [sym], out)
+
+
 def fetch_symbols_raw(
     symbols: list[str],
     start: date,
     end: date,
     client: httpx.Client | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Mehrere Paare in einem Request — der Endpunkt kann das, EOD nicht."""
+    """Mehrere Paare pro Request — der Endpunkt kann das, EOD nicht.
+
+    Scheitert ein Block, werden seine Ticker **einzeln** nachgeholt. Das kostet
+    im Fehlerfall mehr Requests, verhindert aber den Ausfall, den der erste
+    echte Lauf gezeigt hat: ein Verstoß gegen ein Limit ließ alle neun Symbole
+    leer ausgehen, obwohl jedes einzelne abrufbar gewesen wäre. Ein Batch ist
+    eine Optimierung — er darf nicht die Zuverlässigkeit bestimmen.
+    """
     if not symbols:
         return {}
 
@@ -122,17 +181,17 @@ def fetch_symbols_raw(
     try:
         for i in range(0, len(symbols), _MAX_TICKERS_PER_REQUEST):
             chunk = symbols[i : i + _MAX_TICKERS_PER_REQUEST]
-            params = {
-                "tickers": ",".join(s.lower() for s in chunk),
-                "startDate": start.isoformat(),
-                "endDate": end.isoformat(),
-                "resampleFreq": "1day",
-            }
-            payload = _get_with_retry(client, _BASE, params, auth_headers)
-            for sym in chunk:
-                frame = _to_raw_frame(_price_rows(payload, sym))
-                if not frame.empty:
-                    out[sym] = frame
+            try:
+                payload = _get_with_retry(client, _BASE, _params(chunk, start, end), auth_headers)
+            except Exception as exc:  # noqa: BLE001 — Block-Fehler → Einzelabruf
+                log.warning(
+                    "Tiingo-Crypto: Block %s fehlgeschlagen (%s) — jetzt einzeln",
+                    chunk,
+                    exc,
+                )
+                _one_by_one(client, chunk, start, end, auth_headers, out)
+                continue
+            _harvest(payload, chunk, out)
     finally:
         if owns:
             client.close()

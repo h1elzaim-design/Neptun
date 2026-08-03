@@ -28,6 +28,23 @@ _RAW_FIELDS = ["open", "high", "low", "close", "volume", "divCash", "splitFactor
 _MAX_RETRIES = 4
 _BACKOFF_BASE = 2.0  # Sekunden: 2, 4, 8, 16
 
+#: Wie viel vom Fehler-Body in die Exception wandert. Tiingo antwortet bei 4xx
+#: mit ``{"detail": "…"}`` — kurz genug, dass ein Deckel von 500 Zeichen die
+#: Aussage nie abschneidet, und groß genug, dass eine HTML-Fehlerseite den Log
+#: nicht flutet.
+_MAX_ERROR_BODY_CHARS = 500
+
+
+class TiingoHTTPError(RuntimeError):
+    """Ein 4xx von Tiingo, **mit** dem Antwort-Body.
+
+    Existiert, weil `raise_for_status()` nur die Statuszeile liefert. Am
+    2026-08-03 hat ein Neun-Ticker-Crypto-Request 400 zurückgegeben; die
+    Begründung stand im Body (`A limit of 5 tickers may be requested at a
+    time`) und war damit unsichtbar. Ein Client gegen eine fremde API, die man
+    nicht selbst kontrolliert, darf genau diese Zeile nicht wegwerfen.
+    """
+
 
 def _token() -> str:
     tok = os.environ.get("TIINGO_TOKEN", "").strip()
@@ -77,7 +94,13 @@ def _get_with_retry(
                     f"status {resp.status_code}", request=resp.request, response=resp
                 )
                 continue
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # 429 und 5xx sind oben schon abgefangen — hier bleibt echtes
+                # 4xx übrig, das kein Retry heilt. Der Body sagt warum.
+                detail = (resp.text or "").strip()[:_MAX_ERROR_BODY_CHARS]
+                raise TiingoHTTPError(
+                    f"Tiingo {resp.status_code} für {url}: {detail or '(leerer Body)'}"
+                )
             return resp.json()
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
