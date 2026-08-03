@@ -86,11 +86,25 @@ def _missing_at_edge(cal, von: date, bis: date) -> tuple[int, str]:
     nichts, und deshalb darf hier auch nichts gemeldet werden.
 
     Das um eins verkürzte Fenster ist Absicht: der erste vorhandene Tag ist da.
+
+    Drei Wege, je nachdem was bekannt ist:
+
+    * ``all_days_trade``: Kalendertage **sind** Handelstage. Exakt.
+    * Börse mit Handelskalender: die Sessions im Randfenster. Exakt.
+    * Börse ohne Handelskalender: unbekannt. Dann greift dieselbe Toleranz
+      wie bei den Lücken — sonst meldet ein Fetch ab dem 1. Januar für
+      **jedes** Symbol „1 Tag fehlt", weil Neujahr ein Feiertag ist. Sechzehn
+      Warnungen, die alle nichts bedeuten, sind schlimmer als keine.
     """
+    if cal.all_days_trade:
+        return (bis - von).days, "Tage"
+
     sessions = trading_sessions(cal.name, von, bis)
     if sessions is not None:
         return max(len(sessions) - 1, 0), "Handelstage"
-    return (bis - von).days, "Tage"
+
+    tage = (bis - von).days
+    return (tage if tage > cal.max_gap_days else 0), "Tage (geschätzt, ohne Handelskalender)"
 
 
 def check_symbol(

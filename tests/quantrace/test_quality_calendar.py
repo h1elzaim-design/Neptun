@@ -255,6 +255,50 @@ def test_without_the_package_the_tolerance_takes_over(monkeypatch):
     assert "ohne Handelskalender" in _detail(report, "calendar_gap")
 
 
+def test_the_fallback_does_not_cry_wolf_at_new_year(monkeypatch):
+    """Ein Fetch ab dem 1. Januar beginnt zwangsläufig am 2. oder 3. — Neujahr
+    ist Feiertag. Ohne Handelskalender ist das nicht *beweisbar*, aber ein
+    einzelner Kalendertag am Rand ist auch kein Befund: der erste echte Lauf
+    gegen us_core_etfs produzierte so **sechzehn** Warnungen, eine pro Symbol,
+    die alle nichts bedeuteten."""
+    monkeypatch.setattr(quality, "trading_sessions", lambda *a, **k: None)
+
+    report = quality.check_symbol(
+        "SPY",
+        _frame(["2018-01-02", "2018-01-03"]),
+        calendar="us_equity",
+        expected_start=date(2018, 1, 1),
+    )
+    assert "coverage_truncated" not in _kinds(report)
+
+
+def test_the_fallback_still_reports_real_truncation(monkeypatch):
+    """Die Gegenprobe — vier Monate fehlende Historie müssen auch ohne
+    Handelskalender auffallen, nur eben als Schätzung gekennzeichnet."""
+    monkeypatch.setattr(quality, "trading_sessions", lambda *a, **k: None)
+
+    report = quality.check_symbol(
+        "IPO",
+        _frame(["2023-05-01", "2023-05-02"]),
+        calendar="us_equity",
+        expected_start=date(2023, 1, 1),
+    )
+    assert "geschätzt" in _detail(report, "coverage_truncated")
+
+
+def test_crypto_edges_stay_exact_without_any_exchange_calendar():
+    """Bei 24/7 sind Kalendertage die richtige Einheit — dort darf die
+    Toleranz **nicht** greifen, sonst verschwindet ein echter Randabschnitt.
+    AVAXUSD fehlten 131 Tage am Anfang; die müssen gemeldet werden."""
+    report = quality.check_symbol(
+        "AVAXUSD",
+        _frame(["2021-05-12", "2021-05-13"]),
+        calendar="crypto_24_7",
+        expected_start=date(2021, 1, 1),
+    )
+    assert "131 Tage fehlen am Anfang" in _detail(report, "coverage_truncated")
+
+
 def test_an_explicit_limit_still_reaches_the_fallback(monkeypatch):
     monkeypatch.setattr(quality, "trading_sessions", lambda *a, **k: None)
     report = quality.check_symbol(
