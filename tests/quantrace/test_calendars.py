@@ -298,6 +298,69 @@ def test_crypto_costs_are_an_order_of_magnitude_above_etfs():
     assert alt > major
 
 
+# ---------------------------------------------------------------------------
+# Börsen-Handelskalender (exchange_calendars)
+
+
+def test_the_exchange_calendar_agrees_with_our_constant():
+    """252 steht als `periods_per_year` im Code. Der Börsenkalender bestätigt
+    es unabhängig — für 2024 und für 2005."""
+    from quantrace.calendars import trading_sessions
+
+    for jahr in (2005, 2024):
+        sessions = trading_sessions("us_equity", date(jahr, 1, 1), date(jahr, 12, 31))
+        assert sessions is not None
+        assert len(sessions) == 252, jahr
+
+
+def test_the_constant_stays_a_convention_not_a_measurement():
+    """Die echte Zahl schwankt — 248 im Jahr 2001 (vier Tage nach dem 11.
+    September), 254 im Jahr 1996. `periods_per_year` darf ihr **nicht**
+    folgen: derselbe Return-Pfad bekäme sonst je nach Jahr eine andere
+    Kennzahl, und zwei Sharpes wären nicht mehr vergleichbar."""
+    from quantrace.calendars import trading_sessions
+
+    assert len(trading_sessions("us_equity", date(2001, 1, 1), date(2001, 12, 31))) == 248
+    assert periods_per_year("us_equity") == 252.0  # unbeeindruckt
+
+
+def test_the_calendar_knows_september_2001():
+    from quantrace.calendars import trading_sessions
+
+    sessions = trading_sessions("us_equity", date(2001, 9, 10), date(2001, 9, 17))
+    assert [str(d.date()) for d in sessions] == ["2001-09-10", "2001-09-17"]
+
+
+def test_crypto_has_no_exchange_calendar():
+    """Bei 24/7 sind die erwarteten Tage trivial — ein Börsenkalender wäre
+    eine Abhängigkeit ohne Zweck. ``None`` heißt „nicht bestimmbar", nicht
+    „keine Handelstage"; die Unterscheidung entscheidet, ob die
+    Qualitätsprüfung das Gegenteil des Richtigen schließt."""
+    from quantrace.calendars import trading_sessions
+
+    assert get_calendar("crypto_24_7").exchange is None
+    assert trading_sessions("crypto_24_7", date(2024, 1, 1), date(2024, 1, 5)) is None
+
+
+def test_a_window_outside_the_bounds_returns_none_not_nonsense():
+    """**Die Falle der Bibliothek.** `exchange_calendars` liefert ohne Angabe
+    ein rollierendes ±20-Jahre-Fenster. Ein Backtest über 1950 läge außerhalb —
+    und dürfte auf keinen Fall wie ein Jahr ohne Handelstage aussehen."""
+    from quantrace.calendars import trading_sessions
+
+    assert trading_sessions("us_equity", date(1950, 1, 1), date(1950, 12, 31)) is None
+
+
+def test_the_bounds_cover_every_universe_in_the_repo():
+    """us_core_etfs nennt 2005–2024 als Backtest-Zeitraum. Die Grenzen müssen
+    mit Luft darüber liegen, sonst fällt die Prüfung genau dort aus, wo das
+    Buch tatsächlich rechnet."""
+    from quantrace.calendars import CALENDAR_END, CALENDAR_START
+
+    assert date.fromisoformat(CALENDAR_START) <= date(2000, 1, 1)
+    assert date.fromisoformat(CALENDAR_END) >= date(2030, 1, 1)
+
+
 def test_crypto_tickers_are_classified_not_defaulted():
     """Ohne Zuordnung fielen sie auf default_class (0.5 bps) zurück — mit einer
     Log-Warnung, die niemand liest."""

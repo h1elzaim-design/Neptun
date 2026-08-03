@@ -289,8 +289,14 @@ def _load_via_lake(
         raw_frames[str(sym)] = f.set_index("date").sort_index()
 
     # Quality-Gate auf den Roh-OHLCV — Fehler (z.B. high<low, Duplikate) stoppen.
+    # Kalender und angefordertes Fenster gehen mit: was eine Lücke ist, hängt
+    # vom Markt ab, und eine zu kurze Historie sieht ohne das Fenster wie eine
+    # vollständige aus (#184).
     report = quality.check_universe(
-        {s: f[[c for c in _OHLCV if c in f.columns]] for s, f in raw_frames.items()}
+        {s: f[[c for c in _OHLCV if c in f.columns]] for s, f in raw_frames.items()},
+        calendar=calendar,
+        expected_start=start,
+        expected_end=end,
     )
     report.log()
     if not report.ok:
