@@ -24,9 +24,10 @@ from typing import NamedTuple
 import pandas as pd
 
 from quantrace import adjust, quality, storage
+from quantrace.calendars import DEFAULT_CALENDAR, calendar_for_class, validate_universe_calendar
 from quantrace.data_providers import bootstrap_credentials, default_provider
 from quantrace.models import MarketData, Timeframe
-from quantrace.providers import tiingo
+from quantrace.providers import tiingo, tiingo_crypto
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ def load_universe(
     adjusted: bool = True,
     cache_dir: Path | None = None,
     force_refresh: bool = False,
+    calendar: str | None = None,
 ) -> MarketData:
     """Lädt OHLCV für eine Symbolliste und gibt ein normalisiertes MarketData zurück.
 
@@ -55,11 +57,18 @@ def load_universe(
         MultiIndex columns: (symbol, field) mit field ∈ {open, high, low, close, volume}
         DatetimeIndex tz-naiv, sortiert.
     """
+    # Ein Universum, ein Kalender (#184) — vor jedem I/O, damit ein gemischtes
+    # Universum nicht erst Daten zieht und dann scheitert.
+    validate_universe_calendar(symbols, calendar, universe=universe)
+
     provider = provider or default_provider()
     if provider == "tiingo":
-        return _load_via_lake(universe, symbols, start, end, timeframe, adjusted, force_refresh)
+        return _load_via_lake(
+            universe, symbols, start, end, timeframe, adjusted, force_refresh, calendar
+        )
     return _load_via_openbb_cache(
-        universe, symbols, start, end, timeframe, provider, adjusted, cache_dir, force_refresh
+        universe, symbols, start, end, timeframe, provider, adjusted, cache_dir,
+        force_refresh, calendar,
     )
 
 
@@ -133,6 +142,42 @@ def _apply_fetched(
     storage.write_coverage(sym, new_start, new_end)
 
 
+def _provider_for(calendar_name: str):
+    """Kalender → Provider-Modul für den Roh-Fetch (#184, Schritt C).
+
+    Nachschlag zur Laufzeit statt einer Modul-Konstante: Tests ersetzen
+    ``data_agent.tiingo``, und eine beim Import gebundene Referenz würde daran
+    vorbeilaufen.
+    """
+    return tiingo_crypto if calendar_name == "crypto_24_7" else tiingo
+
+
+def _split_by_calendar(
+    fetch_ranges: dict[str, tuple[date, date]],
+) -> dict[str, dict[str, tuple[date, date]]]:
+    """Fetch-Bereiche nach Kalender aufteilen — **pro Symbol**, nicht pro Universum.
+
+    Der Kalender-Guardrail (`validate_universe_calendar`) sorgt dafür, dass ein
+    *Universum* homogen ist. Der Lake ist aber breiter als ein Universum: der
+    Daily-Plan lädt die Symbole des Buchs, und das Buch darf legitim einen
+    Equity- und einen Crypto-Sleeve enthalten. Die Weiche gehört deshalb hier
+    ans Symbol, nicht an den Aufrufer.
+
+    Zugeordnet wird über die Kostenklasse aus `config/costs.yaml` — dieselbe
+    Quelle, die der Guardrail benutzt. Ein unklassifiziertes Symbol landet auf
+    ``us_equity``; das ist der bestehende Zustand und keine neue Annahme.
+    """
+    from quantrace.costs import resolve_symbol_costs
+
+    resolved = resolve_symbol_costs(sorted(fetch_ranges))
+    out: dict[str, dict[str, tuple[date, date]]] = {}
+    for sym, window in fetch_ranges.items():
+        profile = resolved.get(sym)
+        cal = calendar_for_class(profile.asset_class) if profile else DEFAULT_CALENDAR
+        out.setdefault(cal, {})[sym] = window
+    return out
+
+
 def refresh_symbols(
     symbols: list[str],
     start: date,
@@ -145,6 +190,11 @@ def refresh_symbols(
     Liest pro Symbol die vorhandene Abdeckung, holt **nur die Lücke** von
     Tiingo und schreibt Partition + Coverage zurück. Gibt die Symbole zurück,
     für die tatsächlich etwas geholt wurde (leer = alles war schon da).
+
+    Welcher Tiingo-Endpunkt gefragt wird, entscheidet ``_split_by_calendar``
+    pro Symbol (#184): Crypto-Paare gehen an den Crypto-Endpunkt, alles andere
+    an EOD. Der Lake dahinter ist derselbe — gleiche Partitionen, gleiches
+    Spaltenlayout, gleiche Adjustierung beim Lesen.
 
     Aus ``_load_via_lake`` herausgezogen, weil es zwei Aufrufer gibt: den
     Backtest-Pfad, der die Daten anschließend selbst liest, und den
@@ -194,7 +244,11 @@ def refresh_symbols(
         len(symbols),
         {s: (str(a), str(b)) for s, (a, b) in fetch_ranges.items()},
     )
-    fetched_frames = tiingo.fetch_universe_raw_ranges(fetch_ranges)
+    fetched_frames: dict[str, pd.DataFrame] = {}
+    for calendar_name, subset in _split_by_calendar(fetch_ranges).items():
+        provider = _provider_for(calendar_name)
+        log.info("  → %s über %s (%d Symbole)", calendar_name, provider.__name__, len(subset))
+        fetched_frames.update(provider.fetch_universe_raw_ranges(subset))
 
     # ── Step 3: Persist updated partitions + coverage in parallel ──────────
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -216,6 +270,7 @@ def _load_via_lake(
     timeframe: Timeframe,
     adjusted: bool,
     force_refresh: bool,
+    calendar: str | None = None,
 ) -> MarketData:
     if timeframe is not Timeframe.DAILY:
         raise ValueError("Lake/Tiingo unterstützt aktuell nur Daily-Daten.")
@@ -258,6 +313,7 @@ def _load_via_lake(
         end=end,
         provider="tiingo",
         adjusted=adjusted,
+        calendar=calendar or DEFAULT_CALENDAR,
         frame=combined,
     )
 
@@ -298,6 +354,7 @@ def _load_via_openbb_cache(
     adjusted: bool,
     cache_dir: Path | None,
     force_refresh: bool,
+    calendar: str | None = None,
 ) -> MarketData:
     filename = _cache_filename(universe, timeframe, start, end, provider)
     uri = str(cache_dir / filename) if cache_dir is not None else storage.cache_path(filename)
@@ -318,6 +375,7 @@ def _load_via_openbb_cache(
         end=end,
         provider=provider,
         adjusted=adjusted,
+        calendar=calendar or DEFAULT_CALENDAR,
         frame=frame,
     )
 

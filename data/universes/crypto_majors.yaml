@@ -1,0 +1,46 @@
+# Erstes Nicht-Aktien-Universum (#184). Liquide USD-Paare über Tiingo-Crypto.
+name: crypto_majors
+description: "Liquide Crypto-USD-Paare — erstes Universum mit 24/7-Kalender."
+timeframe: 1d
+provider: tiingo
+# Handelskalender (#184): 365 statt 252. Der Unterschied ist nicht kosmetisch —
+# derselbe Return-Pfad mit 252 gerechnet ergibt einen um √(365/252) ≈ 1.20 zu
+# hohen Sharpe, und DSR, PBO und der Governance-Score verarbeiten diesen Wert
+# präzise weiter. Ein Kandidat könnte allein durch die falsche Annualisierung
+# über die 0.70-Schwelle rutschen.
+calendar: crypto_24_7
+# Handverlesen und zum Auditdatum handelbar. Für Crypto ist Survivorship-Bias
+# **größer** als bei Aktien, nicht kleiner: der Friedhof aus 2018 und 2022
+# (LUNA, FTT und mehrere hundert kleinere) fehlt hier per Konstruktion, und
+# genau das waren die Coins, die eine Momentum-Strategie gekauft hätte.
+delisted_included: false
+point_in_time: false
+last_audit_date: 2026-08-03
+source_notes: |
+  Kein Index, keine rekonstruierte Mitgliedschaft — eine Liste von neun Paaren,
+  die am 2026-08-03 liquide waren. Wer daraus ein Cross-Sectional-Momentum
+  baut, misst zu einem erheblichen Teil, dass die Überlebenden überlebt haben.
+  Der Survivorship-Audit stuft dieses Universum deshalb als erhöhtes Risiko
+  ein; das ist die richtige Antwort, kein Mangel der Datei.
+
+  Bewusst nicht drin: MATICUSD. Polygon hat 2024 auf POL migriert — die
+  Ticker-Historie ist über den Wechsel hinweg nicht durchgängig, und ein
+  stillschweigend zusammengeklebter Kurspfad wäre schlimmer als eine Lücke.
+  Die Kostenklasse für MATICUSD steht trotzdem in config/costs.yaml, damit ein
+  gezielter Einzelabruf nicht auf default_class fällt.
+
+  Zeitraum: Tiingo-Crypto reicht für BTC/ETH bis ~2011 bzw. ~2015 zurück, für
+  die jüngeren Paare deutlich kürzer (SOL ab 2020, AVAX ab 2020). Ein Backtest
+  über das ganze Universum ist damit faktisch auf den kürzesten gemeinsamen
+  Nenner beschränkt — vor dem ersten Lauf prüfen, welches Startdatum alle neun
+  Paare tatsächlich abdecken.
+symbols:
+  - BTCUSD   # Bitcoin
+  - ETHUSD   # Ethereum
+  - SOLUSD   # Solana
+  - XRPUSD   # XRP
+  - ADAUSD   # Cardano
+  - AVAXUSD  # Avalanche
+  - DOTUSD   # Polkadot
+  - LINKUSD  # Chainlink
+  - LTCUSD   # Litecoin

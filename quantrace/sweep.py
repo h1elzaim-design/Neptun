@@ -139,6 +139,8 @@ class SweepResult(BaseModel):
     """Ergebnis eines kompletten Parameter-Sweeps."""
 
     strategy_id: str
+    #: Siehe BacktestResult.periods_per_year (#184).
+    periods_per_year: float = 252.0
     param_space: dict[str, list[Any]]
     rank_by: str
     total_combinations: int
@@ -421,6 +423,7 @@ def sweep(
 
     return SweepResult(
         strategy_id=spec.strategy_id,
+        periods_per_year=float(data.periods_per_year),
         param_space=spec.param_space,
         rank_by=rank_by,
         total_combinations=total,

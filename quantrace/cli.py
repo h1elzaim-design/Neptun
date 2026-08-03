@@ -57,6 +57,7 @@ def fetch(
         start=start.date(),
         end=end.date(),
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
         provider=provider,
         force_refresh=force,
     )
@@ -115,6 +116,7 @@ def backtest(
         start=start.date(),
         end=end.date(),
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
     )
 
     if param_json:
@@ -183,6 +185,7 @@ def sweep(
         start=start.date(),
         end=end.date(),
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
     )
 
     # param_space entweder aus --params JSON oder vordefinierte Defaults
@@ -331,6 +334,7 @@ def walkforward(
         start=start.date(),
         end=end.date(),
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
     )
 
     label, spec = _resolve_spec(strategy, graph_spec, universe, cfg, {})
@@ -791,6 +795,7 @@ def regime(
         start=start.date(),
         end=end.date(),
         timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
     )
 
     bench = close_prices(md).mean(axis=1)

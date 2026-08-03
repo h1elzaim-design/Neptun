@@ -285,6 +285,7 @@ def walk_forward(
 
     return WalkForwardResult(
         strategy_id=spec.strategy_id,
+        periods_per_year=float(data.periods_per_year),
         n_folds=len(folds),  # tatsächlich evaluierte Folds (degenerierte übersprungen)
         rank_by=rank_by,
         folds=folds,

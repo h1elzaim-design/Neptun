@@ -64,6 +64,23 @@ def run_inline(
     return _execute(strategy, strategy_id, data, config or BacktestConfig())
 
 
+def _resolve_annualization(config: BacktestConfig, data: MarketData) -> float:
+    """Perioden pro Jahr für diesen Lauf — aus den Daten, nicht aus dem Default.
+
+    `BacktestConfig.annualization` bleibt als **Override** bestehen: wer sie
+    explizit setzt, meint sie auch (Tests, Sonderfälle). Wer sie nicht anfasst,
+    bekommt den Kalender des Universums.
+
+    Warum die Unterscheidung über `model_fields_set` und nicht über einen
+    ``None``-Default: der Feld-Default 252 ist seit jeher öffentlich, und ein
+    Wechsel auf ``None`` würde jeden Aufrufer treffen, der ihn liest. So bleibt
+    das Feld, was es war, und bekommt nur eine ehrlichere Herkunft (#184).
+    """
+    if "annualization" in config.model_fields_set:
+        return float(config.annualization)
+    return float(data.periods_per_year)
+
+
 def _execute(
     strategy: Strategy,
     strategy_id: str,
@@ -105,15 +122,18 @@ def _execute(
             cash_sharing=False,
         )
 
+    annualization = _resolve_annualization(config, data)
+
     equity = _aggregate_equity(pf, config.cash)
-    metrics = _compute_metrics(equity, config.annualization)
+    metrics = _compute_metrics(equity, annualization)
     trades = _trade_metrics(pf)
-    turnover = _turnover_annual(pf, equity, config.annualization)
+    turnover = _turnover_annual(pf, equity, annualization)
 
     return BacktestResult(
         strategy_id=strategy_id,
         data_hash=data.content_hash,
         config=config,
+        periods_per_year=annualization,
         start=_to_date(close.index[0]),
         end=_to_date(close.index[-1]),
         total_return=metrics["total_return"],
@@ -280,7 +300,7 @@ def _aggregate_equity(pf, init_cash: float) -> pd.Series:
     return val.astype(float)
 
 
-def _compute_metrics(equity: pd.Series, ann: int) -> dict[str, float]:
+def _compute_metrics(equity: pd.Series, ann: float) -> dict[str, float]:
     ret = equity.pct_change().dropna()
     if ret.empty or equity.iloc[0] == 0:
         return dict.fromkeys(
@@ -351,7 +371,7 @@ def _order_notionals(orders: pd.DataFrame) -> list[float]:
     return [float(x) for x in notional.to_numpy() if np.isfinite(x)]
 
 
-def _turnover_annual(pf, equity: pd.Series, annualization: int) -> float | None:
+def _turnover_annual(pf, equity: pd.Series, annualization: float) -> float | None:
     """Annualisierter Turnover aus den Order-Records; None wenn nicht ableitbar.
 
     Der Haupttreiber der realisierten Kosten — und ohne ihn ist jede

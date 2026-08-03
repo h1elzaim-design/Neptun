@@ -5,6 +5,10 @@ name: factor_etfs
 description: "Investierbare Faktor-ETFs (Momentum, Value, Quality, Size, Low-Vol, …)."
 timeframe: 1d
 provider: tiingo
+# Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
+# Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
+# an jedem Sharpe, der daraus entsteht.
+calendar: us_equity
 delisted_included: true
 point_in_time: false
 last_audit_date: 2026-06-05

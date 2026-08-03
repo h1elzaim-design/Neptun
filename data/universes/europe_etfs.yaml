@@ -3,6 +3,10 @@ name: europe_etfs
 description: "Europa-Exposure via US-gelistete ETFs (breit, Eurozone, Länder, währungsgehedged)."
 timeframe: 1d
 provider: tiingo
+# Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
+# Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
+# an jedem Sharpe, der daraus entsteht.
+calendar: us_equity
 # Bewusst US-gelistete Europa-ETFs statt EU-domizilierter UCITS: sie handeln in
 # der US-Session mit sauberem Tiingo-EOD und laufen ohne OpenBB-Umweg im
 # bestehenden Lake. Underlying-Session ≠ US-Handelszeit → Premium/Discount-Risiko

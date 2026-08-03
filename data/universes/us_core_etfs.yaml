@@ -3,6 +3,10 @@ name: us_core_etfs
 description: "Breite US-Aktien-ETFs für robuste Daily-Strategien."
 timeframe: 1d
 provider: tiingo
+# Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
+# Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
+# an jedem Sharpe, der daraus entsteht.
+calendar: us_equity
 # All 16 listed are still trading at the time of audit. Survivorship bias is
 # negligible for the broad-market and sector-SPDR ETFs (no major ETF in this
 # basket has been liquidated in the relevant backtest window 2005-2024).

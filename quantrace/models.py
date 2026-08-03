@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from quantrace.calendars import DEFAULT_CALENDAR, get_calendar
+from quantrace.calendars import periods_per_year as _ppy
+
 if TYPE_CHECKING:
     pass
 
@@ -60,8 +63,31 @@ class MarketData(BaseModel):
     end: date
     provider: str = Field(..., description="OpenBB-Provider, z.B. 'yfinance', 'fmp'")
     adjusted: bool = True
+    #: Handelskalender des Universums (#184). Aus `data/universes/*.yaml`.
+    calendar: str = Field(
+        default=DEFAULT_CALENDAR,
+        description="us_equity | crypto_24_7 — bestimmt die Annualisierung.",
+    )
     frame: Any = Field(..., exclude=True)  # pd.DataFrame — lazy import, see module docstring
     content_hash: str = ""
+
+    @field_validator("calendar")
+    @classmethod
+    def _calendar_must_be_known(cls, v: str) -> str:
+        """Tippfehler früh abfangen. Ein unbekannter Kalender darf nicht still
+        auf den Default zurückfallen — dann wäre die Annualisierung falsch,
+        ohne dass es jemand merkt."""
+        return get_calendar(v).name
+
+    @property
+    def periods_per_year(self) -> float:
+        """Perioden pro Jahr — **abgeleitet**, kein eigenes Feld.
+
+        Als Feld könnte es vom `calendar` abweichen, und genau diese Art von
+        stiller Divergenz ist der Fehler, den #184 beseitigt. Es gibt eine
+        Wahrheit: den Kalender.
+        """
+        return _ppy(self.calendar)
 
     @field_validator("frame")
     @classmethod
@@ -203,6 +229,10 @@ class BacktestResult(BaseModel):
     config: BacktestConfig
     start: date
     end: date
+    #: Womit annualisiert wurde (#184). Steht oben statt nur in `config`, weil
+    #: die Analytics-Schicht der Webapp es shape-unabhängig lesen muss — Sweep
+    #: und Walk-Forward haben andere Ergebnis-Formen, aber denselben Schlüssel.
+    periods_per_year: float = 252.0
 
     # Performance
     total_return: float
@@ -289,6 +319,8 @@ class WalkForwardResult(BaseModel):
     """Aggregiertes Ergebnis einer Walk-Forward-Validation über mehrere Folds."""
 
     strategy_id: str
+    #: Siehe BacktestResult.periods_per_year (#184).
+    periods_per_year: float = 252.0
     n_folds: int
     rank_by: str = "sharpe"
     folds: list[FoldResult] = Field(default_factory=list)
