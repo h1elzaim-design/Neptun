@@ -7,7 +7,7 @@ dass der Job-Code keinen Submit-Pfad importiert.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -188,5 +188,83 @@ def test_latest_prices_picks_last_close_per_symbol(monkeypatch):
     monkeypatch.setattr(
         "quantrace.storage.read_symbols", lambda symbols, start, end: df
     )
-    prices = daily_plan_job._latest_prices(["SPY", "QQQ", "GLD"], AS_OF)
+    prices, dates = daily_plan_job._latest_prices(["SPY", "QQQ", "GLD"], AS_OF)
     assert prices == {"SPY": 505.0, "QQQ": 400.0}  # GLD ohne Partition fehlt
+    # Das Datum kommt mit, sonst ist der Preis nicht prüfbar (#192).
+    assert dates == {"SPY": date(2026, 7, 1), "QQQ": date(2026, 6, 30)}
+
+
+# --- Kursstand: Alter sichtbar machen (#192) ----------------------------------
+#
+# Der Job las bis 2026-08-03 nur aus dem Lake; nichts holte auf Zeitplan Daten
+# nach. Ein Plan auf drei Wochen alten Kursen sah damit genauso aus wie einer
+# auf heutigen. Diese Tests halten fest, dass das Alter jetzt im Plan steht und
+# ab einer Grenze zum Alert wird.
+
+
+def _plan_with_dates(price_dates, **kw):
+    return build_daily_plan(
+        _registry({"SPY": 0.6, "QQQ": 0.4}),
+        [_pos("SPY", 100)],
+        {"SPY": 500.0, "QQQ": 400.0},
+        100_000.0,
+        _limits(),
+        as_of=AS_OF,
+        price_dates=price_dates,
+        **kw,
+    )
+
+
+def test_price_age_is_recorded():
+    report = _plan_with_dates({"SPY": date(2026, 7, 2), "QQQ": date(2026, 7, 2)})
+    assert report.price_as_of == date(2026, 7, 2)
+    assert report.price_age_days == 1
+
+
+def test_fresh_prices_raise_no_alert():
+    report = _plan_with_dates({"SPY": date(2026, 7, 2), "QQQ": date(2026, 7, 2)})
+    assert not any("VERALTETE KURSE" in a for a in report.alerts)
+
+
+def test_stale_prices_are_flagged():
+    """Drei Wochen alt — das darf nicht still durchgehen."""
+    old = date(2026, 6, 12)
+    report = _plan_with_dates({"SPY": old, "QQQ": old})
+    assert report.price_age_days == 21
+    assert any("VERALTETE KURSE" in a for a in report.alerts)
+
+
+def test_a_single_lagging_symbol_is_named():
+    """Ein Symbol, das nicht mehr aktualisiert wird, verzerrt die Ist-Gewichte,
+    ohne dass die Gesamtlage alt aussieht — der häufigere und tückischere Fall."""
+    report = _plan_with_dates({"SPY": date(2026, 7, 2), "QQQ": date(2026, 5, 1)})
+    assert report.price_age_days == 1, "die Gesamtlage sieht frisch aus"
+    assert any(a.startswith("Nachzügler QQQ") for a in report.alerts)
+
+
+def test_threshold_is_generous_enough_for_a_long_weekend():
+    """Ein Alert, den man täglich wegklickt, ist schlimmer als keiner. Freitag
+    zu Dienstag nach Feiertag sind vier Tage — die dürfen nicht feuern."""
+    from quantrace.paper.daily_plan import MAX_PRICE_AGE_DAYS
+
+    assert MAX_PRICE_AGE_DAYS >= 4
+    report = _plan_with_dates({"SPY": AS_OF - timedelta(days=4)})
+    assert not any("VERALTETE KURSE" in a for a in report.alerts)
+
+
+def test_without_price_dates_nothing_changes():
+    """Alte Aufrufer (und Tests) sollen unverändert funktionieren."""
+    report = _plan_with_dates(None)
+    assert report.price_as_of is None
+    assert report.price_age_days is None
+    assert not any("VERALTETE KURSE" in a for a in report.alerts)
+
+
+def test_price_age_lands_in_the_note():
+    """Nur im Log wäre es wertlos — der Kursstand gehört in die Note, die man
+    beim Review liest."""
+    report = _plan_with_dates({"SPY": date(2026, 6, 12)})
+    note = render_plan_note(report)
+    assert note.frontmatter["price_as_of"] == date(2026, 6, 12)
+    assert note.frontmatter["price_age_days"] == 21
+    assert "Kursstand:" in note.body

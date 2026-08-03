@@ -133,17 +133,32 @@ def _apply_fetched(
     storage.write_coverage(sym, new_start, new_end)
 
 
-def _load_via_lake(
-    universe: str,
+def refresh_symbols(
     symbols: list[str],
     start: date,
     end: date,
-    timeframe: Timeframe,
-    adjusted: bool,
-    force_refresh: bool,
-) -> MarketData:
-    if timeframe is not Timeframe.DAILY:
-        raise ValueError("Lake/Tiingo unterstützt aktuell nur Daily-Daten.")
+    *,
+    force_refresh: bool = False,
+) -> list[str]:
+    """Den Lake für ``symbols`` über ``start..end`` aktuell machen.
+
+    Liest pro Symbol die vorhandene Abdeckung, holt **nur die Lücke** von
+    Tiingo und schreibt Partition + Coverage zurück. Gibt die Symbole zurück,
+    für die tatsächlich etwas geholt wurde (leer = alles war schon da).
+
+    Aus ``_load_via_lake`` herausgezogen, weil es zwei Aufrufer gibt: den
+    Backtest-Pfad, der die Daten anschließend selbst liest, und den
+    Daily-Plan-Job, der nur sicherstellen will, dass die Kurse aktuell sind,
+    bevor er plant (#192). Zwei Kopien wären zwei Verhalten — und ausgerechnet
+    beim Nachladen von Kursen darf es nur eines geben.
+
+    Fehlt ein einzelnes Symbol bei Tiingo, überspringt
+    ``fetch_universe_raw_ranges`` es mit einer Warnung; der Lake behält dann
+    seinen alten Stand für dieses Symbol. Der Aufrufer entscheidet, ob ihn das
+    stört — der Daily-Plan macht daraus einen Alert.
+    """
+    if not symbols:
+        return []
 
     workers = min(_MAX_IO_WORKERS, len(symbols))
 
@@ -159,37 +174,53 @@ def _load_via_lake(
 
     # ── Step 2: Batch-fetch only the symbols/ranges that are missing ────────
     plans_needing_fetch = [p for p in plans if p.need]
-    fetched_frames: dict[str, pd.DataFrame] = {}
-    if plans_needing_fetch:
-        # Per symbol: fetch only the actual gap (bounding box of its missing
-        # ranges), never the full start..end.  A symbol with an existing
-        # coverage window in the middle can have both a before- and an
-        # after-gap; we request the span between them (a small re-fetch of the
-        # covered middle) rather than adding multi-range request logic — but the
-        # common incremental case (extend forward or backward) fetches exactly
-        # the one gap.  fetch_universe_raw_ranges shares a single httpx.Client.
-        fetch_ranges = {
-            p.symbol: (min(g[0] for g in p.need), max(g[1] for g in p.need))
-            for p in plans_needing_fetch
-        }
-        log.info(
-            "Tiingo-Fetch für %d/%d Symbole (gaps: %s)",
-            len(fetch_ranges),
-            len(symbols),
-            {s: (str(a), str(b)) for s, (a, b) in fetch_ranges.items()},
-        )
-        fetched_frames = tiingo.fetch_universe_raw_ranges(fetch_ranges)
+    if not plans_needing_fetch:
+        return []
+
+    # Per symbol: fetch only the actual gap (bounding box of its missing
+    # ranges), never the full start..end.  A symbol with an existing
+    # coverage window in the middle can have both a before- and an
+    # after-gap; we request the span between them (a small re-fetch of the
+    # covered middle) rather than adding multi-range request logic — but the
+    # common incremental case (extend forward or backward) fetches exactly
+    # the one gap.  fetch_universe_raw_ranges shares a single httpx.Client.
+    fetch_ranges = {
+        p.symbol: (min(g[0] for g in p.need), max(g[1] for g in p.need))
+        for p in plans_needing_fetch
+    }
+    log.info(
+        "Tiingo-Fetch für %d/%d Symbole (gaps: %s)",
+        len(fetch_ranges),
+        len(symbols),
+        {s: (str(a), str(b)) for s, (a, b) in fetch_ranges.items()},
+    )
+    fetched_frames = tiingo.fetch_universe_raw_ranges(fetch_ranges)
 
     # ── Step 3: Persist updated partitions + coverage in parallel ──────────
-    plans_needing_write = [p for p in plans if p.need]
-    if plans_needing_write:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures_write = {
-                pool.submit(_apply_fetched, p, fetched_frames, start, end): p.symbol
-                for p in plans_needing_write
-            }
-            for fut in as_completed(futures_write):
-                fut.result()  # re-raise any exception from the worker
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures_write = {
+            pool.submit(_apply_fetched, p, fetched_frames, start, end): p.symbol
+            for p in plans_needing_fetch
+        }
+        for fut in as_completed(futures_write):
+            fut.result()  # re-raise any exception from the worker
+
+    return sorted(fetched_frames)
+
+
+def _load_via_lake(
+    universe: str,
+    symbols: list[str],
+    start: date,
+    end: date,
+    timeframe: Timeframe,
+    adjusted: bool,
+    force_refresh: bool,
+) -> MarketData:
+    if timeframe is not Timeframe.DAILY:
+        raise ValueError("Lake/Tiingo unterstützt aktuell nur Daily-Daten.")
+
+    refresh_symbols(symbols, start, end, force_refresh=force_refresh)
 
     # ── Step 4: DuckDB bulk-read from lake ──────────────────────────────────
     long_df = storage.read_symbols(symbols, start, end)

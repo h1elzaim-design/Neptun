@@ -26,6 +26,15 @@ from quantrace.models import KnowledgeNote
 from quantrace.paper.rebalance import RebalancePlan, RiskLimits, plan_rebalance
 from quantrace.paper.registry import WEIGHTING_BASIS_NEUTRAL, PortfolioRegistry
 
+#: Ab wann ein Kursstand als veraltet gilt (Kalendertage).
+#:
+#: Großzügig, weil ein langes Wochenende plus Feiertag schon vier Tage frisst
+#: und Tiingos EOD am Abend des Handelstags noch nachhängen kann. Ein zu enger
+#: Wert erzeugt täglich falschen Alarm — und ein Alert, den man wegklickt, ist
+#: schlimmer als keiner.
+MAX_PRICE_AGE_DAYS = 5
+
+
 #: Ab dieser absoluten Gewichts-Abweichung (Ist − Soll) pro Symbol wird ein
 #: Drift-Alert in die Note geschrieben. 5 Prozentpunkte = deutlich mehr als
 #: tägliches Markt-Rauschen bei ETF-Sleeves.
@@ -58,6 +67,11 @@ class DailyPlanReport:
     drift: list[DriftRow] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     registry_warnings: list[str] = field(default_factory=list)
+    #: Jüngster Schlusskurs, den der Plan gesehen hat, und sein Alter in Tagen.
+    #: Ohne das steht in der Note eine Zahl ohne Datum — und ein Plan auf drei
+    #: Wochen alten Kursen sieht genauso aus wie einer auf heutigen (#192).
+    price_as_of: date | None = None
+    price_age_days: int | None = None
 
     @property
     def max_abs_drift(self) -> float:
@@ -72,6 +86,8 @@ def build_daily_plan(
     limits: RiskLimits,
     *,
     as_of: date,
+    price_dates: dict[str, date] | None = None,
+    max_price_age_days: int = MAX_PRICE_AGE_DAYS,
     drawdown: float = 0.0,
     drift_alert_threshold: float = DRIFT_ALERT_THRESHOLD,
 ) -> DailyPlanReport:
@@ -131,6 +147,28 @@ def build_daily_plan(
                 "unvollständig, Symbol im Plan übersprungen."
             )
 
+    # Wie alt sind die Kurse, auf denen hier geplant wird? Ein Plan auf
+    # veralteten Daten ist gefährlicher als gar keiner, weil er genauso
+    # aussieht wie ein frischer.
+    price_as_of = max(price_dates.values()) if price_dates else None
+    price_age_days = (as_of - price_as_of).days if price_as_of else None
+    if price_as_of is not None and price_age_days is not None:
+        if price_age_days > max_price_age_days:
+            alerts.append(
+                f"VERALTETE KURSE: jüngster Close ist {price_as_of.isoformat()} "
+                f"({price_age_days} Tage alt, Grenze {max_price_age_days}). "
+                "Der Plan beruht auf altem Stand — vor einer Ausführung neu fetchen."
+            )
+        # Einzelne Nachzügler: ein Symbol, das nicht mehr aktualisiert wird,
+        # verzerrt die Ist-Gewichte, ohne dass die Gesamtlage alt aussieht.
+        for sym, d in sorted(price_dates.items()):
+            lag = (price_as_of - d).days
+            if lag > max_price_age_days:
+                alerts.append(
+                    f"Nachzügler {sym}: letzter Close {d.isoformat()} — {lag} Tage "
+                    "hinter dem Rest. Ist-Gewicht für dieses Symbol unzuverlässig."
+                )
+
     return DailyPlanReport(
         as_of=as_of,
         account_value=float(account_value),
@@ -141,6 +179,8 @@ def build_daily_plan(
         drift=drift_rows,
         alerts=alerts,
         registry_warnings=list(registry.warnings),
+        price_as_of=price_as_of,
+        price_age_days=price_age_days,
     )
 
 
@@ -168,6 +208,8 @@ def render_plan_note(report: DailyPlanReport) -> KnowledgeNote:
         "blocked": report.plan.blocked,
         "max_abs_drift": round(report.max_abs_drift, 6),
         "n_alerts": len(report.alerts),
+        "price_as_of": report.price_as_of,
+        "price_age_days": report.price_age_days,
         "executed": False,  # wird nur durch den gated Execute-Flow wahr
         "status": "open",
     }
@@ -183,8 +225,13 @@ def render_plan_note(report: DailyPlanReport) -> KnowledgeNote:
         f"- **Kandidaten im Sleeve:** {report.n_candidates} ({report.weighting}, {report.weighting_basis})",
         f"- **Geplante Orders:** {report.plan.n_orders} · Turnover {report.plan.turnover:.2%} · Gross danach {report.plan.gross_after:.2f}",
         f"- **Blocked:** {'JA — kein Order-Vorschlag' if report.plan.blocked else 'nein'}",
-        "",
     ]
+    if report.price_as_of is not None:
+        lines.append(
+            f"- **Kursstand:** {report.price_as_of.isoformat()} "
+            f"({report.price_age_days} Tage alt)"
+        )
+    lines.append("")
 
     if report.alerts:
         lines += ["### ⚠️ Alerts", ""]
