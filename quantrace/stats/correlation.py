@@ -33,6 +33,40 @@ def correlation_matrix(returns: pd.DataFrame, window: int | None = None) -> pd.D
     return clean.corr()
 
 
+def rolling_correlation(returns: pd.DataFrame, window: int) -> pd.Series:
+    """Rollierendes ρ **eines Paares** über die gemeinsamen Handelstage.
+
+    Erwartet genau zwei Spalten. Der Grund für die Enge: `DataFrame.rolling`
+    liefert für n Spalten eine MultiIndex-Matrix je Zeitpunkt, und die daraus
+    wieder auf ein Paar herunterzuschneiden lädt zu genau dem Fehler ein, den
+    `correlation_matrix` vermeidet — paarweise Korrelationen über verschiedene
+    Zeiträume. Hier werden **erst** die gemeinsamen Tage gebildet, **dann**
+    gerollt.
+
+    Der Rückgabewert enthält bewusst die führenden NaN nicht: die ersten
+    `window - 1` Tage haben kein volles Fenster, und eine Kurve, die dort bei 0
+    beginnt, behauptete Unkorreliertheit, wo schlicht nichts gemessen wurde.
+    """
+    if returns.shape[1] != 2:
+        raise ValueError(f"Rolling-Korrelation braucht genau 2 Spalten, bekam {returns.shape[1]}.")
+    if window < 3:
+        raise ValueError(f"Fenster muss mindestens 3 Beobachtungen umfassen (war {window}).")
+
+    clean = returns.dropna(how="any")
+    if len(clean) < window:
+        raise ValueError(
+            f"Zu wenige gemeinsame Beobachtungen für ein Fenster von {window} "
+            f"({len(clean)} verfügbar)."
+        )
+
+    a, b = clean.columns
+    series = clean[a].rolling(window).corr(clean[b])
+    # Eine konstante Reihe im Fenster ergibt 0/0 → ±inf oder NaN. Beides ist
+    # „nicht messbar", nicht „0" — und muss aus der Kurve fallen, statt sie
+    # nach oben oder unten zu reißen.
+    return series.replace([np.inf, -np.inf], np.nan).dropna()
+
+
 def cluster_order(corr: pd.DataFrame) -> list[str]:
     """Blattreihenfolge eines Average-Linkage-Dendrogramms auf d = 1 − |ρ|."""
     labels = list(corr.columns)
