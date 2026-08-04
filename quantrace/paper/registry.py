@@ -29,7 +29,8 @@ Aufbau (rein, kein Netz, kein git — nur Filesystem-Reads im Repo):
 4. **Innerhalb** eines Sleeves: Gleichgewichtung über die Universe-Symbole.
    Das ist bewusst die *neutrale* Allokation — die signal-konditionierte
    Version (Positionen aus dem tatsächlichen Strategie-Signal) kommt mit dem
-   Daily-Rebalance-Cron (PLAN.md P0 #6) und ersetzt dann nur diesen Schritt.
+   Daily-Rebalance-Cron (siehe ``daily_plan.py``) und ersetzt dann nur diesen
+   Schritt.
 
 Die Governance-Invariante bleibt unberührt: die Registry *plant* nur —
 Ausführung läuft weiter über den gated Executor.

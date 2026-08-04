@@ -1,4 +1,4 @@
-"""Daily-Rebalance-Plan + Reconciliation — PLAN.md P0 #6/#7 (Rechen-Kern).
+"""Daily-Rebalance-Plan + Reconciliation (Rechen-Kern).
 
 Der tägliche Zyklus nach US-Close: Registry-Zielgewichte gegen die echten
 Broker-Positionen halten, Drift messen, den Rebalance-Plan rechnen und alles

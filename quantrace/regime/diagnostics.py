@@ -1,7 +1,7 @@
 """Regime-Robustheits-Diagnostik — Stationarität, Persistenz, Fit-Stabilität.
 
-PLAN.md P0 #4. Drei Fragen, die ein HMM-Regime beantworten muss, bevor man
-Strategien darauf konditioniert:
+Drei Fragen, die ein HMM-Regime beantworten muss, bevor man Strategien darauf
+konditioniert:
 
 1. **Sind die Features stationär?** Die Gauss-Emissionen des HMM setzen
    voraus, dass Trend/Vol *innerhalb* eines Regimes aus einer stabilen

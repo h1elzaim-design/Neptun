@@ -2,8 +2,9 @@
 
 This package computes *what would be traded* to move a paper portfolio to its
 target weights. It deliberately submits nothing: turning a plan into broker
-orders is gated behind explicit human approval (see docs/proposals/paper_trading.md
-and CLAUDE.md "handelt nie autonom"). The planner is pure and unit-tested so the
+orders is gated behind explicit human approval (see ADR-005 in
+docs/ARCHITECTURE.md and CLAUDE.md "handelt nie autonom"). The planner is pure
+and unit-tested so the
 risky part — execution — stays a thin, separately-reviewed adapter.
 """
 
