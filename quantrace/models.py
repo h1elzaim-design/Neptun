@@ -325,6 +325,15 @@ class WalkForwardResult(BaseModel):
     rank_by: str = "sharpe"
     folds: list[FoldResult] = Field(default_factory=list)
 
+    #: Die Annahmen, unter denen ALLE Folds gerechnet wurden — allen voran die
+    #: Kosten. Sweeps persistieren sie längst (``runs[].result.config``); hier
+    #: fehlten sie, und weil der Evaluation-Agent fehlende Kosten als *null*
+    #: las, bekam jeder Walk-Forward ``realism 0.00``. Der disziplinierte Pfad
+    #: wurde damit gegenüber einem Grid systematisch schlechter bewertet, aus
+    #: einem Grund, der nichts mit der Strategie zu tun hat.
+    #: ``None`` auf Alt-Ergebnissen — dort ist die Annahme unbekannt, nicht null.
+    config: BacktestConfig | None = None
+
     # Aggregierte Metriken
     is_sharpe_mean: float = Field(0.0, description="Durchschnitt Sharpe In-Sample")
     oos_sharpe_mean: float = Field(0.0, description="Durchschnitt Sharpe Out-of-Sample")

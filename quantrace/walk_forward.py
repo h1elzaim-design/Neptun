@@ -295,4 +295,7 @@ def walk_forward(
         fdr=fdr_summary,
         oos_inference=oos_inference,
         oos_equity=oos_equity,
+        # Ein Walk-Forward rechnet jeden Fold mit denselben Annahmen — die
+        # Config gehört deshalb einmal an die Spitze, nicht pro Fold.
+        config=config,
     )
