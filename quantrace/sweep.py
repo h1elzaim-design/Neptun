@@ -14,6 +14,9 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -205,6 +208,291 @@ def _generate_param_grid(param_space: dict[str, list[Any]]) -> list[dict[str, An
     return [dict(zip(keys, combo, strict=False)) for combo in itertools.product(*values)]
 
 
+# ---------------------------------------------------------------------------
+# Parallele Grid-Ausführung (#210 Punkt 1)
+#
+# Jede Kombination ist unabhängig — embarrassingly parallel. Der Gewinn ist
+# keine Bequemlichkeit: solange Sweep×Walk-Forward teuer ist, wird der billige
+# Pfad genommen (so kam `grid_global_macro` ohne WF ins Buch), und die
+# Disziplin-Schicht erodiert nicht durch Umgehung, sondern durch Laufzeit.
+#
+# **Prozesse, nicht Threads:** vectorbt/numba rechnen unter dem GIL.
+#
+# **`spawn`, nicht `fork`:** unter fork erbt das Kind den bereits
+# initialisierten Thread-Pool von OpenBLAS/numba. Die Thread-Limits unten
+# griffen dann nicht — die Bibliotheken lesen ihre Env-Variablen beim *Import*,
+# und der ist im Elternprozess längst passiert. Zwei Prozesse mit je zwei
+# BLAS-Threads auf zwei Kernen sind Überbuchung; der Sweep würde langsamer statt
+# schneller. `spawn` importiert im Kind frisch, damit greifen die Limits.
+#
+# Der Preis von spawn ist ein vectorbt-Import pro Worker (~Sekunden). Deshalb
+# der Mindest-Grid-Schwellwert: bei vier Kombinationen frisst der Poolstart den
+# Gewinn auf.
+
+#: Vom Worker-Initializer gesetzt. Die MarketData wandert **einmal pro Worker**
+#: über die Prozessgrenze (via `initargs`), nicht einmal pro Kombination.
+_W_SPEC: StrategySpec | None = None
+_W_DATA: MarketData | None = None
+_W_CONFIG: BacktestConfig | None = None
+
+#: Jeder Worker rechnet single-threaded. Ohne das multipliziert sich
+#: Prozess-Parallelität mit BLAS-Thread-Parallelität.
+_THREAD_LIMIT_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "NUMBA_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+#: Unter diesem Grid lohnt der Poolstart nicht — und die Grenze hängt stark
+#: davon ab, wie der Prozess entsteht. Gemessen auf 4 Kernen (Zahlen in der
+#: PR-Beschreibung):
+#:
+#:   fork :  24 Kombis → 4.4× (2 Proz.),  200 → 1.8×/3.3× (2/4 Proz.)
+#:   spawn:  24 Kombis → 0.85×,           200 → 1.26×/1.54×
+#:
+#: Unter `spawn` zahlt jeder Worker vectorbt-Import **und** eine volle
+#: numba-JIT-Runde; das kommt erst jenseits von ~100 Kombinationen herein, und
+#: darunter ist parallel schlicht langsamer als seriell. Unter `fork` erbt das
+#: Kind beides, der Fixkostenblock entfällt.
+_MIN_GRID_BY_START_METHOD = {"fork": 4, "forkserver": 4, "spawn": 128}
+DEFAULT_MIN_GRID_FOR_PARALLEL = 4
+
+
+def _worker_init(spec: StrategySpec, data: MarketData, config: BacktestConfig) -> None:
+    """Läuft einmal pro Worker-Prozess, vor der ersten Kombination."""
+    for var in _THREAD_LIMIT_VARS:
+        os.environ[var] = "1"
+    global _W_SPEC, _W_DATA, _W_CONFIG
+    _W_SPEC, _W_DATA, _W_CONFIG = spec, data, config
+
+
+def _worker_run(item: tuple[int, dict[str, Any]]) -> tuple[int, BacktestResult | None, str | None]:
+    """Eine Kombination im Worker. Gibt **immer** den Grid-Index zurück.
+
+    Der Index ist der Grund, warum das Ergebnis deterministisch bleibt: der
+    Aufrufer sortiert danach ein, nicht nach Fertigstellungsreihenfolge.
+
+    Fehler werden als Text zurückgegeben statt geworfen. Eine Exception über die
+    Prozessgrenze würde den `map`-Aufruf abbrechen und damit den ganzen Sweep
+    kippen — heute zählt die serielle Schleife pro Kombination hoch und läuft
+    weiter, und genau das muss erhalten bleiben.
+    """
+    index, params = item
+    if _W_SPEC is None or _W_DATA is None or _W_CONFIG is None:  # pragma: no cover
+        return index, None, "Worker ohne Initialisierung"
+    try:
+        run_spec = _W_SPEC.model_copy(update={"params": {**_W_SPEC.params, **params}})
+        return index, run_backtest(run_spec, _W_DATA, _W_CONFIG), None
+    except Exception as exc:  # noqa: BLE001 — 1:1 das Verhalten der seriellen Schleife
+        return index, None, str(exc)
+
+
+def available_cpus() -> int:
+    """Wie viele Kerne uns **tatsächlich** zustehen.
+
+    `os.cpu_count()` meldet die Kerne der *Maschine*, nicht das Kontingent des
+    Containers. Die Container App hat 2 vCPU (``infra/azure/container-app.bicep``),
+    läuft aber auf einem deutlich größeren Knoten — nach `cpu_count` würden wir
+    ein Vielfaches an Prozessen starten. Jeder davon importiert vectorbt/numba
+    mit dreistelligem MB-RSS; in 4 GB ist das ein OOM-Kill, kein Speedup.
+
+    Die cgroup-Quote ist die einzige Quelle, die das Kontingent kennt. Reihenfolge:
+    cgroup v2 → v1 → CPU-Affinität → `cpu_count`.
+    """
+    # cgroup v2: "<quota> <period>" oder "max <period>" (= unbegrenzt)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            raw = fh.read().split()
+        if len(raw) == 2 and raw[0] != "max":
+            quota, period = int(raw[0]), int(raw[1])
+            if quota > 0 and period > 0:
+                return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+
+    # cgroup v1: getrennte Dateien, quota == -1 heißt unbegrenzt
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            quota = int(fh.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            period = int(fh.read())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+
+    # Affinität fängt Taskset/Pinning ab, aber keine Quote.
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover — nicht-POSIX
+        pass
+
+    return max(1, os.cpu_count() or 1)
+
+
+def resolve_workers(n_grid: int, requested: int | None = None) -> int:
+    """Wie viele Prozesse für dieses Grid — 1 heißt seriell.
+
+    Reihenfolge: expliziter Parameter, dann ``QUANTRACE_SWEEP_WORKERS``, dann
+    die sichtbaren Kerne. ``QUANTRACE_SWEEP_WORKERS=1`` ist der Rollback-Pfad,
+    analog zu ``BACKTEST_WORKER=local``: eine Env-Variable, die den alten Code
+    zurückholt, ohne ein Deployment.
+
+    Mehr Prozesse als Kombinationen wären leere Worker; mehr als Kerne wäre
+    Überbuchung. Beides wird gekappt.
+    """
+    if n_grid <= 1:
+        return 1
+
+    if requested is None:
+        raw = os.environ.get("QUANTRACE_SWEEP_WORKERS", "").strip()
+        if raw:
+            try:
+                requested = int(raw)
+            except ValueError:
+                log.warning("QUANTRACE_SWEEP_WORKERS=%r ist keine Zahl — ignoriert.", raw)
+
+    if requested is None:
+        requested = available_cpus()
+    if requested <= 1:
+        return 1
+
+    min_grid = _MIN_GRID_BY_START_METHOD.get(_start_method(), DEFAULT_MIN_GRID_FOR_PARALLEL)
+    raw_min = os.environ.get("QUANTRACE_SWEEP_MIN_GRID", "").strip()
+    if raw_min:
+        try:
+            min_grid = int(raw_min)
+        except ValueError:
+            log.warning("QUANTRACE_SWEEP_MIN_GRID=%r ist keine Zahl — ignoriert.", raw_min)
+    if n_grid < min_grid:
+        return 1
+
+    return max(1, min(requested, n_grid))
+
+
+def _run_grid_serial(
+    spec: StrategySpec,
+    data: MarketData,
+    config: BacktestConfig,
+    grid: list[dict[str, Any]],
+) -> tuple[list[SweepRun], int]:
+    """Die ursprüngliche Schleife — auch der Fallback, wenn der Pool stirbt."""
+    runs: list[SweepRun] = []
+    failed = 0
+    total = len(grid)
+
+    for i, params in enumerate(grid, 1):
+        # Neues Spec mit konkreten Params erzeugen. Merge statt Ersetzen:
+        # Basis-Params außerhalb des Grids (explizite Overrides, oder `graph`
+        # bei GraphStrategy) müssen den Sweep überleben — nur die Grid-Keys
+        # variieren. Für Registry-Strategien ist das wertidentisch zum alten
+        # Verhalten (Basis = Klassen-Defaults, die der Ctor ohnehin mergte).
+        run_spec = spec.model_copy(update={"params": {**spec.params, **params}})
+        run_id = _run_id(params)
+        log.info("  [%d/%d] %s", i, total, run_id)
+
+        try:
+            result = run_backtest(run_spec, data, config)
+            runs.append(SweepRun(params=params, result=result))
+        except Exception as exc:
+            log.warning("  FAIL [%d/%d] %s: %s", i, total, run_id, exc)
+            failed += 1
+
+    return runs, failed
+
+
+def _collect_ordered(
+    grid: list[dict[str, Any]],
+    outcomes: list[tuple[int, BacktestResult | None, str | None]],
+) -> tuple[list[SweepRun], int]:
+    """Worker-Ergebnisse → Runs in **Grid-Reihenfolge**.
+
+    Warum das zählt: `sweep()` sortiert am Ende nach `rank_by`, und Pythons Sort
+    ist stabil. Bei Gleichstand entscheidet also die Einfügereihenfolge — käme
+    die aus der Fertigstellung, hinge das Ergebnis eines Sweeps daran, welcher
+    Worker zufällig zuerst fertig war. Zwei Läufe über dieselben Daten könnten
+    verschiedene „beste" Parameter melden.
+    """
+    slots: list[SweepRun | None] = [None] * len(grid)
+    failed = 0
+    total = len(grid)
+
+    for index, result, error in outcomes:
+        if error is not None or result is None:
+            log.warning("  FAIL [%d/%d] %s: %s", index + 1, total, _run_id(grid[index]), error)
+            failed += 1
+            continue
+        slots[index] = SweepRun(params=grid[index], result=result)
+
+    return [r for r in slots if r is not None], failed
+
+
+def _run_grid_parallel(
+    spec: StrategySpec,
+    data: MarketData,
+    config: BacktestConfig,
+    grid: list[dict[str, Any]],
+    workers: int,
+) -> tuple[list[SweepRun], int]:
+    """Grid über einen Prozess-Pool. Fällt bei kaputtem Pool auf seriell zurück."""
+    total = len(grid)
+    log.info("  Grid über %d Prozesse (%d Kombinationen)", workers, total)
+
+    ctx = multiprocessing.get_context(_start_method())
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_worker_init,
+            initargs=(spec, data, config),
+        ) as pool:
+            outcomes = list(pool.map(_worker_run, list(enumerate(grid))))
+    except Exception as exc:  # noqa: BLE001 — BrokenProcessPool und Verwandte
+        # Ein gestorbener Pool (OOM-Kill, kaputter Fork) darf den Sweep nicht
+        # kosten. Seriell ist langsam, aber es liefert ein Ergebnis — und die
+        # Alternative wäre, eine Stunde Rechenzeit wegzuwerfen.
+        log.warning("Prozess-Pool gescheitert (%s) — Grid läuft seriell weiter.", exc)
+        return _run_grid_serial(spec, data, config, grid)
+
+    return _collect_ordered(grid, outcomes)
+
+
+def _run_id(params: dict[str, Any]) -> str:
+    return "_".join(f"{k}{v}" for k, v in sorted(params.items()))
+
+
+def _start_method() -> str:
+    """`fork` wo verfügbar, sonst `spawn`. Überschreibbar per Env.
+
+    Gemessen auf 4 Kernen, 24–200 Kombinationen (siehe PR-Beschreibung): `spawn`
+    kostet pro Worker einen vectorbt-Import **plus** eine komplette
+    numba-JIT-Runde. Das sind mehrere Sekunden Fixkosten, die erst jenseits von
+    ~100 Kombinationen wieder hereinkommen — bei kleinen Grids war der parallele
+    Lauf schlicht langsamer als der serielle.
+
+    `fork` erbt beides aus dem Elternprozess: kein Import, keine
+    Neukompilierung. Der Preis ist, dass die Thread-Limits im Initializer nicht
+    mehr greifen (BLAS liest sie beim Import, und der ist im Eltern längst
+    passiert). Für diese Last ist das vertretbar — der Backtest ist
+    numba-Schleifen und pandas, nicht großes BLAS. Wer auf Überbuchung stößt,
+    setzt die Variablen vor dem Prozessstart oder wechselt auf `spawn`.
+    """
+    override = os.environ.get("QUANTRACE_SWEEP_START_METHOD", "").strip().lower()
+    available = multiprocessing.get_all_start_methods()
+    if override:
+        if override in available:
+            return override
+        log.warning(
+            "QUANTRACE_SWEEP_START_METHOD=%r nicht verfügbar (%s) — ignoriert.",
+            override,
+            ", ".join(available),
+        )
+    return "fork" if "fork" in available else "spawn"
+
+
 def sweep(
     spec: StrategySpec,
     data: MarketData,
@@ -212,6 +500,7 @@ def sweep(
     rank_by: str = "sharpe",
     *,
     selection_stats: bool = True,
+    max_workers: int | None = None,
 ) -> SweepResult:
     """Führt einen vollständigen Parameter-Sweep über spec.param_space durch.
 
@@ -224,6 +513,10 @@ def sweep(
             Inner-Sweeps (z.B. pro Walk-Forward-Fold), deren Statistik
             der Aufrufer verwirft — spart pro Fold einen BH-Pass plus
             Return-Statistiken über jede Combo.
+        max_workers: Prozesse für das Grid. ``None`` = automatisch
+            (``QUANTRACE_SWEEP_WORKERS`` oder Kernzahl), ``1`` = seriell.
+            Das Ergebnis ist von dieser Zahl **unabhängig** — sie ändert nur,
+            wie lange es dauert.
 
     Returns:
         SweepResult mit allen Runs, sortiert nach rank_by.
@@ -248,25 +541,11 @@ def sweep(
         {k: len(v) for k, v in spec.param_space.items()},
     )
 
-    runs: list[SweepRun] = []
-    failed = 0
-
-    for i, params in enumerate(grid, 1):
-        # Neues Spec mit konkreten Params erzeugen. Merge statt Ersetzen:
-        # Basis-Params außerhalb des Grids (explizite Overrides, oder `graph`
-        # bei GraphStrategy) müssen den Sweep überleben — nur die Grid-Keys
-        # variieren. Für Registry-Strategien ist das wertidentisch zum alten
-        # Verhalten (Basis = Klassen-Defaults, die der Ctor ohnehin mergte).
-        run_spec = spec.model_copy(update={"params": {**spec.params, **params}})
-        run_id = "_".join(f"{k}{v}" for k, v in sorted(params.items()))
-        log.info("  [%d/%d] %s", i, total, run_id)
-
-        try:
-            result = run_backtest(run_spec, data, config)
-            runs.append(SweepRun(params=params, result=result))
-        except Exception as exc:
-            log.warning("  FAIL [%d/%d] %s: %s", i, total, run_id, exc)
-            failed += 1
+    workers = resolve_workers(total, max_workers)
+    if workers > 1:
+        runs, failed = _run_grid_parallel(spec, data, config, grid, workers)
+    else:
+        runs, failed = _run_grid_serial(spec, data, config, grid)
 
     # Sortieren
     reverse = rank_by not in _LOWER_IS_BETTER

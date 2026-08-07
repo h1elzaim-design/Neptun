@@ -70,7 +70,12 @@ class RegimeDetector:
     feature_window:
         Trailing window (days) for the trend/vol features.
     n_iter:
-        Max Baum-Welch iterations.
+        Max Baum-Welch iterations. Schneidet den EM bewusst ab — das wirkt als
+        Early Stopping und schlug in der Messung jede auskonvergierte Variante
+        out-of-sample (#210 Punkt 3).
+    n_init:
+        Startpunkte für den Multi-Restart. Default ``1``; höhere Werte sind
+        implementiert, aber out-of-sample bisher nicht besser.
     """
 
     def __init__(
@@ -79,12 +84,13 @@ class RegimeDetector:
         n_states: int = 3,
         feature_window: int = 21,
         n_iter: int = 50,
+        n_init: int = 1,
     ) -> None:
         if n_states not in _LABEL_LADDERS:
             raise ValueError(f"n_states must be one of {sorted(_LABEL_LADDERS)}")
         self.n_states = n_states
         self.feature_window = feature_window
-        self.hmm = GaussianHMM(n_states=n_states, n_iter=n_iter)
+        self.hmm = GaussianHMM(n_states=n_states, n_iter=n_iter, n_init=n_init)
         self.state_to_label_: dict[int, str] = {}
         self._features: pd.DataFrame | None = None
 

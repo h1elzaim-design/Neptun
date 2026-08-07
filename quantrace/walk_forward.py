@@ -86,6 +86,7 @@ def walk_forward(
     train_ratio: float = 0.6,
     rank_by: str = "sharpe",
     embargo: int | None = None,
+    max_workers: int | None = None,
 ) -> WalkForwardResult:
     """Führt eine Walk-Forward-Validation über die übergebenen Daten aus.
 
@@ -100,6 +101,10 @@ def walk_forward(
             param_space abgeleitet (längster Lookback), damit der OOS-Rand
             leak-frei ist. Degenerierte Folds (zu kurzes Train) werden
             übersprungen, ``len(result.folds)`` kann also < ``n_folds`` sein.
+        max_workers: Wird an den **inneren** Sweep pro Fold durchgereicht
+            (#210). Die Folds selbst laufen weiter nacheinander — sie sind
+            wenige (typisch 4–6), das Grid ist die große Zahl, und geschachtelte
+            Pools würden die Kerne doppelt vergeben. ``1`` = alles seriell.
 
     Returns:
         WalkForwardResult mit aggregierten In-Sample- und Out-of-Sample-Metriken.
@@ -144,7 +149,14 @@ def walk_forward(
         # innerhalb des Folds und wird hier verworfen (nur beste Params zählen);
         # die OOS-Signifikanz wird unten über die Folds gerechnet.
         log.info("  IS Sweep Fold %d...", i)
-        sweep_res = sweep(spec, train_data, config=config, rank_by=rank_by, selection_stats=False)
+        sweep_res = sweep(
+            spec,
+            train_data,
+            config=config,
+            rank_by=rank_by,
+            selection_stats=False,
+            max_workers=max_workers,
+        )
 
         if not sweep_res.best_run:
             log.warning("Fold %d: Sweep hat keine Ergebnisse geliefert.", i)

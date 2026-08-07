@@ -165,6 +165,11 @@ def sweep(
         "--params",
         help='JSON param_space, z.B. \'{"fast": [10,20,50], "slow": [100,200]}\'',
     ),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        help="Prozesse für das Grid. 0 = automatisch (cgroup-Kontingent), 1 = seriell.",
+    ),
     cost_model: str = typer.Option(
         "flat",
         help="Kostenmodell: 'flat' oder 'per_asset_class' (config/costs.yaml)",
@@ -211,7 +216,12 @@ def sweep(
     )
 
     result = run_sweep(
-        spec, md, config=_backtest_config(cost_model, capital_model), rank_by=rank_by
+        spec,
+        md,
+        config=_backtest_config(cost_model, capital_model),
+        rank_by=rank_by,
+        # 0 heißt „entscheide selbst" — Typer kennt kein optionales int ohne Wert.
+        max_workers=workers or None,
     )
 
     _print_sweep_result(result)
@@ -314,6 +324,11 @@ def walkforward(
         "--params",
         help='JSON param_space, z.B. \'{"fast": [10,20], "slow": [100]}\'',
     ),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        help="Prozesse für den Sweep pro Fold. 0 = automatisch, 1 = seriell.",
+    ),
     cost_model: str = typer.Option(
         "flat",
         help="Kostenmodell: 'flat' oder 'per_asset_class' (config/costs.yaml)",
@@ -363,6 +378,7 @@ def walkforward(
         n_folds=folds,
         train_ratio=train_ratio,
         rank_by=rank_by,
+        max_workers=workers or None,
     )
 
     _print_walkforward_result(result)
