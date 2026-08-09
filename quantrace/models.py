@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from quantrace.calendars import DEFAULT_CALENDAR, get_calendar
 from quantrace.calendars import periods_per_year as _ppy
+from quantrace.vault_layout import DEFAULT_PURPOSE, Purpose, note_path
 
 if TYPE_CHECKING:
     pass
@@ -384,10 +385,15 @@ class KnowledgeNote(BaseModel):
     body: str
     tags: list[str] = Field(default_factory=list)
 
+    #: Research oder Maschinentest (ADR-013 / vault_layout). Default ist
+    #: `smoke`: ein Lauf, der nichts sagt, ist ein Testlauf. Research muss
+    #: ausgesprochen werden — die umgekehrte Voreinstellung hat den Vault in
+    #: den Zustand gebracht, den der Schnitt vom 2026-08-09 aufgeräumt hat.
+    purpose: Purpose = DEFAULT_PURPOSE
+
     @property
     def path(self) -> str:
-        safe = self.title.replace("/", "-").strip()
-        return f"Trading Research/{self.folder}/{safe}.md"
+        return note_path(self.folder, self.title, self.purpose)
 
     def to_markdown(self) -> str:
         import yaml
@@ -395,6 +401,10 @@ class KnowledgeNote(BaseModel):
         fm = dict(self.frontmatter)
         if self.tags:
             fm["tags"] = self.tags
+        # Der Ordner trägt die Wahrheit, das Feld macht sie lesbar: wer eine
+        # einzelne Note vor sich hat (in Obsidian, in einem Diff, in einem
+        # LLM-Kontext), sieht ohne den Pfad nicht, aus welcher Spur sie stammt.
+        fm["purpose"] = self.purpose
         front = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
         return f"---\n{front}\n---\n\n{self.body.strip()}\n"
 

@@ -69,7 +69,15 @@ def test_knowledge_note_markdown_roundtrip():
     assert "strategy_id: abc" in md
     assert "tags:" in md
     assert "## Idee" in md
-    assert n.path == "Trading Research/02 Strategien/Test Strat.md"
+
+    # Ohne `purpose` ist eine Note ein Testlauf und landet unter `_smoke/`
+    # (vault_layout). Research ist eine bewusste Angabe — siehe
+    # tests/test_vault_layout.py für die vollständige Begründung.
+    assert n.path == "Trading Research/_smoke/02 Strategien/Test Strat.md"
+    assert (
+        n.model_copy(update={"purpose": "research"}).path
+        == "Trading Research/02 Strategien/Test Strat.md"
+    )
 
 
 def test_strategy_status_enum():
