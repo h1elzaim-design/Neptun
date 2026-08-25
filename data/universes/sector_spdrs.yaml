@@ -4,11 +4,16 @@
 name: sector_spdrs
 description: "Die 11 SPDR-Select-Sektor-ETFs — Sektor-Rotation & Cross-Sectional-Research."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
 delisted_included: true
 point_in_time: false
 last_audit_date: 2026-06-05
@@ -17,6 +22,13 @@ source_notes: |
   hochliquide und seit ≥2018 (XLC seit 2018-06, XLRE seit 2015-10) durchgehend
   gelistet. Für Backtests vor dem jeweiligen Auflagedatum eines ETFs fehlen die
   frühen Ränder — das Data-Quality-Gate meldet das.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2018-06-19          # begrenzt durch XLC (Auflage 2018-06-19)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - XLK   # Technology
   - XLF   # Financials

@@ -20,29 +20,33 @@ import os
 
 log = logging.getLogger(__name__)
 
+#: Nur noch OpenBB-Provider. Tiingo ist am 2026-08-13 aus der Plattform
+#: geflogen — es war eine Survivor-Liste, und ein Backtest über 2008 sah dort
+#: nie LEH, WM oder BSC. Der Backtest-Pfad ist der EODHD-Bulk, und der braucht
+#: kein OpenBB: er liest den eigenen Lake.
 _CREDENTIAL_ENV_MAP: dict[str, tuple[str, str]] = {
-    "tiingo": ("TIINGO_TOKEN", "tiingo_token"),
     "fmp": ("FMP_API_KEY", "fmp_api_key"),
     "polygon": ("POLYGON_API_KEY", "polygon_api_key"),
     "intrinio": ("INTRINIO_API_KEY", "intrinio_api_key"),
     "alpha_vantage": ("ALPHA_VANTAGE_API_KEY", "alpha_vantage_api_key"),
 }
 
-_DEFAULT_PROVIDER = "yfinance"
+#: Der Backtest-Pfad. Kein Token-Sniffing mehr: vorher entschied die bloße
+#: Anwesenheit von ``TIINGO_TOKEN`` in der Umgebung, aus welcher Quelle
+#: gerechnet wird — eine Konfiguration, die man versehentlich trifft.
+_DEFAULT_PROVIDER = "eodhd"
 _bootstrapped = False
 
 
 def default_provider() -> str:
-    """Default-Provider für Backtest-Fetches.
+    """Default-Provider für Backtest-Fetches: ``eodhd``.
 
-    Priorität: `QUANTRACE_DATA_PROVIDER` Env > Tiingo (wenn Token gesetzt) > yfinance.
+    ``QUANTRACE_DATA_PROVIDER`` überschreibt das weiterhin — für OpenBB-Quellen
+    in Experimenten. Für Backtests ist ``eodhd`` der einzige Pfad, der
+    survivorship-freie Kurse liefert.
     """
     env = os.environ.get("QUANTRACE_DATA_PROVIDER", "").strip().lower()
-    if env:
-        return env
-    if os.environ.get("TIINGO_TOKEN"):
-        return "tiingo"
-    return _DEFAULT_PROVIDER
+    return env or _DEFAULT_PROVIDER
 
 
 def bootstrap_credentials(force: bool = False) -> list[str]:

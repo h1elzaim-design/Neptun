@@ -5,11 +5,16 @@
 name: us_megacap_equities
 description: "Liquide US-Mega-Cap-Einzelaktien für Stock-Level Cross-Sectional-Research."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: equity
 delisted_included: false
 point_in_time: false
 last_audit_date: 2026-06-05
@@ -19,6 +24,13 @@ source_notes: |
   Survivorship-Bias (nur Gewinner sind drin). Für Methoden-Research (Momentum-
   Mechanik, Regime-Verhalten) ist das ok; für ehrliche Edge-Schätzung ein PIT-
   Universum nutzen. quantrace.stats.survivorship quantifiziert den Effekt.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2012-05-18          # begrenzt durch META (Börsengang 2012-05-18)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - AAPL  # Apple
   - MSFT  # Microsoft

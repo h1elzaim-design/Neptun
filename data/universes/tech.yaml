@@ -1,0 +1,40 @@
+# Im Universums-Builder angelegt (2026-08-16).
+# Erzeugt von api/services/universe_export.py — Änderungen von Hand sind
+# ausdrücklich erwünscht; ein erneutes Schreiben überschreibt sie allerdings.
+name: tech
+description: "Handverlesenes Universum 'tech'."
+timeframe: 1d
+provider: eodhd
+# Handelskalender (#184): bestimmt die Annualisierung. US-gelistete Titel sind
+# us_equity; Crypto braucht crypto_24_7 — sonst wird der Sharpe mit 252 statt
+# 365 gerechnet und sieht um den Faktor 1.20 zu gut aus.
+calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten (siehe
+# api/services/universes.py). etf | equity | crypto | other
+asset_class: equity
+# Handverlesene, zum Erstellungszeitpunkt notierte Symbole: kein
+# Delisting-Bestand, keine Point-in-Time-Mitgliedschaft. Der
+# Survivorship-Audit stuft dieses Universum deshalb als erhöhtes Risiko ein —
+# das ist die richtige Antwort, nicht ein Mangel des Builders.
+delisted_included: false
+point_in_time: false
+last_audit_date: 2026-08-16
+source_notes: |
+  Handverlesene Symbolliste vom 2026-08-16, keine Rekonstruktion
+  eines Index. Wer zwischendurch pleiteging oder übernommen wurde, fehlt
+  hier per Konstruktion — eine heute geschriebene Liste ist eine Liste
+  von Überlebenden.
+  Vor ernsthafter Nutzung: Zeitraum prüfen, in dem alle Symbole handelbar
+  waren, und delisted_included/point_in_time bewusst nachziehen.
+# Ein Universum beginnt mit seinem zuletzt aufgelegten Symbol — deshalb das
+# Maximum über die Coverage-Starts, nicht das Minimum.
+# VORLÄUFIG — nicht alle Symbole liegen im Lake. Der Wert ist aus den
+# bekannten gerechnet und kann sich nach hinten schieben, sobald der Rest
+# gefetcht ist. `scripts/universe_window_audit.py --check` korrigiert ihn.
+usable_window:
+  start: 2026-08-16
+  end: null
+symbols:
+  - AAPL
+  - GOOGL
+  - NVDA

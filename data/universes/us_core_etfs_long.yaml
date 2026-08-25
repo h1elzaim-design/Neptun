@@ -1,0 +1,76 @@
+# `us_core_etfs` ohne XLRE — ein Sektor-ETF gegen elf Jahre Historie.
+#
+# Der Anlass: ein Universum kann erst beginnen, wenn ALLE seine Symbole Daten
+# haben. In `us_core_etfs` ist XLRE (Immobilien, aufgelegt 2015-10-08) das
+# jüngste Symbol und schneidet den Korb auf 10,8 Jahre — obwohl SPY seit 1993
+# und dreizehn der übrigen Symbole seit vor 2005 handeln.
+#
+# Gemessen am 2026-08-09 gegen `supported_tickers`:
+#
+#   Symbole            nutzbar ab      Zeitraum
+#   alle 16            2015-10-08      10,8 Jahre   ← us_core_etfs
+#   ohne XLRE          2004-11-18      21,7 Jahre   ← diese Datei
+#   ohne XLRE, GLD     2002-07-26      24,0 Jahre
+#   ohne XLRE,GLD,TLT  2000-05-26      26,2 Jahre
+#
+# Warum bei XLRE aufgehört wird: die nächsten Streichungen kosten Substanz.
+# GLD ist der einzige Rohstoff im Korb, TLT die einzigen langen Anleihen —
+# beide tragen Diversifikation, die ein Aktien-Sektor nicht ersetzt. Immobilien
+# fehlen nach der Streichung als eigene Sektorwette, sind über die
+# Breitmarkt-ETFs (SPY, DIA) aber weiterhin indirekt enthalten. Das ist der
+# billigste Schnitt.
+#
+# WANN WELCHES: dieses Universum für alles, was lange Historie braucht —
+# Regime-Fits, Walk-Forward über mehrere Zyklen, Krisen vor 2015 (2008, 2011,
+# 2020 statt nur 2020). `us_core_etfs` für Sektorrotation, wo Immobilien als
+# eigene Wette gebraucht werden.
+#
+# Die beiden sind NICHT unabhängig. Wer auf beiden dieselbe Strategie testet,
+# hat zwei Versuche gemacht, nicht einen — 15 von 16 Symbolen sind identisch.
+# Das gehört in die Trial-Zählung, sonst rechnen DSR und PBO mit einer zu
+# kleinen Zahl.
+name: us_core_etfs_long
+description: "Breite US-ETFs mit langer Historie — us_core_etfs ohne XLRE."
+timeframe: 1d
+provider: eodhd
+calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
+delisted_included: true
+point_in_time: false
+last_audit_date: 2026-08-09
+source_notes: |
+  Identisch zu `us_core_etfs`, minus XLRE. Kein neues Symbol, keine neue
+  Auswahlentscheidung — nur eine Streichung, die die Historie verdoppelt.
+
+  Für Survivorship gilt dasselbe wie beim kurzen Korb: keiner dieser ETFs wurde
+  im nutzbaren Fenster liquidiert, und das Auswahlrisiko liegt nicht bei
+  verschwundenen Fonds, sondern darin, dass die Liste heute zusammengestellt
+  wurde. Ein Korb, der 2004 aufgestellt worden wäre, sähe anders aus. Das
+  repariert keine Datenquelle, nur eine regelbasierte Universumsdefinition.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2004-11-18       # begrenzt durch GLD (Auflage 2004-11-18)
+  end: null               # offen — die Reihen laufen weiter
+symbols:
+  - SPY   # S&P 500
+  - QQQ   # Nasdaq 100
+  - IWM   # Russell 2000
+  - DIA   # Dow Jones
+  - XLK   # Tech
+  - XLF   # Financials
+  - XLE   # Energy
+  - XLV   # Health Care
+  - XLI   # Industrials
+  - XLY   # Consumer Discretionary
+  - XLP   # Consumer Staples
+  - XLU   # Utilities
+  - XLB   # Materials
+  - GLD   # Gold
+  - TLT   # Long Bonds

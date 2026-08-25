@@ -26,6 +26,7 @@ import pandas as pd
 
 from quantrace.models import MarketData
 from quantrace.regime import RegimeDetector
+from quantrace.regime.features import benchmark_series
 from quantrace.strategy import Strategy
 
 
@@ -59,7 +60,12 @@ class RegimeFilter(Strategy):
         return entries.astype(bool), exits.astype(bool)
 
     def _risk_off_mask(self, close: pd.DataFrame) -> pd.Series:
-        bench = close.mean(axis=1)  # Equal-Weight-Markt-Proxy
+        # Equal-Weight-Markt-Proxy — über `benchmark_series`, nicht über
+        # `close.mean(axis=1)`. Das Kursmittel ist kursgewichtet und springt bei
+        # jedem Mitgliederwechsel; auf einem rekonstituierten Universum (#255)
+        # lernte das HMM dort einen Regimewechsel, den es nie gab, und genau
+        # dieses Regime schaltet hier die Position.
+        bench = benchmark_series(close)
         train_window = int(self.params["regime_train_window"])
 
         det = RegimeDetector(

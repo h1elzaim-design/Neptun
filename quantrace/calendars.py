@@ -223,6 +223,7 @@ def validate_universe_calendar(
     calendar: str | None,
     *,
     universe: str = "",
+    cost_class: str | None = None,
 ) -> None:
     """Prüfen, dass alle Symbole zum deklarierten Kalender passen.
 
@@ -251,7 +252,11 @@ def validate_universe_calendar(
     # Ein Top-Level-Import wäre ein Zyklus.
     from quantrace.costs import resolve_symbol_costs
 
-    resolved = resolve_symbol_costs(list(symbols))
+    # Ein konstruiertes Universum deklariert seine Klasse im YAML. Ohne diesen
+    # Durchreicher fiele jedes seiner Symbole auf `default_class` und damit auf
+    # `us_equity` — hier zufällig richtig, aber aus dem falschen Grund: die
+    # Prüfung wäre wirkungslos statt bestanden.
+    resolved = resolve_symbol_costs(list(symbols), fallback_class=cost_class)
     offenders: dict[str, str] = {}
     for sym, profile in resolved.items():
         actual = calendar_for_class(profile.asset_class)

@@ -1,0 +1,44 @@
+# Aus der Watchlist "Test" exportiert (2026-08-10).
+# Erzeugt von api/services/universe_export.py (#178) — Änderungen von Hand sind
+# ausdrücklich erwünscht; ein erneuter Export überschreibt sie allerdings.
+name: test
+description: "Aus der Watchlist 'Test' exportiert."
+timeframe: 1d
+provider: eodhd
+# Handelskalender (#184): bestimmt die Annualisierung. Eine Watchlist mit
+# US-Symbolen ist us_equity; wer Crypto exportiert, muss hier crypto_24_7
+# eintragen — sonst wird der Sharpe mit 252 statt 365 gerechnet und sieht um
+# den Faktor 1.20 zu gut aus.
+calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: equity
+# Handverlesene, zum Exportzeitpunkt notierte Symbole: kein Delisting-Bestand,
+# keine Point-in-Time-Mitgliedschaft. Der Survivorship-Audit stuft dieses
+# Universum deshalb als erhöhtes Risiko ein — das ist die richtige Antwort,
+# nicht ein Mangel des Exports.
+delisted_included: false
+point_in_time: false
+last_audit_date: 2026-08-10
+source_notes: |
+  Export einer Watchlist, nicht die Rekonstruktion eines Index. Die Symbole
+  sind die, die am 2026-08-10 in der Liste standen — wer zwischendurch
+  pleiteging oder übernommen wurde, fehlt hier per Konstruktion.
+  Vor ernsthafter Nutzung: Zeitraum prüfen, in dem alle Symbole handelbar
+  waren, und delisted_included/point_in_time bewusst nachziehen.
+# Ein Universum beginnt mit seinem zuletzt aufgelegten Symbol — deshalb das
+# Maximum über die Coverage-Starts, nicht das Minimum.
+# VORLÄUFIG — beim Export (2026-08-10) schrieb die Plattform noch gar kein
+# `usable_window`, weshalb dieses Universum das CI-Gate riss. Nachgetragen von
+# Hand; TSLA ist mit Börsengang 2010-06-29 das jüngste der drei Symbole und
+# damit begrenzend. `scripts/universe_window_audit.py --check` misst es gegen
+# das Listing nach.
+usable_window:
+  start: 2010-06-29
+  end: null
+symbols:
+  - AAPL
+  - TSLA
+  - GOOG

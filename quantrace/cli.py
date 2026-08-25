@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import typer
@@ -19,8 +19,8 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from quantrace import strategy_registry
-from quantrace.data_agent import close_prices, load_universe
+from quantrace import membership, strategy_registry
+from quantrace.data_agent import close_prices, equal_weight_benchmark, load_universe
 from quantrace.models import BacktestConfig, StrategySpec, Timeframe, WalkForwardResult
 from quantrace.sweep import SweepResult
 from quantrace.sweep import sweep as run_sweep
@@ -38,6 +38,32 @@ def _load_universe_yaml(name: str) -> dict:
     return yaml.safe_load(path.read_text())
 
 
+def _universe_data(universe: str, cfg: dict, start: date, end: date, **extra):
+    """Universum laden — die **eine** Stelle, an der die YAML zu Kursen wird.
+
+    Vorher stand derselbe ``load_universe``-Aufruf fünfmal im Modul (fetch,
+    backtest, sweep, walk-forward, regime). Solange nur Kalender und
+    Kostenklasse durchzureichen waren, war das Wiederholung ohne Folgen.
+
+    Mit der zeitvariablen Mitgliedschaft (#255) ist es keine mehr: wer sie an
+    einer der fünf Stellen vergisst, bekommt keinen Fehler, sondern ein
+    Universum, das Papiere handelt, bevor die Regel sie gewählt hat — und die
+    Kurve sieht dabei völlig normal aus. Ein Aufruf statt fünf macht das
+    Vergessen unmöglich statt unwahrscheinlich.
+    """
+    return load_universe(
+        universe=universe,
+        symbols=cfg["symbols"],
+        start=start,
+        end=end,
+        timeframe=Timeframe(cfg.get("timeframe", "1d")),
+        calendar=cfg.get("calendar"),
+        cost_class=cfg.get("cost_class"),
+        membership=membership.from_universe_config(cfg),
+        **extra,
+    )
+
+
 @app.command()
 def fetch(
     universe: str = typer.Option(..., help="Name in data/universes/*.yaml"),
@@ -45,21 +71,18 @@ def fetch(
     end: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
     provider: str | None = typer.Option(
         None,
-        help="OpenBB-Provider: yfinance, tiingo, fmp, polygon. Default: TIINGO_TOKEN gesetzt → tiingo, sonst yfinance.",
+        help=(
+            "Default und einziger Backtest-Pfad: eodhd (US-Bulk, survivorship-frei). "
+            "Alles andere geht über OpenBB (yfinance, fmp, polygon) und ist für "
+            "Backtests nicht vorgesehen — siehe quantrace/data_agent.py."
+        ),
     ),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
     """Lädt ein Universum über OpenBB und cached es."""
     cfg = _load_universe_yaml(universe)
-    md = load_universe(
-        universe=universe,
-        symbols=cfg["symbols"],
-        start=start.date(),
-        end=end.date(),
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        calendar=cfg.get("calendar"),
-        provider=provider,
-        force_refresh=force,
+    md = _universe_data(
+        universe, cfg, start.date(), end.date(), provider=provider, force_refresh=force
     )
     console.print(
         f"[green]OK[/green] {len(md.symbols)} Symbole, {len(md.frame)} Zeilen, "
@@ -110,14 +133,7 @@ def backtest(
     from quantrace.backtest_runner import run_backtest
 
     cfg = _load_universe_yaml(universe)
-    md = load_universe(
-        universe=universe,
-        symbols=cfg["symbols"],
-        start=start.date(),
-        end=end.date(),
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        calendar=cfg.get("calendar"),
-    )
+    md = _universe_data(universe, cfg, start.date(), end.date())
 
     if param_json:
         params = _json.loads(param_json)
@@ -184,14 +200,7 @@ def sweep(
     import json as _json
 
     cfg = _load_universe_yaml(universe)
-    md = load_universe(
-        universe=universe,
-        symbols=cfg["symbols"],
-        start=start.date(),
-        end=end.date(),
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        calendar=cfg.get("calendar"),
-    )
+    md = _universe_data(universe, cfg, start.date(), end.date())
 
     # param_space entweder aus --params JSON oder vordefinierte Defaults
     label, spec = _resolve_spec(strategy, graph_spec, universe, cfg, {})
@@ -343,14 +352,7 @@ def walkforward(
     import json as _json
 
     cfg = _load_universe_yaml(universe)
-    md = load_universe(
-        universe=universe,
-        symbols=cfg["symbols"],
-        start=start.date(),
-        end=end.date(),
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        calendar=cfg.get("calendar"),
-    )
+    md = _universe_data(universe, cfg, start.date(), end.date())
 
     label, spec = _resolve_spec(strategy, graph_spec, universe, cfg, {})
     if param_space_json:
@@ -805,16 +807,11 @@ def regime(
     from quantrace.regime import RegimeDetector
 
     cfg = _load_universe_yaml(universe)
-    md = load_universe(
-        universe=universe,
-        symbols=cfg["symbols"],
-        start=start.date(),
-        end=end.date(),
-        timeframe=Timeframe(cfg.get("timeframe", "1d")),
-        calendar=cfg.get("calendar"),
-    )
+    md = _universe_data(universe, cfg, start.date(), end.date())
 
-    bench = close_prices(md).mean(axis=1)
+    # Über Renditen statt über Kurse — ein Kursmittel ist kursgewichtet, nicht
+    # gleichgewichtet, und springt bei jedem Mitgliederwechsel (#255).
+    bench = equal_weight_benchmark(close_prices(md))
     det = RegimeDetector(n_states=n_states, feature_window=feature_window).fit(bench)
     snap = det.current_regime(bench)
     series = det.regime_series(bench)

@@ -23,6 +23,7 @@ from quantrace.graph.presets import PRESETS
 from quantrace.graph.schema import GraphNode, GraphSpec
 from quantrace.graph.strategy import GraphStrategy, apply_param_overrides
 from quantrace.graph.vault import (
+    UNVERIFIED,
     GraphSpecNotFoundError,
     build_spec,
     is_graph_spec,
@@ -39,6 +40,7 @@ __all__ = [
     "GraphStrategy",
     "GraphValidationError",
     "PRESETS",
+    "UNVERIFIED",
     "ValidationResult",
     "apply_param_overrides",
     "build_spec",

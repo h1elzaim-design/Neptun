@@ -26,6 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SPEC_FOLDER = "Trading Research/02 Strategien"
 GRAPH_CLASS_PATH = "quantrace.graph:GraphStrategy"
 
+#: Der Status generierter Strategien, bis ein Mensch sie befördert (#267).
+#: Steht im Frontmatter der Note, nicht in einem Kommentar — die Lesepfade
+#: fragen das Feld ab, und nur ein Feld lässt sich abfragen.
+UNVERIFIED = "unverified"
+
 # Slug wird in einen Vault-Pfad interpoliert — vor jedem Dateizugriff prüfen
 # (gleiche Begründung wie _validate_family in api/routers/strategies.py).
 _SLUG_RE = re.compile(r"^[a-z0-9_]{1,64}$")
@@ -70,8 +75,29 @@ def is_graph_spec(slug: str, vault_root: Path | None = None) -> bool:
         return False
 
 
-def list_graph_specs(vault_root: Path | None = None) -> list[dict[str, Any]]:
-    """Alle Graph-Specs im Vault — für Dropdowns und Validierung."""
+def list_graph_specs(
+    vault_root: Path | None = None,
+    *,
+    include_unverified: bool = False,
+) -> list[dict[str, Any]]:
+    """Graph-Specs im Vault — für Dropdowns und Validierung.
+
+    **`unverified` ist per Vorgabe nicht dabei, und die Asymmetrie ist der
+    Punkt** (#267). Eine generierte Strategie soll auswählbar sein, aber nur
+    *ausdrücklich*: wer sie beim Namen nennt, bekommt sie; wer „alle
+    Strategien" aufzählt, nicht. Aufzählen ist der versehentliche Pfad — ein
+    Sweep, ein Agentenlauf, eine Katalogrechnung —, und genau dort darf eine
+    ungeprüfte Strategie nicht mitlaufen und später mit einer Zahl neben
+    handgeschriebenen stehen, ohne dass man ihr die Herkunft ansieht.
+
+    Dieselbe Bauart wie `purpose: smoke` in ADR-014: der teure Fall muss
+    ausgesprochen werden, der harmlose gilt von selbst. Die drei Aufrufer, die
+    heute ausdrücklich auswählen (UI-Dropdown, Slug-Prüfung,
+    `param_space`-Check), setzen ``include_unverified=True``.
+
+    `load_graph(slug)` bleibt davon unberührt: ein Slug **ist** die
+    ausdrückliche Auswahl.
+    """
     root = vault_root or REPO_ROOT
     folder = root / SPEC_FOLDER
     if not folder.exists():
@@ -86,6 +112,8 @@ def list_graph_specs(vault_root: Path | None = None) -> list[dict[str, Any]]:
             continue
         graph = fm.get("graph")
         if not isinstance(graph, dict):
+            continue
+        if not include_unverified and str(fm.get("status") or "").strip() == UNVERIFIED:
             continue
         out.append(
             {

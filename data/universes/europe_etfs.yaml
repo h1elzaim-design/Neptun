@@ -2,11 +2,16 @@
 name: europe_etfs
 description: "Europa-Exposure via US-gelistete ETFs (breit, Eurozone, Länder, währungsgehedged)."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
 # Bewusst US-gelistete Europa-ETFs statt EU-domizilierter UCITS: sie handeln in
 # der US-Session mit sauberem Tiingo-EOD und laufen ohne OpenBB-Umweg im
 # bestehenden Lake. Underlying-Session ≠ US-Handelszeit → Premium/Discount-Risiko
@@ -20,6 +25,13 @@ source_notes: |
   hochliquide iShares/Vanguard/SPDR/WisdomTree-Produkte. Für echte EU-
   domizilierte UCITS (Xetra/LSE) bräuchte es einen OpenBB-Provider und einen
   anderen Datenpfad — bewusst nicht Teil dieses Universums.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2014-06-12          # begrenzt durch IEUR (Auflage 2014-06-12)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - VGK   # Vanguard FTSE Europe
   - IEUR  # iShares Core MSCI Europe

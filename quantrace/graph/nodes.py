@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from quantrace.graph.fundamentals import fundamental_frame
 from quantrace.graph.schema import BOOL, SERIES, SIGNAL
 from quantrace.models import MarketData
 
@@ -141,6 +142,98 @@ _source("open", "Eröffnungskurse.")
 _source("high", "Tageshochs (Fallback: close, wenn nicht vorhanden).")
 _source("low", "Tagestiefs (Fallback: close, wenn nicht vorhanden).")
 _source("volume", "Handelsvolumen.")
+
+
+# --- Fundamentaldaten (SEC EDGAR) --------------------------------------------
+#
+# Wie bei OHLCV ein Knoten je Kennzahl statt eines parametrisierten: `ParamDef`
+# kennt nur `int` und `float`, und ein Konzeptname ist keins von beidem.
+#
+# Die Look-ahead-Freiheit dieser Quelle liegt NICHT in den Knoten, sondern in
+# `graph.fundamentals`: dort wird ausschließlich nach dem Einreichungsdatum
+# ausgerichtet, nie nach dem Ende des Berichtszeitraums. Zwischen beiden liegen
+# Wochen, in denen die Zahl noch niemand kannte.
+
+
+def _fundamental(concept: str, label: str, doc: str) -> None:
+    _register(
+        NodeDef(
+            type=f"source.fundamental.{concept}",
+            label=label,
+            doc=doc,
+            inputs=(),
+            output=SERIES,
+            fn=lambda inputs, params, data, _c=concept: fundamental_frame(
+                _c, list(data.symbols), data.frame.index
+            ),
+        )
+    )
+
+
+#: Beschriftung je Kennzahl. **Der Schlüsselsatz muss `CONCEPT_ALIASES`
+#: entsprechen** — `test_graph_fundamentals` prüft das. Vorher waren es zwei
+#: Listen, und drei Konzepte (`liabilities`, `cash`, `eps_diluted`) hatten
+#: stillschweigend keinen Knoten: im Signal-Graph nicht verfügbar, ohne dass
+#: irgendwo stand, warum.
+_FUNDAMENTAL_LABELS: dict[str, tuple[str, str]] = {
+    # --- GuV ---------------------------------------------------------------
+    "revenue": (
+        "Umsatz (Jahr)",
+        "Jahresumsatz aus dem letzten bekannten Geschäftsbericht.",
+    ),
+    "cost_of_revenue": ("Umsatzkosten (Jahr)", "Herstellungskosten des Umsatzes."),
+    "gross_profit": (
+        "Rohertrag (Jahr)",
+        "Direkt gemeldet, nicht aus Umsatz minus Kosten gerechnet — der Nenner "
+        "der Profitabilitätskennzahl nach Novy-Marx.",
+    ),
+    "operating_income": ("Betriebsergebnis (Jahr)", "EBIT laut Abschluss."),
+    "rnd_expense": ("F&E-Aufwand (Jahr)", "Forschung und Entwicklung."),
+    "sga_expense": ("Vertriebs- und Verwaltungsaufwand (Jahr)", "SG&A."),
+    "interest_expense": ("Zinsaufwand (Jahr)", "Zinsaufwand — Nenner der Zinsdeckung."),
+    "pretax_income": ("Ergebnis vor Steuern (Jahr)", "Vorsteuerergebnis."),
+    "income_tax": ("Steueraufwand (Jahr)", "Ertragsteueraufwand."),
+    "net_income": ("Nettoergebnis (Jahr)", "Jahresüberschuss."),
+    "eps_basic": ("Ergebnis je Aktie, unverwässert", "EPS basic."),
+    "eps_diluted": ("Ergebnis je Aktie, verwässert", "EPS diluted."),
+    # --- Bilanz ------------------------------------------------------------
+    "assets": ("Bilanzsumme", "Bilanzsumme zum letzten veröffentlichten Stichtag."),
+    "current_assets": ("Umlaufvermögen", "Kurzfristige Vermögenswerte."),
+    "inventory": ("Vorräte", "Nettovorräte — Basis für Inventory-Growth."),
+    "ppe_net": ("Sachanlagen (netto)", "Property, Plant & Equipment nach Abschreibung."),
+    "liabilities": ("Verbindlichkeiten gesamt", "Summe der Verbindlichkeiten."),
+    "current_liabilities": ("Kurzfristige Verbindlichkeiten", "Nenner der Current Ratio."),
+    "short_term_debt": ("Kurzfristige Finanzschulden", "Kurzfristiger Anteil der Verschuldung."),
+    "long_term_debt": ("Langfristige Finanzschulden", "Langfristige Verschuldung."),
+    "equity": (
+        "Eigenkapital",
+        "Eigenkapital zum letzten veröffentlichten Stichtag — Nenner für Book-to-Market.",
+    ),
+    "cash": ("Zahlungsmittel", "Kasse und Zahlungsmitteläquivalente."),
+    "shares_outstanding": (
+        "Aktien im Umlauf",
+        "Ausstehende Aktien zum letzten Stichtag — mit dem Kurs multipliziert ergibt "
+        "das die Marktkapitalisierung.",
+    ),
+    # --- Kapitalfluss ------------------------------------------------------
+    "operating_cash_flow": ("Operativer Cashflow (Jahr)", "Cashflow aus laufender Geschäftstätigkeit."),
+    "investing_cash_flow": ("Investitions-Cashflow (Jahr)", "Cashflow aus Investitionstätigkeit."),
+    "financing_cash_flow": ("Finanzierungs-Cashflow (Jahr)", "Cashflow aus Finanzierungstätigkeit."),
+    "depreciation_amortization": ("Abschreibungen (Jahr)", "D&A — Brücke von EBIT zu EBITDA."),
+    "capex": ("Investitionen (Jahr)", "Auszahlungen für Sachanlagen."),
+    "dividends_paid": ("Dividenden (Jahr)", "Gezahlte Dividenden."),
+    "buybacks": ("Aktienrückkäufe (Jahr)", "Auszahlungen für eigene Aktien."),
+}
+
+for _c, (_label, _doc) in _FUNDAMENTAL_LABELS.items():
+    _fundamental(
+        _c,
+        _label,
+        f"{_doc} Stufenweise konstant bis zur nächsten Einreichung; NaN, solange "
+        "nichts veröffentlicht wurde, und für Symbole ohne SEC-Filings (ETFs, "
+        "Nicht-US-Werte).",
+    )
+
 
 _register(
     NodeDef(

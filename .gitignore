@@ -47,8 +47,19 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+# `backtests/results/` trägt die Single-Run-JSONs — und die sind **Quelle**,
+# nicht Abfall. Die Vault-Note verweist per `source_json` darauf; `/interpret`
+# und jede Neubewertung lesen sie zurück. `sweeps/` und `walkforward/` waren
+# nie ignoriert und werden seit jeher mitcommittet.
+#
+# Die pauschale Regel hat am 2026-08-11 jeden Single-Backtest am Publish
+# scheitern lassen (`git add … failed: paths are ignored`), während Sweep und
+# Walk-Forward durchliefen — ein Modus kaputt, zwei heil, und niemand sah den
+# Zusammenhang. Zweite Auflage desselben Fehlers wie das pauschale `*.sql`,
+# das zwei Migrationen nie ins Repo ließ.
 backtests/results/*
 !backtests/results/.gitkeep
+!backtests/results/*.json
 reports/*
 !reports/.gitkeep
 strategies/generated/*
@@ -65,3 +76,8 @@ Thumbs.db
 # Obsidian schreibt sie bei jedem Öffnen neu; getrackt erzeugt sie nur Diff-Rauschen
 # und veraltete Verweise auf längst gelöschte Notes.
 .obsidian/workspace.json
+
+# Messeingang des Regime-Prüfstands (#231) — Tagesdaten aus einer freien
+# Schnittstelle, ausdrücklich keine Produktdatenquelle. Siehe
+# scripts/regime_model_selection.py.
+.cache/

@@ -95,8 +95,13 @@ def _execute(
     close = close_prices(data)
     entries, exits = strategy.generate_signals(data)
     entries, exits = _lag_signals(entries, exits, config.execution_lag)
+    # NACH dem Lag: der Zwangs-Exit ist keine Strategie-Entscheidung, die
+    # verzögert gehandelt würde, sondern eine Ausführungsschranke.
+    close, entries, exits = _close_untradable(
+        close, entries, exits, getattr(data, "tradable", None)
+    )
 
-    fees, slippage, config = _cost_inputs(close, config)
+    fees, slippage, config = _cost_inputs(close, config, data)
 
     multi_asset = isinstance(close, pd.DataFrame) and close.shape[1] > 1
     if config.capital_model == "shared" and multi_asset:
@@ -153,6 +158,7 @@ def _execute(
 def _cost_inputs(
     close: pd.DataFrame | pd.Series,
     config: BacktestConfig,
+    data: MarketData | None = None,
 ):
     """Fees/Slippage für vectorbt — skalar (flat) oder pro Spalte (per Klasse).
 
@@ -163,6 +169,10 @@ def _cost_inputs(
     pro Seite ist ``slippage_bps + spread_bps/2``. Die aufgelöste Tabelle wird
     an die zurückgegebene Config gehängt, damit das persistierte Ergebnis
     seine Kosten-Annahmen dokumentiert.
+
+    ``data.cost_class`` — gesetzt von konstruierten Universen — dient als
+    Rückfall für Symbole ohne eigenen Eintrag. Ohne ihn bekäme ein
+    Regel-Universum aus hunderten Small Caps die Kosten von SPY.
     """
     if config.cost_model != "per_asset_class":
         return config.fees_bps / 10_000.0, config.slippage_bps / 10_000.0, config
@@ -173,7 +183,10 @@ def _cost_inputs(
     if table is None:
         from quantrace.costs import resolve_symbol_costs
 
-        table = resolve_symbol_costs([str(s) for s in symbols])
+        table = resolve_symbol_costs(
+            [str(s) for s in symbols],
+            fallback_class=data.cost_class if data is not None else None,
+        )
     else:
         missing = [s for s in symbols if str(s) not in table]
         if missing:
@@ -216,6 +229,71 @@ def _lag_signals(
         entries.shift(lag, fill_value=False),
         exits.shift(lag, fill_value=False),
     )
+
+
+def _close_untradable(
+    close: pd.DataFrame,
+    entries: pd.DataFrame,
+    exits: pd.DataFrame,
+    tradable: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """**Was keinen Kurs hat, kann nicht gehalten werden — aber Lücke ≠ Ende.**
+
+    Ohne diese Regel überlebt eine Position das Papier. Nachgemessen an dem
+    Fall, für den der Lake gebaut wurde: ein Symbol handelt ab Bar 20 nicht
+    mehr, die Strategie hat keinen Exit gefeuert, weil ihre Indikatoren auf
+    ``NaN`` laufen und jeder Vergleich damit ``False`` ergibt. ``_held_mask``
+    liest nur Signale, ``from_orders`` kann bei ``NaN`` nicht verkaufen.
+    Ergebnis ohne Korrektur: 47.500 $ eingefroren zum letzten bekannten Kurs,
+    das zweite Papier dauerhaft auf 47,5 % des Buches gedeckelt statt auf 95 %.
+
+    **Zwei Ursachen, die im Rahmen gleich aussehen und es nicht sind:**
+
+    * **Kein Kurs beobachtet.** Handelsaussetzung, fehlende Partition, ein Tag,
+      an dem dieses Papier nicht handelte, während andere es taten — im
+      Bulk-Lake der Normalfall. Wer hier verkauft, verkauft wegen einer
+      Datenlücke. Eine frühere Fassung tat genau das: eine einzelne fehlende
+      Bar liquidierte die Position, und die Strategie stieg oft nie wieder ein,
+      weil ihr Entry-Signal ein Crossover war. Die Qualitätsprüfung fängt das
+      nicht ab — sie meldet ``NaN`` als *Warnung*, nicht als Fehler.
+      **Also: durchhalten und den letzten Kurs fortschreiben.**
+    * **Kein Kurs mehr, nie wieder.** Delisting, Insolvenz. Der Lauf endet für
+      dieses Papier. **Also: verkaufen**, zum letzten beobachteten Schluss.
+
+    Unterschieden wird an genau einem Merkmal: liegt *irgendwann später* noch
+    ein Kurs? Das ist Buchhaltung über ein abgeschlossenes Ereignis, keine
+    Handelsentscheidung — die Strategie hat den Zeitpunkt nicht gewählt.
+
+    ``tradable`` ist die dritte Ursache und kommt nicht aus den Kursen, sondern
+    aus dem Universum: ein Papier scheidet bei der Rekonstitution aus (#255).
+    Das ist kein Datenproblem und wird deshalb auch nicht aus ``NaN``
+    erschlossen, sondern ausdrücklich mitgegeben — sonst wäre ein Ausscheiden
+    von einer Handelsaussetzung nicht zu unterscheiden, und je nach Rateweg
+    würde entweder durchgehalten (falsch) oder bei jeder Lücke verkauft (auch
+    falsch).
+    """
+    handelbar = close.notna()
+    voll = bool(handelbar.all().all())
+    if voll and tradable is None:
+        return close, entries, exits
+
+    raus = pd.DataFrame(False, index=close.index, columns=close.columns)
+
+    if not voll:
+        # Gibt es an oder nach diesem Bar noch einen Kurs? Rückwärts-cummax
+        # über die Handelbarkeit. Nur wo das False ist, endet der Lauf.
+        spaeter = handelbar[::-1].cummax()[::-1].astype(bool)
+        endgueltig = ~spaeter & handelbar.shift(fill_value=False)
+        raus |= endgueltig
+        close = close.ffill()
+
+    if tradable is not None:
+        # Ausgeschieden: gestern Mitglied, heute nicht.
+        mask = tradable.reindex(index=close.index, columns=close.columns).fillna(False)
+        raus |= mask.shift(fill_value=False).astype(bool) & ~mask.astype(bool)
+        handelbar &= mask.astype(bool)
+
+    return close, entries & handelbar, exits | raus
 
 
 def _held_mask(entries: pd.DataFrame, exits: pd.DataFrame) -> pd.DataFrame:

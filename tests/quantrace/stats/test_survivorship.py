@@ -101,3 +101,34 @@ class TestSurvivorshipAudit:
         a = audit_universe("u", meta)
         b = audit_universe("u", meta)
         assert a == b
+
+
+# ---------------------------------------------------------------------------
+# EODHD — der Bulk ist survivorship-frei, die Auswahl deshalb noch nicht
+
+
+def test_eodhd_ist_der_audit_tabelle_bekannt():
+    """Ohne Eintrag wäre jedes Universum nach dem Provider-Wechsel „unbekannt",
+    und die Begründung im Audit fiele auf „Risiko nicht verfeinerbar" zurück —
+    ausgerechnet bei der Quelle, deren ganzer Zweck die Toten sind."""
+    from quantrace.stats.survivorship import PROVIDER_PROFILE
+
+    profil = PROVIDER_PROFILE["eodhd"]
+    assert profil["delivers_delisted_by_default"] is True
+    assert profil["point_in_time_capable"] is True
+
+
+def test_eodhd_heilt_eine_ueberlebenden_liste_nicht():
+    """Der Kern der Unterscheidung: survivorship-freie *Kurse* sind nicht
+    dasselbe wie ein survivorship-freies *Universum*. Eine handverlesene
+    Symbolliste von heute bleibt eine Liste der Überlebenden — der Provider
+    darf das nicht wegdefinieren."""
+    from quantrace.stats.survivorship import audit_universe
+
+    meta = {
+        "provider": "eodhd",
+        "symbols": ["SPY", "QQQ"],
+        "delisted_included": False,
+        "last_audit_date": date.today().isoformat(),
+    }
+    assert audit_universe("handverlesen", meta).risk == "HIGH"

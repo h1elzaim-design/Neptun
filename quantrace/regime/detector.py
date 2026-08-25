@@ -66,16 +66,29 @@ class RegimeDetector:
     Parameters
     ----------
     n_states:
-        Number of regimes (2–5 supported by the label ladder).
+        Number of regimes (2–5 supported by the label ladder). Die **3** ist
+        gemessen und nicht geerbt (#231, ADR-016): über 51 Walk-Forward-Falten
+        auf echten Kursreihen steigt die Out-of-Sample-Likelihood mit jeder
+        zusätzlichen Zustandszahl, während Persistenz und Label-Stabilität über
+        dieselbe Achse fallen. Likelihood taugt deshalb nicht zur Auswahl — sie
+        würde immer das grösste Modell nehmen. Bei ``n_states=5`` ändern sich
+        42 % der *vergangenen* Beschriftungen, sobald neue Daten dazukommen.
     feature_window:
         Trailing window (days) for the trend/vol features.
     n_iter:
         Max Baum-Welch iterations. Schneidet den EM bewusst ab — das wirkt als
-        Early Stopping und schlug in der Messung jede auskonvergierte Variante
-        out-of-sample (#210 Punkt 3).
+        Early Stopping (#210 Punkt 3). Auf echten Kursreihen nachgemessen
+        (#231): der *Median* ist für 30, 50 und 200 auf vier Stellen identisch;
+        was sich ändert, ist der **Rand**. Auskonvergieren (``n_iter=200``:
+        100 % konvergiert) kostet in der schlechtesten Falte −1.77 gegenüber
+        dem Stand. Anheben kauft also keinen besseren Fit, sondern einen
+        schlechteren Ausreisser.
     n_init:
         Startpunkte für den Multi-Restart. Default ``1``; höhere Werte sind
-        implementiert, aber out-of-sample bisher nicht besser.
+        implementiert und bleiben aus. Auf echten Daten (#231) ist die
+        Likelihood ein Münzwurf (25 Falten besser, 26 schlechter) — aber die
+        **Label-Stabilität** fällt von 0.879 auf 0.643. Multi-Restart scheitert
+        also nicht am Fit, sondern daran, dass es die Vergangenheit umschreibt.
     """
 
     def __init__(
@@ -85,11 +98,20 @@ class RegimeDetector:
         feature_window: int = 21,
         n_iter: int = 50,
         n_init: int = 1,
+        macro: pd.DataFrame | None = None,
     ) -> None:
         if n_states not in _LABEL_LADDERS:
             raise ValueError(f"n_states must be one of {sorted(_LABEL_LADDERS)}")
         self.n_states = n_states
         self.feature_window = feature_window
+        #: Optionale Makro-Spalten (Zinskurve, Credit-Spread). **Default aus.**
+        #:
+        #: Sie hängen am Detektor und nicht an ``fit``, weil ``predict_proba``
+        #: dieselben Features braucht wie das Training. Zwei Aufrufstellen, die
+        #: sie getrennt übergeben müssten, wären genau die Bruchstelle, an der
+        #: ein Modell auf vier Dimensionen geschätzt und auf zweien ausgewertet
+        #: wird — ohne Fehlermeldung, mit falschen Posterioren.
+        self.macro = macro
         self.hmm = GaussianHMM(n_states=n_states, n_iter=n_iter, n_init=n_init)
         self.state_to_label_: dict[int, str] = {}
         self._features: pd.DataFrame | None = None
@@ -97,7 +119,7 @@ class RegimeDetector:
     # -- fit ------------------------------------------------------------------
 
     def fit(self, prices: pd.Series | pd.DataFrame) -> RegimeDetector:
-        feats = regime_features(prices, window=self.feature_window)
+        feats = regime_features(prices, window=self.feature_window, macro=self.macro)
         if len(feats) < self.n_states + 1:
             raise ValueError(
                 f"Not enough history: {len(feats)} feature rows for "
@@ -129,7 +151,7 @@ class RegimeDetector:
     def _proba_frame(self, prices: pd.Series | pd.DataFrame, mode: str) -> pd.DataFrame:
         if not self.state_to_label_:
             raise RuntimeError("RegimeDetector is not fitted — call fit() first")
-        feats = regime_features(prices, window=self.feature_window)
+        feats = regime_features(prices, window=self.feature_window, macro=self.macro)
         proba = self.hmm.predict_proba(feats.to_numpy(), mode=mode)
         # Each state maps to a distinct ladder label, so columns are unique;
         # reorder them worst→best for stable downstream consumption.

@@ -69,7 +69,28 @@ class MarketData(BaseModel):
         default=DEFAULT_CALENDAR,
         description="us_equity | crypto_24_7 — bestimmt die Annualisierung.",
     )
+    #: Kostenklasse für Symbole ohne eigenen Eintrag in `config/costs.yaml`.
+    #: Gesetzt von **konstruierten** Universen (`cost_class:` im YAML), deren
+    #: Mitglieder eine Regel bestimmt statt eine Hand. Ohne diesen Wert fiele
+    #: ein Korb aus hunderten Small Caps auf `default_class` zurück — und das
+    #: ist das *günstigste* Profil der Datei.
+    cost_class: str | None = Field(
+        default=None,
+        description="Fallback-Kostenklasse aus dem Universe-YAML (konstruierte Universen).",
+    )
     frame: Any = Field(..., exclude=True)  # pd.DataFrame — lazy import, see module docstring
+    #: Boolesche Maske (Index × Symbol): **durfte** dieses Papier an diesem Bar
+    #: gehalten werden? Gesetzt von zeitvariablen Universen (#255); ``None``
+    #: heißt „immer", der Normalfall.
+    #:
+    #: Bewusst getrennt von ``NaN`` im Rahmen. Beides sieht in den Kursen
+    #: gleich aus und bedeutet Verschiedenes: ``NaN`` heißt „kein Kurs
+    #: beobachtet" (Handelsaussetzung, fehlende Partition, Delisting),
+    #: ``tradable=False`` heißt „gehört an diesem Tag nicht zum Universum".
+    #: Der Backtest muss darauf verschieden reagieren — eine Lücke wird
+    #: durchgehalten, ein Ausscheiden wird verkauft —, und aus einer
+    #: NaN-Zelle allein lässt sich die Ursache nicht ablesen.
+    tradable: Any | None = Field(default=None, exclude=True)
     content_hash: str = ""
 
     @field_validator("calendar")

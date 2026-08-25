@@ -4,11 +4,16 @@
 name: global_macro
 description: "Multi-Asset GTAA-Satz: globale Aktien, Treasuries, Gold, Rohstoffe, REITs."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
 delisted_included: true
 point_in_time: false
 last_audit_date: 2026-06-05
@@ -17,6 +22,13 @@ source_notes: |
   unkorrelierte Anlageklassen, damit Trend-/Momentum-Strategien echte
   Rotation zeigen statt nur Beta. Alle ETFs seit ≥2007 (DBC seit 2006,
   VNQ seit 2004) durchgehend liquide gelistet.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2006-02-06          # begrenzt durch DBC (Auflage 2006-02-06)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - SPY   # US Large Cap
   - EFA   # Developed ex-US (MSCI EAFE)

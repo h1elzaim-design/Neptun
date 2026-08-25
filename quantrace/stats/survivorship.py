@@ -60,7 +60,27 @@ PROVIDER_PROFILE: dict[str, dict[str, Any]] = {
         "point_in_time_capable": False,
         "trustworthy_for_pit": False,
     },
+    "eodhd": {
+        # Der US-Bulk liefert **Tagesquerschnitte**: was am 2008-09-12 handelte,
+        # steht im Querschnitt vom 2008-09-12 — LEH, BSC, WM und AIG inklusive.
+        # Die Toten sind nicht nachträglich ergänzt, sie sind nie verschwunden.
+        #
+        # **Was das nicht heißt.** Survivorship-freie *Kurse* sind nicht
+        # dasselbe wie ein survivorship-freies *Universum*. Eine handverlesene
+        # `symbols:`-Liste von heute bleibt eine Liste der Überlebenden, egal
+        # wie ehrlich die Quelle ist — der Provider kann die Auswahl nicht
+        # heilen. Deshalb bleibt `delisted_included` die Angabe, die zählt, und
+        # dieses Profil verfeinert nur.
+        "delivers_delisted_by_default": True,
+        "point_in_time_capable": True,
+        "trustworthy_for_pit": True,
+    },
     "tiingo": {
+        # Bleibt in der Tabelle, obwohl der Ladepfad am 2026-08-13 entfernt
+        # wurde: alte Universe-YAMLs und archivierte Vault-Notes nennen den
+        # Provider weiterhin, und für die ist die Einordnung genau dann
+        # relevant, wenn jemand eine alte Zahl nachliest.
+        #
         # Tiingo EOD covers currently-listed tickers (and some delisted ones
         # only if queried by symbol); it carries no point-in-time index
         # membership, so a static `symbols:` list is survivor-only by default.

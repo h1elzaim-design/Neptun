@@ -2,11 +2,16 @@
 name: us_midcap_etfs
 description: "US-Mid-Cap-ETFs (S&P 400 / Russell Midcap, inkl. Value/Growth-Tilts)."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
 # Alle 10 handeln zum Audit-Zeitpunkt. Mid-Cap-Index-ETFs (IJH/MDY seit 1995/2000,
 # VO/IWR seit 2004) sind über den Backtest-Zeitraum stabil — keine Liquidationen
 # im Korb. delisted_included wie bei den übrigen Tiingo-Universen: der Provider
@@ -20,6 +25,13 @@ source_notes: |
   und Style-Rotation-Strategien. point_in_time=false: die zugrunde liegenden
   Indizes rotieren Konstituenten über die Zeit; für PIT-Treue ein Russell-PIT-
   Universum nutzen.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2006-08-25          # begrenzt durch VOE (Auflage 2006-08-25)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - IJH   # iShares Core S&P Mid-Cap
   - MDY   # SPDR S&P MidCap 400

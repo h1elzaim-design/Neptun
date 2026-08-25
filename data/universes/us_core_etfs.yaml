@@ -2,22 +2,43 @@
 name: us_core_etfs
 description: "Breite US-Aktien-ETFs für robuste Daily-Strategien."
 timeframe: 1d
-provider: tiingo
+provider: eodhd
 # Handelskalender (#184): bestimmt die Annualisierung. us_equity = 252
 # Handelstage. Ein Universum, ein Kalender — Mischen wäre stiller Betrug
 # an jedem Sharpe, der daraus entsteht.
 calendar: us_equity
+# Anlageklasse — ausdrücklich, nicht aus dem Namen geraten. `sector_spdrs`
+# und `global_macro` sind ETF-Körbe, ohne dass "etf" im Namen steht; eine
+# Heuristik hätte sie unter "other" einsortiert und damit im Dropdown eine
+# plausible Falschangabe erzeugt. etf | equity | crypto | other
+asset_class: etf
 # All 16 listed are still trading at the time of audit. Survivorship bias is
 # negligible for the broad-market and sector-SPDR ETFs (no major ETF in this
-# basket has been liquidated in the relevant backtest window 2005-2024).
+# basket has been liquidated in the usable window below).
+#
+# KORREKTUR 2026-08-09: hier stand "backtest window 2005-2024". Das war um
+# 3932 Tage falsch — XLRE wurde erst am 2015-10-08 aufgelegt, und ein Universum
+# beginnt mit seinem jüngsten Symbol. Die Zusage stand in einem #-Kommentar,
+# den `yaml.safe_load` wegwirft; gefunden hat sie erst ein Skript, das die
+# Kommentarzeilen mitliest. Wer 20 Jahre Beleg erwartet und 10 bekommt, zieht
+# aus derselben Zahl einen anderen Schluss.
 delisted_included: true
 point_in_time: false
 last_audit_date: 2026-05-15
 source_notes: |
   US ETF basket — historically stable, no liquidations among the listed
-  symbols in the backtest period. point_in_time is false because constituents
+  symbols in the usable window. Wer mehr Historie braucht: `us_core_etfs_long`
+  ist derselbe Korb ohne XLRE und reicht bis 2004-11-18 zurück — ein
+  Sektor-ETF gegen elf Jahre. point_in_time is false because constituents
   of the underlying indices have rotated over time; if you need that level of
   fidelity, use a Russell PIT universe.
+# Gemessen am 2026-08-09 gegen Tiingos `supported_tickers`, nicht geschätzt.
+# Ein Universum kann erst beginnen, wenn ALLE Symbole Daten haben — begrenzend
+# ist deshalb immer das zuletzt aufgelegte. `scripts/universe_window_audit.py
+# --check` hält Zusage und Realität zusammen und läuft in CI.
+usable_window:
+  start: 2015-10-08          # begrenzt durch XLRE (Auflage 2015-10-08)
+  end: null               # offen — die Reihen laufen weiter
 symbols:
   - SPY   # S&P 500
   - QQQ   # Nasdaq 100
