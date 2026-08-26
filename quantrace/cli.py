@@ -857,6 +857,97 @@ def regime(
     console.print(char_t)
 
 
+#: Womit ein vom Server gelieferter Befehl anfangen **muss**, bevor er
+#: ausgeführt wird. Der Aufruf kommt zwar aus der eigenen API, aber „mein
+#: Server hat es gesagt" ist kein Grund, beliebiges argv zu starten — ein
+#: kompromittierter Token oder ein falsch konfiguriertes `--api-url` würden
+#: sonst zu Codeausführung auf dem Operator-Rechner.
+_ERLAUBTES_PREFIX = ("python", "-m", "quantrace")
+
+
+@app.command("run-local")
+def run_local(
+    run_id: str = typer.Option(..., help="Run-ID aus der Webapp"),
+    api_url: str = typer.Option(..., help="Basis-URL der API, ohne Pfad"),
+    token: str = typer.Option(
+        "", help="Zugangstoken; leer → aus QUANTRACE_API_TOKEN"
+    ),
+) -> None:
+    """Einen in der Webapp angelegten Run **hier** rechnen (#235).
+
+    Der Weg für große Sweeps und Walk-Forwards: die Container App hat 2 Kerne
+    und 4 GiB, ein Entwicklungsrechner meist deutlich mehr. Statt die Serie
+    dort in einen Timeout laufen zu lassen, legt die Webapp den Run nur an und
+    man kopiert sich diesen Befehl.
+
+    Was hier **nicht** passiert: den Lauf selbst konfigurieren. Strategie,
+    Universum, Zeitraum und Grid stehen in der Run-Zeile, und der Befehl wird
+    serverseitig daraus gebaut. Dieses Kommando holt ihn, führt ihn aus und
+    meldet den Ausgang zurück — damit kann das lokale Ergebnis nicht von dem
+    abweichen, was der Run behauptet zu sein.
+    """
+    import os
+    import shlex
+    import subprocess
+
+    import httpx
+
+    basis = api_url.rstrip("/")
+    schluessel = token or os.environ.get("QUANTRACE_API_TOKEN", "")
+    if not schluessel:
+        raise typer.BadParameter(
+            "Kein Token — --token setzen oder QUANTRACE_API_TOKEN exportieren."
+        )
+    kopf = {"Authorization": f"Bearer {schluessel}"}
+
+    def melden(client: httpx.Client, **payload) -> None:
+        """Statusmeldung — Fehler hier dürfen den Lauf nicht mitreißen."""
+        try:
+            r = client.post(
+                f"{basis}/api/pipeline/runs/{run_id}/report", json=payload, headers=kopf
+            )
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            console.print(f"[yellow]Statusmeldung '{payload.get('status')}' fehlgeschlagen: {e}")
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        try:
+            antwort = client.get(
+                f"{basis}/api/pipeline/runs/{run_id}/local-command", headers=kopf
+            )
+            antwort.raise_for_status()
+        except httpx.HTTPError as e:
+            console.print(f"[red]Befehl nicht abrufbar: {e}")
+            raise typer.Exit(1) from e
+
+        cmd = [str(x) for x in (antwort.json().get("command") or [])]
+        if tuple(cmd[:3]) != _ERLAUBTES_PREFIX:
+            console.print(
+                f"[red]Unerwarteter Befehl vom Server: {shlex.join(cmd) or '(leer)'}"
+            )
+            raise typer.Exit(1)
+
+        console.print(f"[bold]{shlex.join(cmd)}")
+        melden(client, status="running")
+
+    # Außerhalb des Clients: der Lauf dauert Minuten bis Stunden, und eine
+    # offene Verbindung so lange zu halten hat keinen Zweck.
+    ergebnis = subprocess.run(cmd, cwd=str(Path.cwd()))
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        if ergebnis.returncode == 0:
+            melden(client, status="done")
+            console.print("[green]Fertig — das Ergebnis steht in der Webapp.")
+        else:
+            melden(
+                client,
+                status="failed",
+                error=f"Lokaler Lauf endete mit Exit-Code {ergebnis.returncode}.",
+            )
+            console.print(f"[red]Fehlgeschlagen (Exit {ergebnis.returncode}).")
+            raise typer.Exit(ergebnis.returncode)
+
+
 @app.command()
 def plan() -> None:
     """Druckt den 5-Phasen-Plan auf den Terminal."""

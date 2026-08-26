@@ -56,6 +56,57 @@ log = logging.getLogger(__name__)
 #: nicht geraten (siehe `read_instruments`). ~8 Jahre lassen komfortabel Luft.
 _MAX_ADJUST_WINDOW_DAYS = 3000
 
+#: EODHDs Platzhalter für „kein Kurs ermittelbar" — kein Nullwert, sondern eine
+#: konkrete Zahl, die wie ein echter Kurs aussieht. Steht in **beiden**
+#: Kursspalten, häufiger in ``adjusted_close`` als in ``close`` (am 2012-06-29:
+#: 113 gegen 29 Zeilen, davon 93 nur dort).
+EODHD_NULL_PRICE_SENTINEL = 999999.9999
+
+
+def dollar_volume(frame: pd.DataFrame) -> pd.Series:
+    """Tages-Dollarvolumen aus einem **rohen** Bulk-Frame.
+
+    Die eine Stelle, an der diese Rechnung steht. ``quantrace.screen._aggregat``
+    spiegelt sie in SQL, weil es über tausende Partitionen aggregiert — wer
+    eine der beiden ändert, muss die andere mitziehen.
+
+    **Warum es nicht ``close * volume`` ist.** Im EODHD-Bulk stehen Kurs und
+    Volumen auf verschiedenen Zeitbasen: ``close`` ist roh und zeitgenau,
+    ``volume`` ist auf die **heutige** Stückzahl split-adjustiert. Bewiesen am
+    Split-Tag — AAPLs 2:1-Split am 2005-02-28 halbiert ``close``, lässt
+    ``volume`` aber ohne Sprung durchlaufen. Mit ``S`` = Split-Faktor und
+    ``D`` = Dividendenfaktor gilt::
+
+        close          * volume  =  DV_wahr * S    (kaputt bei Splits)
+        adjusted_close * volume  =  DV_wahr / D    (D >= 1, Untergrenze)
+
+    Die zweite Zeile ist eine garantierte Untergrenze, geht aber dort schief,
+    wo ``adjusted_close`` selbst Müll ist (Insolvenz mit gelöschtem
+    Eigenkapital). Die beiden Fehlerfälle überschneiden sich nicht, deshalb das
+    Minimum. Ohne den Fix kam AAPL zum 2012-06-29 auf 246 Mrd. $ Tagesumsatz
+    statt 8,4. Ausführlich in ``screen._aggregat`` und #296.
+
+    Fehlt ``adjusted_close`` ganz, gibt es **keine** Split-Information — dann
+    ist ``close * volume`` die einzig verfügbare Schätzung und wird als solche
+    zurückgegeben. Das ist kein stiller Rückfall auf den alten Fehler: die
+    Spalte fehlt nur bei Frames, die nicht aus dem Bulk stammen.
+    """
+    close = frame["close"].astype(float)
+    volume = frame["volume"].astype(float)
+    roh = close * volume
+    if "adjusted_close" not in frame.columns:
+        return roh
+
+    adjusted = frame["adjusted_close"].astype(float)
+    aus_adjustiert = adjusted * volume
+    # Der Sentinel ist kein Kurs. Wo er steht, trägt die betroffene Schätzung
+    # nichts bei — sonst gewänne sie das Minimum mit einer Fantasiezahl.
+    aus_adjustiert = aus_adjustiert.where(
+        (adjusted > 0) & (adjusted != EODHD_NULL_PRICE_SENTINEL)
+    )
+    roh = roh.where((close > 0) & (close != EODHD_NULL_PRICE_SENTINEL))
+    return pd.concat([roh, aus_adjustiert], axis=1).min(axis=1)
+
 
 @dataclass(frozen=True)
 class Adjustment:

@@ -64,6 +64,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from quantrace import storage
+from quantrace.bulk_read import EODHD_NULL_PRICE_SENTINEL
 from quantrace.instruments import US_EQUITY_PREFIX
 from quantrace.resolve import DEFAULT_ACTIVE_TOLERANCE_DAYS
 
@@ -107,7 +108,11 @@ MAX_WINDOW_STALENESS_DAYS = 30
 #: das Dollarvolumen aus ``close`` kam, reichte das zufällig. Seit es aus
 #: ``adjusted_close`` kommt (siehe ``_aggregat``), wäre es die teurere Hälfte
 #: gewesen.
-_EODHD_NULL_PRICE_SENTINEL = 999999.9999
+#:
+#: Aus ``bulk_read`` importiert, nicht kopiert: dort steht die Pandas-Fassung
+#: derselben Rechnung (``bulk_read.dollar_volume``), die ``_aggregat`` unten in
+#: SQL spiegelt. Zwei Zahlenliterale wären zwei Wahrheiten.
+_EODHD_NULL_PRICE_SENTINEL = EODHD_NULL_PRICE_SENTINEL
 
 
 class ScreenError(ValueError):
