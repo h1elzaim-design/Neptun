@@ -272,7 +272,7 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
     (Größenordnung 10^4 Zeilen), deshalb passiert das Filtern danach in pandas
     — dort ist der Trichter drei Zeilen statt einer verschachtelten Query.
 
-    **Warum ``adjusted_close * volume`` und nicht ``close * volume``.** Im
+    **Das Dollarvolumen ist die *kleinere* zweier Schätzungen — bewusst.** Im
     EODHD-Bulk stehen Kurs und Volumen auf **verschiedenen Zeitbasen**:
     ``close`` ist roh und zeitgenau, ``volume`` ist auf die **heutige**
     Stückzahl split-adjustiert. Bewiesen am Split-Tag: AAPLs 2:1-Split am
@@ -285,19 +285,34 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
     GOOG auf 59 Mrd. $ (real ~1,5) — beide verdrängten damit die echten
     liquiden Titel aus jedem Top-N.
 
-    Die Korrektur ist Algebra, keine Schätzung. Mit ``S`` = kumulierter
-    Split-Faktor nach dem Tag und ``D`` = kumulierter Dividendenfaktor gilt
-    ``volume = volume_wahr * S`` und ``adjusted_close = close / (S * D)``,
-    also::
+    Mit ``S`` = kumulierter Split-Faktor nach dem Tag und ``D`` = kumulierter
+    Dividendenfaktor gilt ``volume = volume_wahr * S`` sowie
+    ``adjusted_close = close / (S * D)``, und damit::
 
-        adjusted_close * volume  =  close * volume_wahr / D
+        close          * volume  =  DV_wahr * S      (S kann > oder < 1 sein)
+        adjusted_close * volume  =  DV_wahr / D      (D >= 1, immer)
 
-    ``S`` kürzt sich **exakt** weg — genau der Fehler, der wehtut. Was bleibt,
-    ist ``D``: bei Dividendenzahlern ist das Ergebnis um deren
-    Ausschüttungsfaktor zu **niedrig** (KO 2012: Faktor ~1,5). Das ist bewusst
-    in Kauf genommen und nicht verschwiegen — die Verzerrung ist beschränkt,
-    einseitig und trifft die Rangfolge weit schwächer als ein Faktor 28. Der
-    Rest braucht Dividenden über das Lake-Ende hinaus, die es nicht gibt
+    Die zweite Zeile ist eine **garantierte Untergrenze**: Dividenden sind nie
+    negativ, also ist ``D >= 1``. Sie allein zu nehmen ginge aber schief, wo
+    ``adjusted_close`` selbst Müll ist — nach einer Insolvenz mit gelöschtem
+    Eigenkapital liefert EODHD Fantasiewerte (WFT am 2012-06-29: ``close``
+    12,63 $, ``adjusted_close`` 18.198 $, macht 204 Mrd. $ Tagesumsatz bei
+    real ~140 Mio.). Umgekehrt ist ``close * volume`` genau dort gesund und
+    bei den Split-Fällen kaputt.
+
+    Die beiden Fehlerfälle überschneiden sich nicht, deshalb ``least(…)``:
+    im gesunden Fall ist das Ergebnis die Untergrenze ``DV_wahr / D``, im
+    Müllfall fängt es die jeweils andere Schätzung ab. Gemessen am 2012-06-29
+    trifft das jeden geprüften Fall — AAPL 7,4 Mrd., GOOG 1,4, SPY 22,7,
+    IWM 4,7, MSFT 1,3, WFT 0,14.
+
+    **Die Richtung des Restfehlers ist die sichere.** Was bleibt, ist eine
+    Unterschätzung (bei Dividendenzahlern um ``D``, KO 2012 ~1,5). Für eine
+    Liquiditätsschwelle ist das das richtige Vorzeichen: wer die Hürde
+    trotzdem nimmt, hat sie wirklich genommen. Dieselbe Abwägung wie bei der
+    Kostenklasse in ``universe_export`` — zu teuer gerechnet verwirft eine
+    gute Strategie, zu billig gerechnet gibt eine schlechte frei. Der exakte
+    Wert bräuchte Dividenden über das Lake-Ende hinaus, die es nicht gibt
     (#296).
 
     ``last_close`` bleibt der **rohe** Kurs: der Preisfilter fragt, was das
@@ -322,7 +337,8 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
             -- zwei Handelsplätzen deterministisch dieselbe Zeile ergibt.
             max(exchange_short_name)            AS exchange,
             COUNT(*)                            AS n_days,
-            median(adjusted_close * volume)     AS dollar_volume,
+            median(least(close * volume,
+                         adjusted_close * volume)) AS dollar_volume,
             arg_max(close, date)                AS last_close
         FROM read_parquet([{platzhalter}], union_by_name=true)
         WHERE close IS NOT NULL AND volume IS NOT NULL AND close > 0
