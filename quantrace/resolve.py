@@ -711,6 +711,7 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
 
     # Was wirklich entstanden ist, sagt der Lake — nicht die Absicht. Bei
     # einem Instrument ohne passende Kurszeile schreibt DuckDB keine Partition.
+    _drop_materialised_cache()
     return len(materialised_keys() & {r["instrument"] for r in rows})
 
 
@@ -776,17 +777,47 @@ def resolve_symbols(
     return aufgeloest, fehlend
 
 
+#: Ein LIST über `resolved/` bei 42.000+ materialisierten Instrumenten paginiert
+#: auf S3/R2 (~1000 Keys je Seite) — gemessen ~11.6s für einen einzelnen Read.
+#: `read_instruments` ruft das bei **jedem** Candle-Request auf, bevor es
+#: überhaupt ein Fenster kennt: ein Chart über eine Woche zahlte dieselbe
+#: Steuer wie „Max". Ändert sich nur bei `materialise`/`prune_stale`
+#: (Operator-Lauf, beide löschen den Cache selbst) — fünf Minuten wie die
+#: Universe-Coverage (`api.services.market._COVERAGE_TTL_SECONDS`), nicht nur
+#: sechzig wie beim Manifest: die Liste ist teurer zu erneuern und ändert sich
+#: seltener als die Karte.
+_MATERIALISED_TTL_S = 300.0
+_materialised_memo: tuple[str, float, frozenset[str]] | None = None
+
+
+def _drop_materialised_cache() -> None:
+    global _materialised_memo
+    _materialised_memo = None
+
+
 def materialised_keys() -> set[str]:
     """Die Instrument-Schlüssel, für die Kursdateien liegen.
 
     Ein LIST-Aufruf statt eines ``exists`` pro Instrument — bei 26.000
     Instrumenten ist der Unterschied zwischen einem Roundtrip und 26.000.
     """
-    return {
+    global _materialised_memo
+    key = _manifest_cache_key(storage.cache_path(RESOLVED_PREFIX))
+    now = time.monotonic()
+    if (
+        _materialised_memo is not None
+        and _materialised_memo[0] == key
+        and now - _materialised_memo[1] < _MATERIALISED_TTL_S
+    ):
+        return set(_materialised_memo[2])
+
+    keys = frozenset(
         name.removeprefix("instrument=")
         for name in storage.list_children(RESOLVED_PREFIX)
         if name.startswith("instrument=")
-    }
+    )
+    _materialised_memo = (key, now, keys)
+    return set(keys)
 
 
 class PruneRefusedError(RuntimeError):
@@ -859,6 +890,7 @@ def prune_stale(imap: IdentityMap, *, partial: bool = False, dry_run: bool = Fal
     for key in veraltet:
         storage.delete_tree(storage.cache_path(f"{RESOLVED_PREFIX}/instrument={key}"))
     if veraltet:
+        _drop_materialised_cache()
         log.info(
             "Schicht 2 aufgeräumt: %d verwaiste Instrument-Partitionen entfernt.", len(veraltet)
         )

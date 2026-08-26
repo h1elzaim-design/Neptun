@@ -434,6 +434,13 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
             con.execute(f"SET s3_access_key_id='{ak}';")
         if sk:
             con.execute(f"SET s3_secret_access_key='{sk}';")
+        # Der Default (= CPU-Kerne, auf Heroku Basic nur eine Hand voll) bremst
+        # nichts CPU-Gebundenes hier — es sind lauter kleine R2-GETs, eins je
+        # Tagespartition. Gemessen (#Actions-Read über 17 Jahre AAPL):
+        # 3.452 Dateien brauchten ~60s mit dem Default und ~23s mit 64 Threads;
+        # 128 hat gehangen (zu viele gleichzeitige Verbindungen). 32 ist die
+        # sichere Seite von diesem Knick.
+        con.execute("SET threads=32;")
     return con
 
 

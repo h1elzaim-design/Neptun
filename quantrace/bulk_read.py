@@ -38,6 +38,7 @@ sie ignoriert, tut das sichtbar.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 
@@ -49,6 +50,11 @@ from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
 log = logging.getLogger(__name__)
+
+#: Ab hier ist ein Actions-Read (ein GET je Tagespartition, zwei Feeds) auf
+#: Herokus 30s-Router-Timeout nicht mehr verlässlich verlassbar — gemessen,
+#: nicht geraten (siehe `read_instruments`). ~8 Jahre lassen komfortabel Luft.
+_MAX_ADJUST_WINDOW_DAYS = 3000
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,15 @@ def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.D
     Feed wären auf R2 tausend HTTP-GETs für eine Adjustierung, die nur das
     Chart-Jahr braucht — DuckDB kann Hive-Pruning erst anwenden, nachdem
     der Glob expandiert ist, und die Expansion *ist* der teure Teil.
+
+    **Kein Wildcard je Tag.** ``scripts/load_us_equities.py`` schreibt
+    Actions-Partitionen immer als ``date=…/data.parquet`` (anders als die
+    Schicht-2-Instrumentpfade, wo `PARTITION_BY` mal `data_0.parquet`
+    hinterlässt). Ein `*.parquet` je Tag zwingt DuckDB, für **jeden** Tag im
+    Fenster erst das Verzeichnis zu LISTen, bevor es lesen kann — bei einem
+    17-Jahre-Fenster (~4.300 Handelstage × zwei Feeds) war genau das der
+    30-Sekunden-Timeout auf Heroku (H12), der als "Max"-Chart aufschlug. Der
+    exakte Pfad braucht kein LIST, nur ein GET.
     """
     days = storage.list_day_partitions(prefix)
     if not days or not codes:
@@ -114,7 +129,7 @@ def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.D
         return pd.DataFrame()
 
     pfade = [
-        storage.cache_path(f"{prefix}/date={d.isoformat()}/*.parquet") for d in im_fenster
+        storage.cache_path(f"{prefix}/date={d.isoformat()}/data.parquet") for d in im_fenster
     ]
     con = storage._duckdb_conn()
     try:
@@ -182,9 +197,33 @@ def read_instruments(
     if not adjust:
         return prices, Adjustment(status="none")
 
+    if (end - start).days > _MAX_ADJUST_WINDOW_DAYS:
+        # Ein Actions-Read ist ein GET je Tagespartition (~80-150ms, R2 kennt
+        # keine größere Einheit). Gemessen: 3.452 Tage (17 Jahre AAPL) brauchen
+        # ~23s bei 64 Threads — für EINEN Feed. Beide Feeds seriell hätten
+        # Herokus 30s-Router-Timeout gerissen (H12), genau das Symptom, das
+        # den „Max"-Chart auf ein leeres 503 reduzierte. Lieber ROHE Kurse
+        # ausliefern als gar keine: die Reihe ist wahrheitsgemäß `status=none`,
+        # nicht `full` erschwindelt.
+        log.warning(
+            "Fenster %s…%s (%d Tage) über der Adjustierungs-Grenze (%d) — "
+            "Kurse bleiben ROH.",
+            start,
+            end,
+            (end - start).days,
+            _MAX_ADJUST_WINDOW_DAYS,
+        )
+        return prices, Adjustment(status="none")
+
     codes = sorted({str(c) for c in prices["code"].dropna().unique()})
-    splits = _read_actions(US_SPLITS_PREFIX, codes, start, end)
-    divs = _read_actions(US_DIVIDENDS_PREFIX, codes, start, end)
+    # Beide Feeds parallel statt seriell: zwei unabhängige R2-Reads, die sich
+    # nicht in die Quere kommen — seriell war das genau die Verdopplung, die
+    # ein grenzwertiges Fenster über die 30s kippte.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_splits = pool.submit(_read_actions, US_SPLITS_PREFIX, codes, start, end)
+        f_divs = pool.submit(_read_actions, US_DIVIDENDS_PREFIX, codes, start, end)
+        splits = f_splits.result()
+        divs = f_divs.result()
 
     s_von, s_bis = _actions_window(US_SPLITS_PREFIX)
     d_von, d_bis = _actions_window(US_DIVIDENDS_PREFIX)
