@@ -93,6 +93,15 @@ MIN_SUPPORTED_DOLLAR_VOLUME = 1_000_000.0
 #: ``_fenster``.
 MAX_WINDOW_STALENESS_DAYS = 30
 
+#: EODHDs Sentinel für „kein Kurs ermittelbar" — kein Nullwert, sondern eine
+#: konkrete Zahl, die wie ein echter Kurs aussieht. Gefunden am 2026-08-26 beim
+#: Bau der ersten Point-in-Time-Universen: ein Screen zum 2007-06-29 wählte auf
+#: den Rängen 1, 2, 8, 12 und 14 Papiere mit exakt diesem „Kurs" — macht daraus
+#: ein Dollarvolumen im zweistelligen Milliardenbereich und verdrängt echte
+#: liquide Titel (AAPL, GOOG, MSFT) aus der Top-Auswahl. `_aggregat` filtert das
+#: jetzt vorne raus, nicht bloß `close > 0`.
+_EODHD_NULL_PRICE_SENTINEL = 999999.9999
+
 
 class ScreenError(ValueError):
     """Fachlicher Fehler beim Screen. Der Router macht daraus 409."""
@@ -279,11 +288,12 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
             arg_max(close, date)                AS last_close
         FROM read_parquet([{platzhalter}], union_by_name=true)
         WHERE close IS NOT NULL AND volume IS NOT NULL AND close > 0
+          AND close != ?
         GROUP BY code
     """
     con = storage._duckdb_conn()
     try:
-        return con.execute(sql, pfade).df()
+        return con.execute(sql, [*pfade, _EODHD_NULL_PRICE_SENTINEL]).df()
     except Exception as exc:
         raise ScreenError(
             f"Querschnitte für {tage[0]}..{tage[-1]} nicht lesbar: {exc}"
