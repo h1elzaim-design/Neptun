@@ -100,6 +100,13 @@ MAX_WINDOW_STALENESS_DAYS = 30
 #: ein Dollarvolumen im zweistelligen Milliardenbereich und verdrängt echte
 #: liquide Titel (AAPL, GOOG, MSFT) aus der Top-Auswahl. `_aggregat` filtert das
 #: jetzt vorne raus, nicht bloß `close > 0`.
+#:
+#: **In beiden Kursspalten prüfen.** Der Sentinel steht häufiger in
+#: ``adjusted_close`` als in ``close``: am 2012-06-29 in 113 gegen 29 Zeilen,
+#: davon 93 *nur* dort. Die erste Fassung filterte allein ``close`` — solange
+#: das Dollarvolumen aus ``close`` kam, reichte das zufällig. Seit es aus
+#: ``adjusted_close`` kommt (siehe ``_aggregat``), wäre es die teurere Hälfte
+#: gewesen.
 _EODHD_NULL_PRICE_SENTINEL = 999999.9999
 
 
@@ -264,6 +271,37 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
     Ein DuckDB-Durchlauf über die Fenster-Partitionen. Das Ergebnis ist klein
     (Größenordnung 10^4 Zeilen), deshalb passiert das Filtern danach in pandas
     — dort ist der Trichter drei Zeilen statt einer verschachtelten Query.
+
+    **Warum ``adjusted_close * volume`` und nicht ``close * volume``.** Im
+    EODHD-Bulk stehen Kurs und Volumen auf **verschiedenen Zeitbasen**:
+    ``close`` ist roh und zeitgenau, ``volume`` ist auf die **heutige**
+    Stückzahl split-adjustiert. Bewiesen am Split-Tag: AAPLs 2:1-Split am
+    2005-02-28 halbiert ``close`` (88,99 → 44,86), lässt ``volume`` aber
+    ohne Sprung durchlaufen — bei rohem Volumen müsste es sich verdoppeln.
+
+    ``close * volume`` multipliziert damit einen Kurs von 2005 mit einer
+    Stückzahl in Aktien von 2026. Der Fehler ist der kumulierte Split-Faktor:
+    AAPL kam im Screen zum 2012-06-29 auf 246 Mrd. $ Tagesumsatz (real ~8),
+    GOOG auf 59 Mrd. $ (real ~1,5) — beide verdrängten damit die echten
+    liquiden Titel aus jedem Top-N.
+
+    Die Korrektur ist Algebra, keine Schätzung. Mit ``S`` = kumulierter
+    Split-Faktor nach dem Tag und ``D`` = kumulierter Dividendenfaktor gilt
+    ``volume = volume_wahr * S`` und ``adjusted_close = close / (S * D)``,
+    also::
+
+        adjusted_close * volume  =  close * volume_wahr / D
+
+    ``S`` kürzt sich **exakt** weg — genau der Fehler, der wehtut. Was bleibt,
+    ist ``D``: bei Dividendenzahlern ist das Ergebnis um deren
+    Ausschüttungsfaktor zu **niedrig** (KO 2012: Faktor ~1,5). Das ist bewusst
+    in Kauf genommen und nicht verschwiegen — die Verzerrung ist beschränkt,
+    einseitig und trifft die Rangfolge weit schwächer als ein Faktor 28. Der
+    Rest braucht Dividenden über das Lake-Ende hinaus, die es nicht gibt
+    (#296).
+
+    ``last_close`` bleibt der **rohe** Kurs: der Preisfilter fragt, was das
+    Papier am Stichtag kostete, nicht was es totalrenditebereinigt wert wäre.
     """
     if not tage:
         return pd.DataFrame(
@@ -284,16 +322,19 @@ def _aggregat(tage: list[date]) -> pd.DataFrame:
             -- zwei Handelsplätzen deterministisch dieselbe Zeile ergibt.
             max(exchange_short_name)            AS exchange,
             COUNT(*)                            AS n_days,
-            median(close * volume)              AS dollar_volume,
+            median(adjusted_close * volume)     AS dollar_volume,
             arg_max(close, date)                AS last_close
         FROM read_parquet([{platzhalter}], union_by_name=true)
         WHERE close IS NOT NULL AND volume IS NOT NULL AND close > 0
-          AND close != ?
+          AND adjusted_close IS NOT NULL AND adjusted_close > 0
+          AND close != ? AND adjusted_close != ?
         GROUP BY code
     """
     con = storage._duckdb_conn()
     try:
-        return con.execute(sql, [*pfade, _EODHD_NULL_PRICE_SENTINEL]).df()
+        return con.execute(
+            sql, [*pfade, _EODHD_NULL_PRICE_SENTINEL, _EODHD_NULL_PRICE_SENTINEL]
+        ).df()
     except Exception as exc:
         raise ScreenError(
             f"Querschnitte für {tage[0]}..{tage[-1]} nicht lesbar: {exc}"
