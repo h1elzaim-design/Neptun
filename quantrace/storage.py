@@ -413,6 +413,15 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
     import duckdb
 
     con = duckdb.connect()
+    # Große Schreibläufe sortieren extern: `materialise()` schiebt 88 Mio.
+    # Zeilen durch ein ORDER BY, das nicht in den RAM passt. Ohne Angabe legt
+    # DuckDB diesen Stapel unter `.tmp` im Arbeitsverzeichnis ab — also auf der
+    # Systemplatte, unabhängig davon, wo der Platz tatsächlich ist. Der Ort
+    # gehört deshalb konfiguriert, nicht geerbt.
+    tmp_dir = os.environ.get("QUANTRACE_DUCKDB_TEMP_DIR", "").strip()
+    if tmp_dir:
+        os.makedirs(tmp_dir, exist_ok=True)
+        con.execute(f"SET temp_directory='{tmp_dir}';")
     if is_remote():
         con.execute("INSTALL httpfs; LOAD httpfs;")
         # DuckDB will den Host ohne Schema — die Normalisierung selbst steckt
