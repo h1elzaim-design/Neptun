@@ -121,6 +121,43 @@ DEFAULT_GAP_TRADING_DAYS = 252
 #: deshalb historisch wird, weil der Bulk-Load drei Wochen alt ist.
 DEFAULT_ACTIVE_TOLERANCE_DAYS = 45
 
+#: Wie viele Bars ein **beendetes** späteres Segment mindestens tragen muss,
+#: damit es das frühere ablöst. Segmente, die bis an die Front reichen, sind
+#: ausgenommen — dort ist die Frage nicht entscheidbar (siehe unten).
+#:
+#: **Der Fall.** Am 2026-08-27 im Lake gemessen: von 4.457 Ablösungen hingen
+#: **304 an einem späteren Segment mit genau einem Bar**. `ICTXX` und `CAGXX`
+#: etwa je einer am 2012-08-01 — derselbe Tag, nach 3.837 bzw. 3.836 Bars
+#: Historie, danach nie wieder. Zwei Codes, ein Tag, je eine Zeile: ein
+#: Zombie-Ticker in einem einzelnen Querschnitt, keine Firma.
+#:
+#: Die Folge war nicht nur eine schiefe Zahl. `resolve_symbols` bricht ab,
+#: sobald zwei Segmente das Fenster schneiden — zu Recht, das ist der
+#: BBBY-Schutz. Dieser eine Bar machte damit jeden Backtest über den Code
+#: unmöglich, mit der Begründung, er habe den Besitzer gewechselt. Er hatte
+#: nicht.
+#:
+#: **Warum aktive Segmente ausgenommen bleiben.** Ein kurzes Segment *an der
+#: Front* ist von einer echten Neunotierung nicht zu unterscheiden: `KENT` trug
+#: am 2026-08-27 genau 34 Bars seit dem 2014-12-16, und BBBYs Nachfolger hatte
+#: am Anfang auch nicht mehr. Wer dort stillschweigend die alte Reihe
+#: zurückgibt, begeht genau den BBBY-Fehler, nur später. Beendet **und** kurz
+#: ist dagegen eine abgeschlossene Aussage: eine Firma, die einen Tag existiert
+#: hat, hat es nicht gegeben. Und weil die Front nächtlich wandert, entscheidet
+#: sich der offene Fall von selbst — eine echte Neunotierung wächst über die
+#: Schwelle, ein Zombie bleibt stehen, wo er steht.
+#:
+#: **Die Zahl ist ein Urteil, keine Messung.** Die Verteilung der Ablösungen
+#: hat keinen Knick (6,8 % unter 2 Bars, 17,3 % unter 5, 35,0 % unter 20,
+#: 49,4 % unter 60): die Daten sagen, was jede Wahl kostet, nicht welche
+#: richtig ist. Ein Handelsmonat ist der Kompromiss.
+#:
+#: Die Fehlerrichtung stimmt: wird ein Segment übergangen, **fehlen seine Tage**
+#: im Ergebnis. In die fremde Reihe geraten können sie nicht, weil
+#: `materialise` je Instrument auf `date BETWEEN first AND last` joint.
+#: Weglassen statt erfinden — dieselbe Richtung wie überall sonst hier.
+DEFAULT_MIN_SEGMENT_BARS = 20
+
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -155,6 +192,7 @@ class IdentityMap:
     lake_first: date | None = None
     lake_last: date | None = None
     gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS
+    min_segment_bars: int = DEFAULT_MIN_SEGMENT_BARS
 
     @property
     def n_instruments(self) -> int:
@@ -172,6 +210,17 @@ class IdentityMap:
         bei naiver Verkettung stillschweigend in einer fremden Reihe gelandet.
         """
         return sum(1 for r in self.rows if r["superseded"])
+
+    @property
+    def n_short(self) -> int:
+        """Segmente unter der Schwelle — die Fälle, die nichts ablösen können.
+
+        Sie stehen neben ``n_superseded``, weil erst beide zusammen die Frage
+        beantworten, ob eine Ablösung ein Besitzerwechsel war: ein Feed, der
+        Zombie-Ticker in einzelne Querschnitte streut, produziert beliebig
+        viele Segmente, die wie ein Neuanfang aussehen.
+        """
+        return sum(1 for r in self.rows if r["n_bars"] < self.min_segment_bars)
 
     def to_frame(self) -> pd.DataFrame:
         if not self.rows:
@@ -496,12 +545,20 @@ def build_identity_map(
     segments: list[Segment] | None = None,
     gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS,
     active_tolerance_days: int = DEFAULT_ACTIVE_TOLERANCE_DAYS,
+    min_segment_bars: int = DEFAULT_MIN_SEGMENT_BARS,
 ) -> IdentityMap:
     """Segmente + Schlüssel + Herkunft. Das Herzstück der Schicht.
 
     Die ISIN wird **nur** an ein Segment vergeben, das bis ans Ende des
     geladenen Fensters reicht. Alles davor ist historisch: die Karte kennt den
     heutigen Inhaber des Codes, nicht den damaligen.
+
+    Abgelöst ist ein Segment nur durch einen Nachfolger, der entweder
+    ``min_segment_bars`` Bars trägt oder bis an die Front reicht (siehe
+    ``DEFAULT_MIN_SEGMENT_BARS``). Ein einzelner, längst beendeter
+    Tagesquerschnitt hinter einer fünfzehnjährigen Historie ist kein
+    Besitzerwechsel, sondern ein Zombie-Ticker — und würde die echte Reihe
+    grundlos als „abgelöst" abstempeln.
 
     ``segments`` überspringt den Kalender-Schritt — der Weg für den echten
     Lake, wo ``segments_from_lake`` die Grenzen in DuckDB rechnet, statt 19,6
@@ -519,16 +576,22 @@ def build_identity_map(
     lake_first = min(s.first for s in segments)
     aktiv_ab = lake_last - timedelta(days=int(active_tolerance_days))
 
-    # Wie viele Segmente hat der Code insgesamt? Nur so lässt sich sagen, ob
-    # ein Segment von einem späteren abgelöst wurde.
+    # Bis zu welchem Index hat der Code ein **substanzielles** Segment? Nur so
+    # lässt sich sagen, ob ein Segment von einem späteren abgelöst wurde — und
+    # ein beendeter Stummel dahinter löst nichts ab, er beweist nur, dass der
+    # Feed den Code an einem Tag noch einmal geführt hat. Reicht das kurze
+    # Segment dagegen bis an die Front, bleibt es zählend: dort sieht eine echte
+    # Neunotierung genauso aus (siehe DEFAULT_MIN_SEGMENT_BARS).
     letzte: dict[tuple[str, str], int] = {}
     for s in segments:
+        if s.n_bars < min_segment_bars and s.last < aktiv_ab:
+            continue
         key = (s.code, s.exchange)
         letzte[key] = max(letzte.get(key, 0), s.index)
 
     rows: list[dict] = []
     for s in segments:
-        superseded = s.index < letzte[(s.code, s.exchange)]
+        superseded = s.index < letzte.get((s.code, s.exchange), 0)
         active = s.last >= aktiv_ab
         isin = None
         if active and not superseded:
@@ -583,6 +646,7 @@ def build_identity_map(
         lake_first=lake_first,
         lake_last=lake_last,
         gap_trading_days=gap_trading_days,
+        min_segment_bars=min_segment_bars,
     )
 
 
@@ -725,7 +789,12 @@ class AmbiguousCodeError(ValueError):
 
 
 def resolve_symbols(
-    codes: list[str], start: date, end: date, *, manifest: pd.DataFrame | None = None
+    codes: list[str],
+    start: date,
+    end: date,
+    *,
+    manifest: pd.DataFrame | None = None,
+    min_segment_bars: int = DEFAULT_MIN_SEGMENT_BARS,
 ) -> tuple[dict[str, str], list[str]]:
     """Ticker → Instrument-Schlüssel **für ein Zeitfenster**.
 
@@ -743,6 +812,15 @@ def resolve_symbols(
         der Ticker während der Anfrage den Besitzer gewechselt, und jede
         automatische Wahl wäre eine Erfindung. Der Aufrufer muss das Fenster
         teilen oder den Instrument-Schlüssel direkt nennen.
+
+        **Nicht** aber, wenn die anderen beendete Stummel unter
+        ``min_segment_bars`` sind: ein einzelner Querschnitt aus einem toten
+        Code ist kein Besitzerwechsel, und ein Abbruch dafür kostet einen
+        Backtest, den nichts gefährdet. Ein kurzes Segment, das bis an die
+        Front reicht, löst den Abbruch weiterhin aus — dort sieht eine echte
+        Neunotierung genauso aus. Die Tage des kurzen Segments fehlen dann im Ergebnis
+        — sie können nicht in die fremde Reihe geraten, weil ``materialise``
+        je Instrument auf ``date BETWEEN first AND last`` joint.
 
     **Warum das Fenster mitentscheidet.** Ohne Zeitbezug wäre `BBBY` heute
     Overstock — und ein Backtest über 2019 bekäme die Kurse einer Firma, die
@@ -764,6 +842,21 @@ def resolve_symbols(
         if passend.empty:
             fehlend.append(code)
             continue
+        if len(passend) > 1:
+            # Erst die beendeten Stummel aussortieren — sonst blockiert ein
+            # einzelner Zombie-Bar eine Historie, die niemand bestreitet. Was
+            # bis an die Front reicht, bleibt stehen: dort ist eine echte
+            # Neunotierung nicht zu unterscheiden. Bleibt danach mehr als eines
+            # übrig, ist es ein Besitzerwechsel und der Abbruch bleibt.
+            lang = pd.to_numeric(passend["n_bars"], errors="coerce").fillna(0) >= min_segment_bars
+            aktiv = (
+                passend["active"].fillna(True).astype(bool)
+                if "active" in passend.columns
+                else True
+            )
+            substanziell = passend[lang | aktiv]
+            if len(substanziell) == 1:
+                passend = substanziell
         if len(passend) > 1:
             teile = ", ".join(
                 f"{r.instrument} ({r.first}…{r.last})" for r in passend.itertuples(index=False)
