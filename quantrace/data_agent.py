@@ -82,18 +82,33 @@ def load_universe(
     # Universum nicht erst Daten zieht und dann scheitert.
     validate_universe_calendar(symbols, calendar, universe=universe, cost_class=cost_class)
 
+    explizit = provider is not None
     provider = provider or default_provider()
     if provider == "eodhd":
         md = _load_via_bulk(universe, symbols, start, end, timeframe, adjusted, calendar)
     elif provider == "tiingo":
-        # Eigener Zweig statt „unbekannter Provider": ein Universe-YAML mit
-        # `provider: tiingo` ist kein Tippfehler, sondern eine Datei von vor
-        # dem 2026-08-13. Der Unterschied gehört in die Fehlermeldung.
+        # Eigener Zweig statt „unbekannter Provider": `tiingo` ist kein
+        # Tippfehler, sondern ein Rest von vor dem 2026-08-13.
+        #
+        # **Und woher der Wert kam, gehört genauso hinein.** Die Meldung zeigte
+        # bis zum 2026-08-27 auf die Universe-YAML — über `sweep`, `backtest`
+        # und `walk-forward` kann sie von dort aber gar nicht stammen:
+        # `_universe_data` reicht `provider` nicht durch, der Wert kommt also
+        # aus `default_provider()` und damit aus `QUANTRACE_DATA_PROVIDER`.
+        # Genau der Fall trat ein: alle zwölf YAMLs sagten längst `eodhd`, die
+        # `.env` trug den toten Provider, und gesucht wurde in den Dateien, die
+        # recht hatten.
+        woher = (
+            "als Argument übergeben"
+            if explizit
+            else "aus QUANTRACE_DATA_PROVIDER (Umgebung oder .env im Repo-Verzeichnis)"
+        )
         raise ValueError(
-            f"Universum {universe!r} nennt provider='tiingo' — der Pfad ist entfernt. "
-            "Der Backtest-Pfad ist der EODHD-Bulk: `provider: eodhd` in der "
-            "Universe-YAML setzen. Tiingo war eine Survivor-Liste; ein Backtest "
-            "über 2008 sah dort nie LEH, WM oder BSC."
+            f"provider='tiingo' ist entfernt — hier {woher}, Universum "
+            f"{universe!r}. Der Backtest-Pfad ist der EODHD-Bulk: den Wert auf "
+            "`eodhd` setzen oder die Zeile löschen, `eodhd` ist der Default. "
+            "Tiingo war eine Survivor-Liste; ein Backtest über 2008 sah dort "
+            "nie LEH, WM oder BSC."
         )
     else:
         md = _load_via_openbb_cache(
