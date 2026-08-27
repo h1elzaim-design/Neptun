@@ -892,11 +892,24 @@ def run_local(
 
     import httpx
 
+    from quantrace.local_env import load_local_env
+
     basis = api_url.rstrip("/")
+    # Die `.env` zählt als Quelle, nicht nur die Shell. Alle Datenskripte lesen
+    # sie seit jeher; dass ausgerechnet dieser Aufruf es nicht tat, war kein
+    # Entwurf, sondern eine Lücke — der Token stand in der Datei und der Befehl
+    # brach trotzdem mit „Kein Token" ab. `override=False`: ein explizit
+    # vorangestelltes `QUANTRACE_API_TOKEN=… python -m quantrace …` gewinnt
+    # weiterhin.
+    load_local_env()
     schluessel = token or os.environ.get("QUANTRACE_API_TOKEN", "")
     if not schluessel:
         raise typer.BadParameter(
-            "Kein Token — --token setzen oder QUANTRACE_API_TOKEN exportieren."
+            "Kein Token. Drei Wege, in dieser Reihenfolge geprüft: --token, "
+            "QUANTRACE_API_TOKEN in der Umgebung, oder dieselbe Zeile in der "
+            "`.env` im Repo-Verzeichnis. Der Wert ist ein GitHub-Token mit "
+            "`read:user` — `gh auth token` gibt einen aus, wenn die GitHub CLI "
+            "eingerichtet ist."
         )
     kopf = {"Authorization": f"Bearer {schluessel}"}
 
