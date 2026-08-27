@@ -38,6 +38,7 @@ sie ignoriert, tut das sichtbar.
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
@@ -54,7 +55,35 @@ log = logging.getLogger(__name__)
 #: Ab hier ist ein Actions-Read (ein GET je Tagespartition, zwei Feeds) auf
 #: Herokus 30s-Router-Timeout nicht mehr verlässlich verlassbar — gemessen,
 #: nicht geraten (siehe `read_instruments`). ~8 Jahre lassen komfortabel Luft.
-_MAX_ADJUST_WINDOW_DAYS = 3000
+_DEFAULT_MAX_ADJUST_WINDOW_DAYS = 3000
+
+
+def _max_adjust_window_days() -> int:
+    """Die Grenze in Tagen; ``0`` hebt sie auf.
+
+    **Warum sie überhaupt verstellbar sein muss.** Sie schützt einen
+    HTTP-Request vor einem Router-Timeout — außerhalb eines Requests schützt
+    sie nichts und kostet die Adjustierung. Ein Walk-Forward über 2000–2015
+    (5.511 Tage) lief am 2026-08-27 genau deshalb ins Leere: die Actions lagen
+    im Lake, wurden aber nicht gelesen, und der Lauf brach ab, weil eine rohe
+    Reihe für einen Backtest zu Recht abgelehnt wird. Lokal darf der Read
+    Minuten dauern; es wartet niemand mit einer offenen Verbindung.
+
+    Der Default bleibt streng: auf Heroku ist die Grenze richtig, und sie
+    wegzunehmen hieße, den H12 zurückzuholen, gegen den sie gebaut wurde.
+    """
+    roh = os.environ.get("QUANTRACE_MAX_ADJUST_WINDOW_DAYS", "").strip()
+    if not roh:
+        return _DEFAULT_MAX_ADJUST_WINDOW_DAYS
+    try:
+        return max(int(roh), 0)
+    except ValueError:
+        log.warning(
+            "QUANTRACE_MAX_ADJUST_WINDOW_DAYS=%r ist keine Zahl — Default %d gilt.",
+            roh,
+            _DEFAULT_MAX_ADJUST_WINDOW_DAYS,
+        )
+        return _DEFAULT_MAX_ADJUST_WINDOW_DAYS
 
 #: EODHDs Platzhalter für „kein Kurs ermittelbar" — kein Nullwert, sondern eine
 #: konkrete Zahl, die wie ein echter Kurs aussieht. Steht in **beiden**
@@ -127,6 +156,10 @@ class Adjustment:
     status: str
     covered_from: date | None = None
     covered_to: date | None = None
+    #: Das *angefragte* Fenster. Ohne diese beiden weiß `warning()` nicht,
+    #: welche Seite fehlt — und nannte deshalb immer den Anfang.
+    requested_from: date | None = None
+    requested_to: date | None = None
     n_splits: int = 0
     n_dividends: int = 0
 
@@ -138,11 +171,47 @@ class Adjustment:
         """Ein Satz für Log, API und UI — oder ``None``, wenn alles sauber ist."""
         if self.status == "full":
             return None
+        if self.status == "skipped":
+            return (
+                "Corporate Actions wurden NICHT GELESEN — das Fenster liegt über "
+                "der Adjustierungs-Grenze, nicht etwa die Daten fehlen. Die "
+                "Grenze schützt einen HTTP-Request vor dem Router-Timeout; für "
+                "einen lokalen Lauf hebt QUANTRACE_MAX_ADJUST_WINDOW_DAYS=0 sie "
+                "auf. Bis dahin ist die Reihe ROH."
+            )
         if self.status == "none":
             return (
                 "Keine Splits/Dividenden im Lake — die Reihe ist ROH, nicht "
                 "adjustiert. Renditen unterschätzen den Total Return, und an "
                 "jedem Split springt der Kurs."
+            )
+        # **Welche Seite fehlt, entscheidet die Meldung.** Bis zum 2026-08-27
+        # nannte sie ausnahmslos den Anfang — auch dann, wenn der exakt
+        # abgedeckt war und genau ein Tag am *Ende* fehlte, weil der Ladelauf
+        # Kurse einen Tag weiter geschrieben hatte als die Actions. Wer das
+        # liest, prüft die Historie von 2000 und findet dort nichts.
+        vorne = (
+            self.requested_from is not None
+            and self.covered_from is not None
+            and self.covered_from > self.requested_from
+        )
+        hinten = (
+            self.requested_to is not None
+            and self.covered_to is not None
+            and self.covered_to < self.requested_to
+        )
+        if hinten and not vorne:
+            return (
+                f"Corporate Actions enden am {self.covered_to}, angefragt ist bis "
+                f"{self.requested_to} — der Rest der Reihe ist roh. Meist steht der "
+                "Ladelauf schlicht einen Tag weiter bei den Kursen als bei den "
+                "Actions; dann genügt ein Enddatum bis zum abgedeckten Tag."
+            )
+        if vorne and hinten:
+            return (
+                f"Corporate Actions decken nur {self.covered_from} … "
+                f"{self.covered_to}, angefragt ist {self.requested_from} … "
+                f"{self.requested_to} — außerhalb ist die Reihe roh."
             )
         return (
             f"Corporate Actions decken erst ab {self.covered_from} — davor ist "
@@ -248,7 +317,8 @@ def read_instruments(
     if not adjust:
         return prices, Adjustment(status="none")
 
-    if (end - start).days > _MAX_ADJUST_WINDOW_DAYS:
+    grenze = _max_adjust_window_days()
+    if grenze and (end - start).days > grenze:
         # Ein Actions-Read ist ein GET je Tagespartition (~80-150ms, R2 kennt
         # keine größere Einheit). Gemessen: 3.452 Tage (17 Jahre AAPL) brauchen
         # ~23s bei 64 Threads — für EINEN Feed. Beide Feeds seriell hätten
@@ -258,13 +328,17 @@ def read_instruments(
         # nicht `full` erschwindelt.
         log.warning(
             "Fenster %s…%s (%d Tage) über der Adjustierungs-Grenze (%d) — "
-            "Kurse bleiben ROH.",
+            "Kurse bleiben ROH. Aufheben mit QUANTRACE_MAX_ADJUST_WINDOW_DAYS=0.",
             start,
             end,
             (end - start).days,
-            _MAX_ADJUST_WINDOW_DAYS,
+            grenze,
         )
-        return prices, Adjustment(status="none")
+        # **Nicht `none`.** Der Unterschied ist der zwischen „liegt nicht im
+        # Lake" und „wurde nicht gelesen" — die alte Meldung behauptete das
+        # Erste, während 3.795 Tage Actions danebenlagen. Wer das liest, sucht
+        # einen Ladelauf statt eine Konfigurationszeile.
+        return prices, Adjustment(status="skipped")
 
     codes = sorted({str(c) for c in prices["code"].dropna().unique()})
     # Beide Feeds parallel statt seriell: zwei unabhängige R2-Reads, die sich
@@ -292,6 +366,8 @@ def read_instruments(
         status="full" if voll else "partial",
         covered_from=von,
         covered_to=bis,
+        requested_from=start,
+        requested_to=end,
         n_splits=int(len(splits)),
         n_dividends=int(len(divs)),
     )
