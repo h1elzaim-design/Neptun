@@ -990,6 +990,164 @@ def prune_stale(imap: IdentityMap, *, partial: bool = False, dry_run: bool = Fal
     return veraltet
 
 
+@dataclass(frozen=True)
+class Bruch:
+    """Ein Instrument, dessen Kursdatei nicht hält, was das Manifest verspricht."""
+
+    instrument: str
+    #: ``n_bars`` aus dem Manifest — die Zusage.
+    versprochen: int
+    #: Zeilen in der materialisierten Kursdatei — was tatsächlich gelesen wird.
+    vorhanden: int
+    #: ``last`` aus dem Manifest.
+    verspricht_bis: date
+    #: Letzter Bar in der Datei. ``None``, wenn die Partition leer ist.
+    reicht_bis: date | None
+
+    @property
+    def fehlend(self) -> int:
+        """Positiv: die Datei hinkt nach. Negativ: das Manifest ist das ältere."""
+        return self.versprochen - self.vorhanden
+
+
+@dataclass(frozen=True)
+class Materialisierungsbefund:
+    """Wie viele Instrumente geprüft wurden, und welche davon auseinanderlaufen."""
+
+    geprueft: int
+    brueche: list[Bruch]
+
+    @property
+    def ok(self) -> bool:
+        return not self.brueche
+
+
+def stichprobe(karte: pd.DataFrame, *, n: int) -> list[str]:
+    """Welche materialisierten Instrumente werden geprüft — deterministisch.
+
+    Zwei Hälften, weil es zwei Fehlerbilder gibt:
+
+    * **Die Hälfte mit den meisten Bars.** Der Rückstand aus #298 ist
+      systematisch — Schicht 2 stammt aus einer Zeit, in der der Lake früher
+      endete. Er trifft zuerst die Reihen, die am weitesten reichen, und dort
+      ist er am größten. AAPL und SPY liegen in dieser Hälfte.
+    * **Ein gleichmäßiger Querschnitt über den Rest.** Ein einzelner
+      fehlgeschlagener Schreibvorgang ist nicht nach Bar-Zahl sortiert; eine
+      reine Top-Liste würde ihn nie sehen.
+
+    Deterministisch und nicht zufällig, damit zwei Läufe dieselbe Antwort
+    vergleichbar machen: eine Zahl, die zwischen zwei Aufrufen springt, weil
+    die Stichprobe wanderte, ist keine Auskunft über den Lake.
+    """
+    if karte.empty or n <= 0:
+        return []
+    vorhanden = materialised_keys()
+    kandidaten = karte[karte["instrument"].astype(str).isin(vorhanden)]
+    if kandidaten.empty:
+        return []
+
+    gereiht = kandidaten.sort_values(
+        ["n_bars", "instrument"], ascending=[False, True]
+    )["instrument"].astype(str).tolist()
+    if len(gereiht) <= n:
+        return gereiht
+
+    kopf = gereiht[: n // 2]
+    rest = sorted(set(gereiht) - set(kopf))
+    schritt = max(1, len(rest) // max(1, n - len(kopf)))
+    quer = rest[::schritt][: n - len(kopf)]
+    return sorted(set(kopf) | set(quer))
+
+
+def _datei_stand(schluessel: list[str]) -> dict[str, tuple[int, date | None]]:
+    """Zeilenzahl und letzter Bar je Instrument — aus den Dateien selbst.
+
+    Eine Abfrage über die betroffenen Partitionen statt einer je Instrument,
+    und nur über die Spalte ``date``: DuckDB liest Parquet spaltenweise, der
+    Rest der Datei wird nicht angefasst. ``instrument`` kommt aus dem
+    Hive-Pfad, denn ``PARTITION_BY`` nimmt die Spalte aus den Daten heraus.
+    """
+    if not schluessel:
+        return {}
+    pfade = [
+        storage.cache_path(f"{RESOLVED_PREFIX}/instrument={k}/*.parquet") for k in schluessel
+    ]
+    con = storage._duckdb_conn()
+    try:
+        df = con.execute(
+            "SELECT instrument, COUNT(*) AS n, MAX(date) AS letzter "
+            "FROM read_parquet(?, hive_partitioning=true) GROUP BY instrument",
+            [pfade],
+        ).df()
+    finally:
+        con.close()
+
+    out: dict[str, tuple[int, date | None]] = {}
+    for r in df.itertuples(index=False):
+        letzter = pd.to_datetime(r.letzter).date() if pd.notna(r.letzter) else None
+        out[str(r.instrument)] = (int(r.n), letzter)
+    return out
+
+
+def audit_materialised(karte: pd.DataFrame, *, n: int = 40) -> Materialisierungsbefund:
+    """Hält die Kursdatei, was das Manifest über sie behauptet?
+
+    **Warum diese Prüfung existiert.** Das Manifest und die materialisierten
+    Kursdateien sind zwei Stände, die auseinanderlaufen können, ohne dass
+    irgendwo etwas rot wird — und am 2026-08-26 haben sie das getan: für AAPL
+    versprach die Karte 4.398 Bars bis 2013-09-23, die Datei hatte 1.683 bis
+    2011-08-25 (#298). Sichtbar war nichts: `/market/<symbol>` liest die
+    Coverage-Zeile aus dem Manifest und zeichnet die Kurve aus der Datei, also
+    zeigte die Oberfläche eine Zusage neben einer Kurve, die sie nicht hält.
+
+    ``build_resolved.py --status`` prüfte bis dahin nur die *Karte* gegen den
+    Rohbestand — die Richtung „Datei gegen Karte" stellte niemand, obwohl die
+    Zahl in beiden Quellen bereits steht.
+
+    **Stichprobe, und das ausdrücklich.** Ein Vollabgleich wäre ein Roundtrip
+    je Instrument; bei 62.152 Instrumenten gegen R2 ist das kein Statusbericht
+    mehr. Der Fehler, um den es geht, ist ohnehin systematisch: eine veraltete
+    Schicht 2 ist nicht bei einzelnen Reihen alt, sondern bei allen, deren
+    Fenster über das damalige Lake-Ende reicht. Eine Stichprobe von einigen
+    Dutzend findet das zuverlässig — was sie nicht kann, ist eine
+    Unauffälligkeit auf den ganzen Bestand hochrechnen, und genau so wird sie
+    auch berichtet.
+
+    Nicht materialisierte Instrumente kommen nicht vor. Eine fehlende Datei ist
+    kein Widerspruch, sondern eine Entscheidung (``--top`` statt ``--all``);
+    verwaiste Schlüssel beantwortet ``stale_keys``.
+    """
+    if karte.empty:
+        return Materialisierungsbefund(geprueft=0, brueche=[])
+
+    keys = stichprobe(karte, n=n)
+    if not keys:
+        return Materialisierungsbefund(geprueft=0, brueche=[])
+
+    stand = _datei_stand(keys)
+    zeilen = karte.set_index(karte["instrument"].astype(str))
+
+    brueche: list[Bruch] = []
+    for k in keys:
+        vorhanden, reicht_bis = stand.get(k, (0, None))
+        zeile = zeilen.loc[k]
+        versprochen = int(zeile["n_bars"])
+        if vorhanden == versprochen:
+            continue
+        brueche.append(
+            Bruch(
+                instrument=k,
+                versprochen=versprochen,
+                vorhanden=vorhanden,
+                verspricht_bis=zeile["last"],
+                reicht_bis=reicht_bis,
+            )
+        )
+
+    brueche.sort(key=lambda b: (-abs(b.fehlend), b.instrument))
+    return Materialisierungsbefund(geprueft=len(keys), brueche=brueche)
+
+
 # ---------------------------------------------------------------------------
 # Ticker → CIK, mit Zeitbezug
 #
