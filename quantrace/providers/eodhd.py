@@ -124,7 +124,19 @@ def _get_with_retry(client: httpx.Client, path: str, params: dict[str, Any]) -> 
 
 @dataclass(frozen=True)
 class Security:
-    """Ein Wertpapier, identifiziert über seine ISIN."""
+    """Ein Wertpapier — mit ISIN, wo es eine gibt.
+
+    **``isin`` darf leer sein, und das ist eine Aussage, kein Datenfehler**
+    (#297). Rund drei Viertel der toten US-Stammaktien tragen keine; wer sie
+    verwirft, verwirft genau die Firmen, derentwegen der survivorship-freie
+    Bulk überhaupt benutzt wird. Ob ein Eintrag eine hat, sagt
+    ``identity_source`` — die schwächere Zusage wird markiert, nicht versteckt,
+    dieselbe Disziplin wie bei ``resolve.identity_source`` und
+    ``Adjustment.status``.
+
+    Wer eine ISIN *braucht*, holt die Liste mit ``require_isin=True`` — dann
+    ist ein leeres Feld ausgeschlossen, statt später aufzufallen.
+    """
 
     isin: str
     code: str  # Ticker OHNE Börsensuffix, z.B. "AAPL"
@@ -146,14 +158,47 @@ class Security:
         """Ein abgelöster Code (``BBBY_old``) — dieselbe ISIN, alte Schreibweise."""
         return self.code.endswith(_SUPERSEDED_SUFFIXES)
 
+    @property
+    def identity_source(self) -> str:
+        """``isin`` oder ``code`` — worauf sich die Identität dieses Eintrags stützt.
 
-def fetch_symbol_list(exchange: str = "US", *, delisted: bool = False) -> list[Security]:
+        ``code`` heißt: der Eintrag beantwortet „gab es dieses Kürzel je an
+        dieser Börse?" und sonst nichts. Er taugt als Zugehörigkeitstest, aber
+        nicht als Schlüssel über die Zeit — dafür ist ADR-013 zuständig.
+        """
+        return "isin" if self.isin else "code"
+
+
+def fetch_symbol_list(
+    exchange: str = "US", *, delisted: bool = False, require_isin: bool = True
+) -> list[Security]:
     """Symbolliste einer Börse. ``delisted=True`` liefert **nur** die Toten.
 
     Am 2026-08-10 geprüft: `delisted=1` enthält AAPL nicht, LEH schon — es ist
     also keine Gesamtliste, sondern der Friedhof. Für die USA: 59.190 tote
     gegen 51.650 lebende Einträge. Mehr als die Hälfte aller je gelisteten
     US-Ticker existiert nicht mehr.
+
+    **Zwei Aufrufer, zwei Ansprüche** (#297). ``require_isin`` entscheidet,
+    welcher gilt:
+
+    ``True`` (Vorgabe)
+        Für **Identität**. Ein Eintrag ohne stabilen Schlüssel ist keine
+        Identität, und einer, der sie vortäuscht, ist schlechter als keiner —
+        die Disziplin aus ADR-013. So liest ``build_instrument_map.py``.
+
+    ``False``
+        Für einen **Katalog**, dessen Frage „gab es dieses Kürzel je an dieser
+        Börse?" lautet. Die beantwortet auch ein Eintrag ohne ISIN, und ihn zu
+        verwerfen kostet genau die toten Firmen: LEH, BSC, MOT, KFT fehlen
+        heute im Katalog, obwohl EODHD sie führt. Rund drei Viertel der toten
+        US-Stammaktien haben keine ISIN — der Filter trifft also überwiegend
+        die Seite, um derentwillen der Bulk benutzt wird. Wer so liest, muss
+        ``Security.identity_source`` mitführen, sonst sieht die schwächere
+        Zusage aus wie die starke.
+
+    Die Vorgabe ist die strengere, weil nur einer der beiden Fehler teuer ist —
+    dieselbe Asymmetrie wie beim ``purpose``-Default in ADR-014.
     """
     params: dict[str, Any] = {"fmt": "json"}
     if delisted:
@@ -169,11 +214,12 @@ def fetch_symbol_list(exchange: str = "US", *, delisted: bool = False) -> list[S
         if not code:
             continue
         if not isin:
-            # Warrants, Rechte, manche OTC-Papiere haben keine. Sie fallen raus:
-            # ohne stabilen Schlüssel wären sie genau das Risiko, das dieses
-            # Modul verhindern soll. Die Zahl wird gemeldet, nicht verschwiegen.
+            # Warrants, Rechte, manche OTC-Papiere haben keine — und ein großer
+            # Teil der toten Stammaktien. Ob sie durchkommen, entscheidet der
+            # Aufrufer; gezählt werden sie in jedem Fall.
             ohne_isin += 1
-            continue
+            if require_isin:
+                continue
         out.append(
             Security(
                 isin=isin,
@@ -186,11 +232,12 @@ def fetch_symbol_list(exchange: str = "US", *, delisted: bool = False) -> list[S
             )
         )
     log.info(
-        "EODHD %s (%s): %d Wertpapiere mit ISIN, %d ohne (übersprungen).",
+        "EODHD %s (%s): %d Wertpapiere, davon %d ohne ISIN (%s).",
         exchange,
         "delistet" if delisted else "aktiv",
         len(out),
         ohne_isin,
+        "übersprungen" if require_isin else "mit identity_source='code' geführt",
     )
     return out
 
@@ -202,17 +249,28 @@ class SecurityMaster:
     securities: list[Security]
 
     @classmethod
-    def load(cls, exchange: str = "US") -> SecurityMaster:
-        """Beide Listen holen und zusammenlegen. Zwei Requests."""
+    def load(cls, exchange: str = "US", *, require_isin: bool = True) -> SecurityMaster:
+        """Beide Listen holen und zusammenlegen. Zwei Requests.
+
+        ``require_isin`` wird an ``fetch_symbol_list`` durchgereicht — die
+        Vorgabe bleibt die strenge. Zur Bedeutung siehe dort (#297).
+        """
         return cls(
-            fetch_symbol_list(exchange, delisted=False)
-            + fetch_symbol_list(exchange, delisted=True)
+            fetch_symbol_list(exchange, delisted=False, require_isin=require_isin)
+            + fetch_symbol_list(exchange, delisted=True, require_isin=require_isin)
         )
 
     # -- Nachschlagen ------------------------------------------------------
 
     def by_isin(self, isin: str) -> list[Security]:
-        """Alle Einträge zu einer ISIN — meist einer, bei abgelösten Codes mehrere."""
+        """Alle Einträge zu einer ISIN — meist einer, bei abgelösten Codes mehrere.
+
+        Ein leerer Suchbegriff findet **nichts**, statt alle ISIN-losen
+        Einträge zurückzugeben: „keine ISIN" ist keine ISIN, und ein Treffer
+        auf `""` wäre der Fehlertyp, gegen den ADR-013 gebaut ist.
+        """
+        if not isin:
+            return []
         return [s for s in self.securities if s.isin == isin]
 
     def by_code(self, code: str) -> list[Security]:
@@ -234,7 +292,10 @@ class SecurityMaster:
         treffer = self.by_code(code)
         if not treffer:
             return None
-        isins = {s.isin for s in treffer}
+        # Leere ISINs zählen hier nicht mit: sie sagen „unbekannt", nicht
+        # „ein anderes Papier". Sonst meldete jeder ISIN-lose Eintrag neben
+        # einem belegten eine Mehrdeutigkeit, die es nicht gibt (#297).
+        isins = {s.isin for s in treffer if s.isin}
         if len(isins) > 1:
             log.warning(
                 "Kürzel %r trug %d verschiedene Wertpapiere (%s) — löse auf %s auf.",
@@ -259,6 +320,12 @@ class SecurityMaster:
 
         Abgelöste Schreibweisen desselben Papiers (``BBBY_old``) zählen nicht
         mit — die tragen dieselbe ISIN und sind kein Identitätswechsel.
+
+        **ISIN-lose Einträge zählen ebenfalls nicht mit** (#297). Sie belegen
+        keinen Wechsel, sondern eine Wissenslücke, und als eigener „Wert" im
+        Vergleich hätten sie jeden Code mit einem solchen Eintrag als recycelt
+        gemeldet. Diese Zahl soll ein Befund bleiben, kein Rauschmaß — was der
+        Filter dadurch *nicht* sieht, ist bekannt und in #297 benannt.
         """
         nach_code: dict[str, list[Security]] = defaultdict(list)
         for s in self.securities:
@@ -266,7 +333,7 @@ class SecurityMaster:
         return {
             code: sec
             for code, sec in nach_code.items()
-            if len({s.isin for s in sec}) > 1
+            if len({s.isin for s in sec if s.isin}) > 1
         }
 
     def summary(self) -> dict[str, int]:
@@ -276,7 +343,10 @@ class SecurityMaster:
             "wertpapiere": len(self.securities),
             "aktiv": aktiv,
             "delistet": len(self.securities) - aktiv,
-            "eindeutige_isins": len({s.isin for s in self.securities}),
+            "eindeutige_isins": len({s.isin for s in self.securities if s.isin}),
+            # Die Gegenzahl gehört daneben, nicht in eine Fußnote: ohne sie
+            # liest sich `eindeutige_isins` als Abdeckung des Katalogs.
+            "ohne_isin": sum(1 for s in self.securities if not s.isin),
             "recycelte_kuerzel": len(recycelt),
             "abgeloeste_schreibweisen": sum(1 for s in self.securities if s.superseded),
         }

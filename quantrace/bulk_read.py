@@ -380,11 +380,15 @@ def read_instruments(
 def _apply_actions(
     prices: pd.DataFrame, splits: pd.DataFrame, divs: pd.DataFrame
 ) -> pd.DataFrame:
-    """Baut je Instrument ``divCash``/``splitFactor`` und adjustiert.
+    """Baut je Instrument ``divCash``/``splitFactor`` und adjustiert **die Kurse**.
 
     Die beiden Spaltennamen sind Tiingo-Vokabular — bewusst übernommen, damit
     ``adjust.adjust_ohlcv`` unverändert weiterbenutzt wird. Eine zweite
     Adjustierungs-Implementierung wäre eine zweite Wahrheit.
+
+    **``volume`` bleibt, wie es aus dem Lake kommt** — es steht dort schon auf
+    heutiger Stückzahl und braucht keine Adjustierung mehr (#304). Begründung
+    an der Stelle, wo der Frame gebaut wird.
     """
     # Lazy: `providers.eodhd` zieht auf Modulebene `httpx` herein. Ein
     # Lesepfad, der nur einen Bruch parst, soll keinen HTTP-Client brauchen —
@@ -418,13 +422,26 @@ def _apply_actions(
         # `index` reindiziert pandas übergebene Series auf diesen Index — die
         # Positionen 0..n-1 träfen auf Zeitstempel, und der ganze Frame käme
         # als NaN zurück. Roh-Arrays haben keinen Index, der kollidieren kann.
+        # **`volume` wird `adjust_ohlcv` gar nicht erst gezeigt** (#304). Die
+        # Funktion skaliert es mit dem Split-Faktor, weil sie für Tiingo gebaut
+        # wurde: dort kam `volume` roh herein. Im EODHD-Bulk steht es bereits
+        # auf heutiger Stückzahl — bewiesen am Split-Tag, siehe `dollar_volume`
+        # weiter oben. Ein zweites Skalieren machte daraus `V · S²`: für AAPL
+        # vor 2005 das 784-fache der gehandelten Stücke statt des 28-fachen.
+        #
+        # Weggelassen statt hinterher überschrieben: was hier nicht ankommt,
+        # kann auch niemand versehentlich wieder aus `adj` zurückkopieren.
+        # `adjust_ohlcv` rührt fehlende Spalten nicht an.
+        #
+        # Damit ist das Ergebnis in sich stimmig — `adjusted_close · volume`
+        # ergibt wieder ein echtes Dollarvolumen, weil beide Seiten auf
+        # derselben Stückzahl stehen.
         roh = pd.DataFrame(
             {
                 "open": teil["open"].astype(float).to_numpy(),
                 "high": teil["high"].astype(float).to_numpy(),
                 "low": teil["low"].astype(float).to_numpy(),
                 "close": teil["close"].astype(float).to_numpy(),
-                "volume": teil["volume"].astype(float).to_numpy(),
                 "splitFactor": [split_map.get((code, d), 1.0) for d in teil["date"]],
                 "divCash": [div_map.get((code, d), 0.0) for d in teil["date"]],
             },
@@ -433,7 +450,7 @@ def _apply_actions(
         adj = adjust_ohlcv(roh)
         adj = adj.reset_index(drop=True)
         neu = teil.copy()
-        for col in ("open", "high", "low", "close", "volume"):
+        for col in ("open", "high", "low", "close"):
             if col in adj.columns:
                 neu[col] = adj[col].to_numpy()
         teile.append(neu)

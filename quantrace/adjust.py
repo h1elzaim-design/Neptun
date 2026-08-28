@@ -13,6 +13,14 @@ Methode (Total-Return, CRSP-Stil, ankert an der letzten Zeile = Raw == Adjusted)
     adj_price_i = price_i * cumFactor_i
 
 Volumen wird nur durch Splits skaliert (mehr Aktien), nicht durch Dividenden.
+
+**Vorbedingung für `volume`, seit #304 ausgesprochen:** die Spalte muss *roh*
+hereinkommen, also die am Stichtag tatsächlich gehandelten Stücke. Das galt für
+Tiingo und gilt für den EODHD-Bulk **nicht** — dort steht `volume` bereits auf
+heutiger Stückzahl. Wer eine solche Reihe hierher gibt, bekommt `V · S²`
+zurück. Der Bulk-Lesepfad reicht `volume` deshalb gar nicht erst herein
+(`bulk_read._apply_actions`); diese Funktion bleibt reine Mathematik ohne
+Provider-Wissen.
 """
 
 from __future__ import annotations
