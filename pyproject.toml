@@ -30,6 +30,10 @@ dependencies = [
 [project.optional-dependencies]
 data = ["openbb>=4.3.0"]  # live data fetching via OpenBB; not needed for tests or CI
 ibkr = ["ib_insync>=0.9.86"]
+# The MCP surface: `python -m quantrace.mcp_server` makes the engine steerable
+# by any agent that speaks MCP. An extra, not a base dependency — the library
+# is useful without a server, and nothing else imports the SDK.
+mcp = ["mcp>=2.0"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

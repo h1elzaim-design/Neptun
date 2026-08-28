@@ -210,6 +210,8 @@ def assess(
     start: date | None = None,
     end: date | None = None,
     universe: str | None = None,
+    data_window: tuple[date, date] | None = None,
+    judge_availability: bool = True,
 ) -> Verdict:
     """Ist das mit dem heutigen Stand rechenbar?
 
@@ -221,6 +223,13 @@ def assess(
     ``needs_data=["optionsflow"]`` übergibt, meint etwas, das es nicht gibt;
     das stillschweigend durchzulassen wäre die teuerste Antwort — »machbar«
     für eine Strategie, deren halbe Idee fehlt.
+
+    ``judge_availability=False`` prüft weiterhin, ob ein Schlüssel *existiert*,
+    urteilt aber nicht darüber, ob die Klasse **hier** verfügbar ist. Denn das
+    hängt an diesem Bestand und diesen Zugängen — und für einen fremden
+    Aufrufer ist beides weder eine Eigenschaft seiner Idee noch seine Sache.
+    Zusammen mit ``data_window`` ist das die Fassung, die ohne jede Auskunft
+    über den eigenen Datenbestand auskommt (`docs/MCP_BOUNDARY.md`).
     """
     from quantrace.graph.nodes import CATALOG
 
@@ -235,6 +244,8 @@ def assess(
                 f"Datenklasse `{key}` ist der Plattform unbekannt. "
                 f"Bekannt sind: {', '.join(sorted(bekannt))}."
             )
+        elif not judge_availability:
+            continue  # Existenz geprüft, Verfügbarkeit ist nicht unsere Aussage
         elif not d.available:
             v.missing_data.append(key)
             v.blockers.append(
@@ -251,27 +262,39 @@ def assess(
                 f"{len(CATALOG)} Typen — `catalog_payload()` listet sie."
             )
 
-    # Das Fenster gegen den Lake. Diese Prüfung ist der Grund, warum das Modul
-    # heute überhaupt etwas ablehnt: die Bausteine sind fast immer da, die
-    # Jahre nicht.
-    lake_first, lake_last, _ = _lake_window()
+    # Das Fenster gegen die verfügbaren Daten. Diese Prüfung ist der Grund,
+    # warum das Modul überhaupt etwas ablehnt: die Bausteine sind fast immer
+    # da, die Jahre nicht.
+    #
+    # **Wessen Daten?** Ohne `data_window` die eigenen — der Weg für den
+    # internen Agenten, der auf diesem Lake rechnet. *Mit* `data_window` die
+    # des Aufrufers: er sagt, was er hat, und bekommt ein Urteil darüber,
+    # ohne dass unser Bestand in die Antwort eingeht. Das ist die Fassung für
+    # eine Oberfläche nach außen (`docs/MCP_BOUNDARY.md`), und sie ist nicht
+    # nur eine Sparfassung: für einen fremden Aufrufer ist unser Ladestand
+    # keine Eigenschaft seiner Idee.
+    eigener_bestand = data_window is None
+    if eigener_bestand:
+        fenster_first, fenster_last, _ = _lake_window()
+    else:
+        fenster_first, fenster_last = data_window  # type: ignore[misc]
+
     if start or end:
-        if lake_first is None:
+        if fenster_first is None:
             v.blockers.append(
                 "Kein Kursfenster im Lake — Schicht 2 ist nicht gebaut. "
                 "→ scripts/build_resolved.py --manifest-only"
             )
         else:
-            if start and start < lake_first:
+            quelle = "der Lake" if eigener_bestand else "das angegebene Datenfenster"
+            if start and start < fenster_first:
+                nachsatz = " Der Ladelauf läuft (#265)." if eigener_bestand else ""
                 v.blockers.append(
-                    f"Fenster beginnt {start}, der Lake trägt erst ab {lake_first}. "
-                    f"Fehlend: {(lake_first - start).days} Kalendertage. Der Ladelauf "
-                    "läuft (#265)."
+                    f"Fenster beginnt {start}, {quelle} trägt erst ab {fenster_first}. "
+                    f"Fehlend: {(fenster_first - start).days} Kalendertage.{nachsatz}"
                 )
-            if end and end > lake_last:
-                v.blockers.append(
-                    f"Fenster endet {end}, der Lake reicht bis {lake_last}."
-                )
+            if end and fenster_last and end > fenster_last:
+                v.blockers.append(f"Fenster endet {end}, {quelle} reicht bis {fenster_last}.")
 
     if universe:
         pfad = UNIVERSES_DIR / f"{universe}.yaml"
@@ -302,12 +325,19 @@ def assess(
     return v
 
 
-def capabilities() -> dict[str, Any]:
+def capabilities(*, include_lake: bool = True) -> dict[str, Any]:
     """Der volle Fähigkeitsbericht — Kontext für das LLM, Anzeige für die UI.
 
     Das ist bewusst *eine* Funktion und nicht drei Endpunkte: das LLM soll den
     Stand in einem Stück bekommen. Wer ihn in Häppchen holt, baut ein Modell,
     das die Hälfte kennt und über die andere rät.
+
+    ``include_lake=False`` lässt den Block über den eigenen Datenbestand weg.
+    Er nennt zwar keine Kurse, aber Abdeckung und Instrumentenzahl sind eine
+    Auskunft über *unseren* Bestand — und die hat auf einer Oberfläche nach
+    außen nichts verloren (`docs/MCP_BOUNDARY.md`). Was übrig bleibt, kommt
+    ausschließlich aus Code und Konfiguration: Knoten, Datenklassen,
+    Universen.
     """
     from quantrace.graph.nodes import CATALOG
 
@@ -315,29 +345,40 @@ def capabilities() -> dict[str, Any]:
     for typ in CATALOG:
         familien.setdefault(typ.split(".")[0], []).append(typ)
 
-    first, last, n = _lake_window()
-    return {
+    bericht: dict[str, Any] = {
         "nodes": {k: sorted(v) for k, v in sorted(familien.items())},
         "n_nodes": len(CATALOG),
+        # Ohne den Lake-Block auch keine Verfügbarkeits-Auskunft: `available`,
+        # `reason`, `since` und `until` beschreiben **diese** Installation —
+        # wie viele Instrumente geladen sind, welche Schlüssel gesetzt sind,
+        # was das Abo hergibt. Der Katalog der Klassen ist dagegen eine
+        # Eigenschaft der Engine und darf raus.
         "data": [
-            {
-                "key": d.key,
-                "label": d.label,
-                "available": d.available,
-                "reason": d.reason,
-                "since": d.since.isoformat() if d.since else None,
-                "until": d.until.isoformat() if d.until else None,
-                "issue": d.issue,
-            }
+            (
+                {
+                    "key": d.key,
+                    "label": d.label,
+                    "available": d.available,
+                    "reason": d.reason,
+                    "since": d.since.isoformat() if d.since else None,
+                    "until": d.until.isoformat() if d.until else None,
+                    "issue": d.issue,
+                }
+                if include_lake
+                else {"key": d.key, "label": d.label}
+            )
             for d in data_kinds()
         ],
-        "lake": {
+        "universes": sorted(p.stem for p in UNIVERSES_DIR.glob("*.yaml")),
+    }
+    if include_lake:
+        first, last, n = _lake_window()
+        bericht["lake"] = {
             "first": first.isoformat() if first else None,
             "last": last.isoformat() if last else None,
             "n_instruments": n,
-        },
-        "universes": sorted(p.stem for p in UNIVERSES_DIR.glob("*.yaml")),
-    }
+        }
+    return bericht
 
 
 __all__ = ["DataKind", "Verdict", "assess", "capabilities", "data_kinds"]

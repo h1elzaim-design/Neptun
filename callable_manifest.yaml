@@ -1,0 +1,89 @@
+# callable_manifest.yaml — die zweite Grenze: was darf **aufgerufen** werden.
+#
+# Schwesterdatei zu `public_manifest.yaml`. Die eine entscheidet, welche Dateien
+# den privaten Tresor verlassen dürfen; diese hier entscheidet, welche
+# Operationen ein fremder Agent über den MCP-Server auslösen darf. Keins der
+# beiden impliziert das andere — die Begründung steht in `docs/MCP_BOUNDARY.md`.
+#
+# Durchsetzung: `quantrace/mcp_server/tools.py` liest **nur** diese Liste. Was
+# hier nicht steht, kennt der Dispatcher nicht — nicht weil ein Prompt es
+# verbietet, sondern weil der Name nicht existiert. Dieselbe Bauform wie
+# `agents/agent_mode/tools.py` für den internen Agenten (ADR-011).
+#
+# Wer hier etwas hinzufügt, beantwortet vorher **eine** Frage:
+#
+#     Was rekonstruiert ein Aufrufer, der dieses Tool tausendmal aufruft?
+#
+# Das ist die Frage, die der Content-Scan im Export NICHT stellt. Er prüft
+# Bytes; ein Orakel verrät sich durch Befragung, nicht durch Inhalt.
+
+meta:
+  surface: "Neptun MCP"
+  stage: "v1 — Machbarkeit und Katalog"
+  # Warum genau diese vier: sie beantworten „kann Neptun das?", bevor jemand
+  # rechnen lässt. Sie geben ausschließlich preis, was ohnehin im öffentlichen
+  # Repo steht — plus die Lake-Fenster, und das ist ein Wettbewerbsfakt, kein
+  # Alpha. Es ist die einzige Gruppe ohne offene Vorfrage: keine Lizenzfrage,
+  # kein Orakel, kein Mandantenmodell nötig.
+  boundary_doc: "docs/MCP_BOUNDARY.md"
+
+# ---------------------------------------------------------------------------
+# ERLAUBT — nur diese Namen existieren für den Server.
+# ---------------------------------------------------------------------------
+callable:
+  - name: platform_capabilities
+    # Knotenkatalog, Datenklassen, Lake-Fenster, Universen. Das Größte der vier;
+    # der Katalog hat heute 61 Knoten.
+    max_bytes: 262144
+
+  - name: assess_feasibility
+    # Urteil plus blockers/caveats. Klein und beschränkt.
+    max_bytes: 65536
+
+  - name: list_graph_nodes
+    max_bytes: 262144
+
+  - name: validate_graph_strategy
+    # Die Fehlerliste eines kaputten Graphen kann lang werden.
+    max_bytes: 65536
+
+# ---------------------------------------------------------------------------
+# NIEMALS — Dokumentation *und* Testgegenstand.
+#
+# Die Liste ist nicht „noch nicht dran", sondern „nicht auf dieser Oberfläche".
+# Was hier steht, gehört in die interne Registry, wo der Agent im Namen des
+# Betreibers handelt, dem der Vault gehört.
+# ---------------------------------------------------------------------------
+denied:
+  # Klasse ① — direkte Preisgabe. `Trading Research/` ist das Gehirn des
+  # Labors (OPEN_SOURCE_BOUNDARY.md §3). Ein externer Aufruf liest darin.
+  - list_backtests
+  - get_backtest
+  - list_strategy_specs
+  - get_strategy_spec
+  - list_hypotheses
+  - list_evaluations
+  - read_vault_note
+  - list_workspaces
+  - get_current_regime        # liest die Vault-Note, nicht zu verwechseln mit
+                              # detect_regime, das rechnet
+
+  # Klasse ③ — Weiterverbreitung von Anbieterdaten. Offen, bis die
+  # EODHD-Bedingungen geprüft sind; bis dahin gilt die strengere Lesart.
+  - get_candles
+  - search_instruments
+  - get_instrument
+  - get_instruments
+
+  # Schreibend unter fremder Identität. Braucht einen Mandantenbegriff, den es
+  # nicht gibt — sie schrieben sonst in *unseren* Vault.
+  - create_hypothesis
+  - generate_spec
+  - generate_graph_strategy
+  - write_workspace_iteration
+  - start_backtest            # rechnet zusätzlich auf unserer Hardware
+
+  # Klasse ② — Orakel. Heute nimmt es einen Slug aus dem Vault, ist also noch
+  # keins; mit dem ersten Mandanten wird es eines. Freischalten nur zusammen
+  # mit der Abschwächung: Verdikt plus bindende Dimension, nie der Vektor.
+  - run_evaluation
