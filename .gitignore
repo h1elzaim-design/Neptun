@@ -17,6 +17,14 @@ venv/
 env/
 .env
 .env.local
+# `env/` oben passt nur auf Verzeichnisse. Eine *Datei* namens `env` — wie sie
+# ein `docker run --env-file env` hinterlässt — war damit nicht erfasst und
+# stand als untracked im Baum: ein `git add -A` hätte Klartext-Zugangsdaten
+# committet. Genau so lag `quantrace/env` hier (nie committet, aber ungeschützt).
+env
+**/env
+.env.*
+!.env.example
 
 # Notebooks
 .ipynb_checkpoints/
