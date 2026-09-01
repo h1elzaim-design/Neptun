@@ -33,6 +33,34 @@ CORP_COLUMNS = ["divCash", "splitFactor"]
 ALL_RAW_COLUMNS = RAW_COLUMNS + CORP_COLUMNS
 
 
+class UnadjustableActionError(ValueError):
+    """Ein Aktionseintrag ergibt keinen positiven Preisfaktor.
+
+    Praktisch heisst das: die gemeldete Dividende ist grösser als der
+    Vortagsschluss. ``1 - div/prev_close`` wird dann negativ, und das Produkt
+    kippt **alle** früheren Kurse ins Minus.
+
+    Das ist kein extremes, aber gültiges Ereignis, sondern ein defekter
+    Eintrag. Nachgemessen am 2026-09-01 an ``WY``: EODHD führt zum 2010-07-20
+    eine „Dividende" von 26,42 $ auf ein 16-Dollar-Papier — die REIT-Umwandlung
+    von Weyerhaeuser, historisch überwiegend **in Aktien** geleistet. Der Kurs
+    fiel an diesem Tag von 16,52 auf 15,94, also gar nicht; auch EODHDs eigener
+    ``adjusted_close`` läuft glatt weiter. Die Formel korrigiert hier für einen
+    Kurssturz, den es nie gab.
+
+    Deshalb wird geworfen statt gerechnet: eine Reihe mit negativen Kursen ist
+    schlimmer als keine. Renditen kehren das Vorzeichen um, Positionsgrössen
+    aus ``capital / price`` werden negativ, und jede Kennzahl darüber ist
+    bedeutungslos statt bloss ungenau — ohne dass irgendwo etwas rot wird.
+    """
+
+    def __init__(self, message: str, *, tage: list = ()) -> None:
+        super().__init__(message)
+        #: Die verantwortlichen Tage — damit der Aufrufer sie nennen kann,
+        #: statt nur „irgendwo in dieser Reihe".
+        self.tage = list(tage)
+
+
 def _reverse_cumprod_exclusive(series: pd.Series) -> pd.Series:
     """Für jede Position i: Produkt aller Werte mit Index > i (self exklusiv).
 
@@ -67,6 +95,25 @@ def adjust_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     # Dividenden-Faktor der Aktion an Tag t (wirkt auf Tage < t). Erste Zeile hat
     # keinen Vortagsschluss → kein Faktor (1.0).
     div_factor = (1.0 - div / prev_close).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    # **Ein nicht-positiver Faktor ist ein Datenfehler, kein Extremfall.**
+    # Siehe `UnadjustableActionError`: eine Dividende über dem Vortagsschluss
+    # kippt jede frühere Zeile ins Negative. Lieber keine Reihe als eine mit
+    # negativen Kursen.
+    schlecht = div_factor <= 0.0
+    if bool(schlecht.any()):
+        tage = list(df.index[schlecht])
+        beispiel = tage[0]
+        raise UnadjustableActionError(
+            f"Aktionseintrag am {getattr(beispiel, 'date', lambda: beispiel)()}: "
+            f"Dividende {float(div[schlecht].iloc[0]):.4f} bei Vortagsschluss "
+            f"{float(prev_close[schlecht].iloc[0]):.4f} ergibt den Preisfaktor "
+            f"{float(div_factor[schlecht].iloc[0]):.4f}. Eine Dividende über dem "
+            f"Vortagsschluss ist keine Bardividende — die Reihe wäre ab hier "
+            f"rückwärts negativ. ({len(tage)} betroffene(r) Tag(e))",
+            tage=tage,
+        )
+
     day_ratio = (1.0 / split) * div_factor
 
     price_factor = _reverse_cumprod_exclusive(day_ratio)

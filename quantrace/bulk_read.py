@@ -46,7 +46,7 @@ from datetime import date
 import pandas as pd
 
 from quantrace import storage
-from quantrace.adjust import adjust_ohlcv
+from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
@@ -414,6 +414,7 @@ def _apply_actions(
             div_map[(str(row.code), tag)] = float(betrag)
 
     teile: list[pd.DataFrame] = []
+    unadjustierbar: list[str] = []
     for _instrument, teil in prices.groupby("instrument", sort=True):
         teil = teil.sort_values("date").reset_index(drop=True)
         code = str(teil["code"].iloc[0])
@@ -447,7 +448,18 @@ def _apply_actions(
             },
             index=idx,
         )
-        adj = adjust_ohlcv(roh)
+        try:
+            adj = adjust_ohlcv(roh)
+        except UnadjustableActionError as exc:
+            # **Ein defekter Aktionseintrag darf nicht das ganze Universum
+            # kippen** — dasselbe Muster wie bei mehrdeutigen Kürzeln (#311).
+            # Das Instrument fällt heraus und wird benannt; wer es braucht,
+            # sieht warum. Verworfen wird die *Reihe*, nicht bloss die Aktion:
+            # eine halb adjustierte Reihe wäre wieder etwas, das aussieht wie
+            # ein Total Return und keiner ist.
+            log.warning("%s: nicht adjustierbar, fällt heraus — %s", code, exc)
+            unadjustierbar.append(code)
+            continue
         adj = adj.reset_index(drop=True)
         neu = teil.copy()
         for col in ("open", "high", "low", "close"):
@@ -455,7 +467,13 @@ def _apply_actions(
                 neu[col] = adj[col].to_numpy()
         teile.append(neu)
 
-    return pd.concat(teile, ignore_index=True) if teile else prices
+    if unadjustierbar:
+        log.warning(
+            "%d Instrument(e) ohne adjustierbare Reihe: %s",
+            len(unadjustierbar),
+            ", ".join(sorted(unadjustierbar)[:10]),
+        )
+    return pd.concat(teile, ignore_index=True) if teile else prices.iloc[0:0]
 
 
 __all__ = ["Adjustment", "read_instruments"]

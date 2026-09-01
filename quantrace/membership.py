@@ -62,6 +62,7 @@ Stelle, an der der Unterschied zählt.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Any
@@ -258,6 +259,28 @@ class Membership:
             mitglied = np.asarray([n in p.symbols for n in normiert])
             erlaubt |= m[:, None] & mitglied[None, :]
         return frame.where(pd.DataFrame(erlaubt, index=frame.index, columns=frame.columns))
+
+    def mit_symbolen(self, je_periode: Sequence[Sequence[str]]) -> Membership:
+        """Dieselben Perioden, andere Symbolnamen (#311).
+
+        Gebraucht, sobald ein Kürzel über die Perioden hinweg auf verschiedene
+        Papiere zeigt: ``resolve.resolve_membership`` macht daraus ``ACL__S1``
+        und ``ACL__S2``, und die Mitgliedschaft muss dieselben Namen benutzen —
+        sonst maskiert sie Spalten, die es nicht mehr gibt, und der Korb wäre
+        an jedem Tag leer.
+
+        Die Zeitgrenzen bleiben unangetastet; nur die Namen ändern sich.
+        """
+        if len(je_periode) != len(self.periods):
+            raise MembershipError(
+                f"{len(je_periode)} Symbollisten für {len(self.periods)} Perioden — "
+                "die Umbenennung muss Periode für Periode passen."
+            )
+        neu = tuple(
+            MembershipPeriod(start=p.start, end=p.end, symbols=frozenset(_norm(s) for s in syms))
+            for p, syms in zip(self.periods, je_periode, strict=True)
+        )
+        return Membership(periods=neu, frequency=self.frequency)
 
     def apply(self, md: MarketData) -> MarketData:
         """``MarketData`` auf die Mitgliedschaft beschneiden.

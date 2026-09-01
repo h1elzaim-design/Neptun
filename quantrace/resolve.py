@@ -56,7 +56,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -806,6 +806,23 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
 
     glob = _prices_glob()
     ziel = storage.cache_path(RESOLVED_PREFIX)
+
+    # **Erst räumen, dann schreiben.** DuckDBs ``OVERWRITE_OR_IGNORE`` lässt
+    # Dateien stehen, die dieser Lauf nicht selbst schreibt: legte ein früherer
+    # Lauf zwei Dateien in eine Partition und dieser nur eine, bleibt die
+    # zweite liegen. Am 2026-09-01 trug ``code.BP.US.s1`` deshalb
+    # ``data_0.parquet`` (6.109 Zeilen, 1996–2020) **und** ``data_1.parquet``
+    # (3.818 Zeilen, 2005–2020) nebeneinander — genau 3.818 doppelte
+    # Zeitstempel, und daran ist der Load des ersten rekonstituierten
+    # Universums gescheitert. Dieselbe Ursache erklärt die ``high < low``-Bars:
+    # High aus der einen Datei, Low aus der anderen.
+    #
+    # ``OVERWRITE`` wäre der naheliegende Schalter und ist die falsche Wahl:
+    # gemessen räumt es den **ganzen** Zielbaum, nicht nur die geschriebenen
+    # Partitionen. Mit ``only=[…]`` würde aus dem Bugfix ein Datenverlust.
+    for schluessel in sorted({str(r["instrument"]) for r in rows}):
+        storage.delete_tree(storage.cache_path(f"{RESOLVED_PREFIX}/instrument={schluessel}"))
+
     con = storage._duckdb_conn()
     try:
         con.register("identitaet", karte)
@@ -837,13 +854,180 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
     return len(materialised_keys() & {r["instrument"] for r in rows})
 
 
+@dataclass(frozen=True)
+class MembershipResolution:
+    """Wie die Ticker eines rekonstituierten Universums auf Papiere zeigen.
+
+    ``perioden_symbole`` ist die umgeschriebene Mitgliedschaft: je Periode die
+    **Anzeigenamen** statt der rohen Ticker. Nur dort weicht es ab, wo ein
+    Ticker über die Perioden hinweg auf verschiedene Papiere zeigt.
+    """
+
+    #: Anzeigename → Instrument-Schlüssel. Der Anzeigename ist der Ticker,
+    #: solange er eindeutig ist.
+    zuordnung: dict[str, str]
+    #: Ticker → seine Anzeigenamen, **nur** bei Spaltung. Der Beleg dafür, dass
+    #: eine Spalte nicht die ganze Geschichte des Kürzels ist.
+    epochen: dict[str, list[str]]
+    #: Je Periode die Anzeigenamen — die Mitgliedschaft, umgeschrieben.
+    perioden_symbole: list[list[str]]
+    #: Ticker ohne jede Zeile im Fenster ihrer Mitgliedschaft.
+    fehlend: list[str]
+    #: Ticker, die **innerhalb einer Periode** mehrdeutig blieben. Sie fehlen
+    #: in dieser Periode, statt den ganzen Lauf abzubrechen.
+    mehrdeutig: dict[str, list[date]]
+
+
+def _epochen_name(code: str, n: int) -> str:
+    """``ACL`` → ``ACL__S1``/``ACL__S2``, sobald das Kürzel gespalten wird.
+
+    **Beide** Epochen bekommen ein Suffix, nicht nur die zweite. Bliebe die
+    erste ``ACL``, sähe sie aus wie „die" Reihe des Kürzels — und genau das ist
+    sie dann nicht mehr. Nur Grossbuchstaben, Ziffern und Unterstrich, damit
+    der Name überall durchgeht, wo ein Ticker durchgeht.
+    """
+    return f"{code}__S{n}"
+
+
+def resolve_membership(
+    perioden: Sequence[tuple[date, date, Sequence[str]]],
+    *,
+    manifest: pd.DataFrame | None = None,
+    min_segment_bars: int = DEFAULT_MIN_SEGMENT_BARS,
+) -> MembershipResolution:
+    """Ticker → Papiere, **je Mitgliedschaftsperiode** statt über alles.
+
+    **Warum das nötig ist.** ``resolve_symbols`` löst über *ein* Fenster auf
+    und bricht ab, sobald ein Kürzel darin den Besitzer gewechselt hat. Für ein
+    survivorship-freies Universum über zwanzig Jahre ist das keine Ausnahme:
+    am 2026-09-01 trugen 75 der 1.934 Ticker in ``us_top500_liquid`` mehr als
+    ein Segment, und ein einziger davon (``ACL`` — Alcon bis 2011, danach ein
+    fremdes Papier) brach den gesamten Load ab.
+
+    Das Universum weiss aber, **wann** ein Ticker Mitglied war. Innerhalb einer
+    Halbjahresperiode ist ``ACL`` eindeutig. Aufgelöst wird deshalb je Periode.
+
+    **Gespalten wird im Zweifel.** Zeigt ein Ticker über die Perioden hinweg
+    auf verschiedene Papiere, werden daraus getrennte Spalten. Die Alternative
+    — verketten — erzeugte am Übergang eine Rendite zwischen zwei fremden
+    Firmen, und die sieht hinterher niemand mehr. Der Preis der Vorsicht ist
+    eine unnötig geteilte Position, falls es doch dieselbe Firma war (eine
+    Segmentgrenze kann auch aus einer Lücke im Lake stammen); dieser Fehler
+    ist sichtbar, der andere nicht.
+
+    Von 1.934 Tickern traf das am 2026-09-01 sechs.
+    """
+    man = read_manifest() if manifest is None else manifest
+
+    # **Einmal auf die Kürzel des Universums eindampfen.** `resolve_symbols`
+    # filtert je Aufruf das ganze Manifest; bei 42 Stichtagen gegen 87.249
+    # Zeilen waren das am 2026-09-01 fünf Minuten. Die Union der Mitglieder
+    # sind rund 2.000 Zeilen — dieselbe Antwort, ein Vierzigstel der Arbeit.
+    if not man.empty:
+        alle_codes = {
+            str(s).strip().upper()
+            for _, _, symbole in perioden
+            for s in symbole
+            if str(s).strip()
+        }
+        man = man[man["code"].astype(str).str.upper().isin(alle_codes)]
+
+    zuordnung: dict[str, str] = {}
+    perioden_symbole: list[dict[str, str]] = []
+    je_code: dict[str, list[str]] = {}
+    fehlend: set[str] = set()
+    mehrdeutig: dict[str, list[date]] = {}
+
+    for von, bis, symbole in perioden:
+        codes = [str(s).strip().upper() for s in symbole if str(s).strip()]
+        try:
+            aufgeloest, fehlt = resolve_symbols(
+                codes, von, bis, manifest=man, min_segment_bars=min_segment_bars
+            )
+        except AmbiguousCodeError as exc:
+            # **Nur das schuldige Kürzel entfernen, dann den Stapel wiederholen.**
+            # Ein mehrdeutiges Symbol darf nicht den ganzen Stichtag kippen —
+            # die anderen 499 sind in Ordnung. Alle einzeln aufzulösen wäre der
+            # naheliegende Weg und kostete am 2026-09-01 das Fünffache der
+            # Laufzeit; der Fehler nennt den Schuldigen, also reicht ein
+            # Durchlauf je Fund.
+            rest = list(codes)
+            aufgeloest, fehlt = {}, []
+            while True:
+                schuldig = exc.code or ""
+                if not schuldig or schuldig not in rest:  # pragma: no cover - Notausgang
+                    mehrdeutig.setdefault(schuldig or "?", []).append(von)
+                    break
+                mehrdeutig.setdefault(schuldig, []).append(von)
+                rest.remove(schuldig)
+                try:
+                    aufgeloest, fehlt = resolve_symbols(
+                        rest, von, bis, manifest=man, min_segment_bars=min_segment_bars
+                    )
+                    break
+                except AmbiguousCodeError as weiterer:
+                    exc = weiterer
+        fehlend.update(fehlt)
+
+        for code, instrument in aufgeloest.items():
+            liste = je_code.setdefault(code, [])
+            if instrument not in liste:
+                liste.append(instrument)
+        # **Die Zuordnung dieser Periode behalten.** Sie ein zweites Mal zu
+        # rechnen, um die Mitgliedschaft umzuschreiben, kostete am 2026-09-01
+        # 21.000 zusätzliche Manifest-Scans und elf Minuten für ein Universum,
+        # dessen erste Runde Sekunden braucht.
+        perioden_symbole.append(dict(aufgeloest))
+
+    # Anzeigenamen vergeben — Suffix nur, wo ein Kürzel wirklich gespalten ist.
+    epochen: dict[str, list[str]] = {}
+    instrument_name: dict[str, str] = {}
+    for code, instrumente in je_code.items():
+        if len(instrumente) == 1:
+            zuordnung[code] = instrumente[0]
+            instrument_name[instrumente[0]] = code
+            continue
+        namen = []
+        for i, instrument in enumerate(instrumente, start=1):
+            name = _epochen_name(code, i)
+            zuordnung[name] = instrument
+            instrument_name[instrument] = name
+            namen.append(name)
+        epochen[code] = namen
+
+    # Die Mitgliedschaft auf die Anzeigenamen umschreiben — aus der Zuordnung,
+    # die oben schon feststand.
+    umgeschrieben = [
+        sorted(instrument_name[instrument] for instrument in zuordnung_der_periode.values())
+        for zuordnung_der_periode in perioden_symbole
+    ]
+
+    return MembershipResolution(
+        zuordnung=zuordnung,
+        epochen=epochen,
+        perioden_symbole=umgeschrieben,
+        fehlend=sorted(fehlend),
+        mehrdeutig=mehrdeutig,
+    )
+
+
 class AmbiguousCodeError(ValueError):
     """Ein Code gehörte im angefragten Fenster mehr als einem Papier.
 
     Das ist der BBBY-Fall in seiner teuersten Form: die Anfrage überspannt den
     Besitzerwechsel. Es gibt keine richtige Antwort — eines der beiden Papiere
     zu wählen erfindet Historie, beide zu verketten auch.
+
+    ``code`` nennt das schuldige Kürzel **maschinenlesbar**. Ohne das bleibt
+    einem Aufrufer, der weitermachen will, nur die Meldung zu parsen oder alle
+    Symbole einzeln nachzufassen — Letzteres kostete `resolve_membership` am
+    2026-09-01 fünf Minuten für ein Universum, dessen Auflösung Sekunden
+    braucht.
     """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def resolve_symbols(
@@ -922,7 +1106,8 @@ def resolve_symbols(
             raise AmbiguousCodeError(
                 f"{code} gehörte zwischen {start} und {end} mehr als einem Papier: {teile}. "
                 "Fenster teilen oder den Instrument-Schlüssel direkt angeben — "
-                "eine automatische Wahl würde Historie erfinden."
+                "eine automatische Wahl würde Historie erfinden.",
+                code=code,
             )
         aufgeloest[code] = str(passend.iloc[0]["instrument"])
     return aufgeloest, fehlend

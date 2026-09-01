@@ -25,7 +25,7 @@ Storage entscheidet lokal vs. R2 allein über Env (QUANTRACE_DATA_LAKE).
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -85,7 +85,9 @@ def load_universe(
     explizit = provider is not None
     provider = provider or default_provider()
     if provider == "eodhd":
-        md = _load_via_bulk(universe, symbols, start, end, timeframe, adjusted, calendar)
+        md, membership = _load_via_bulk(
+            universe, symbols, start, end, timeframe, adjusted, calendar, membership
+        )
     elif provider == "tiingo":
         # Eigener Zweig statt „unbekannter Provider": `tiingo` ist kein
         # Tippfehler, sondern ein Rest von vor dem 2026-08-13.
@@ -142,7 +144,8 @@ def _load_via_bulk(
     timeframe: Timeframe,
     adjusted: bool,
     calendar: str | None = None,
-) -> MarketData:
+    membership: Membership | None = None,
+) -> tuple[MarketData, Membership | None]:
     """Universum aus dem EODHD-Bulk laden — über Schicht 2, nicht über Ticker.
 
     Der Unterschied zum Tiingo-Pfad ist nicht die Quelle, sondern die
@@ -162,7 +165,42 @@ def _load_via_bulk(
     if timeframe is not Timeframe.DAILY:
         raise ValueError("Der Bulk-Lake führt ausschließlich Tagesdaten.")
 
-    aufgeloest, fehlend = resolve.resolve_symbols(symbols, start, end)
+    if membership is not None:
+        # **Je Mitgliedschaftsperiode auflösen, nicht über das ganze Fenster.**
+        # Über zwanzig Jahre hat ein survivorship-freies Universum mit
+        # Sicherheit recycelte Kürzel: am 2026-09-01 trugen 75 der 1.934 Ticker
+        # in `us_top500_liquid` mehr als ein Segment, und ein einziges davon
+        # (ACL — Alcon bis 2011, danach ein fremdes Papier) brach den gesamten
+        # Load ab. Das Universum weiss aber, *wann* ein Ticker Mitglied war,
+        # und innerhalb einer Periode ist er eindeutig.
+        aufloesung = resolve.resolve_membership(
+            [
+                (p.start, (p.end - timedelta(days=1)) if p.end else end, sorted(p.symbols))
+                for p in membership.periods
+            ]
+        )
+        aufgeloest = aufloesung.zuordnung
+        fehlend = aufloesung.fehlend
+        membership = membership.mit_symbolen(aufloesung.perioden_symbole)
+        if aufloesung.epochen:
+            # Kein Fehler, aber eine Aussage über die Daten: unter diesem
+            # Kürzel handelten verschiedene Papiere, und sie bleiben getrennt.
+            log.warning(
+                "%s: %d Kürzel zeigen über die Perioden auf verschiedene Papiere und "
+                "werden getrennt geführt: %s",
+                universe,
+                len(aufloesung.epochen),
+                ", ".join(f"{k} → {'/'.join(v)}" for k, v in list(aufloesung.epochen.items())[:5]),
+            )
+        if aufloesung.mehrdeutig:
+            log.warning(
+                "%s: %d Kürzel blieben innerhalb ihrer Periode mehrdeutig und fehlen dort: %s",
+                universe,
+                len(aufloesung.mehrdeutig),
+                ", ".join(sorted(aufloesung.mehrdeutig)[:5]),
+            )
+    else:
+        aufgeloest, fehlend = resolve.resolve_symbols(symbols, start, end)
     if not aufgeloest:
         raise RuntimeError(
             f"Kein Symbol aus {universe} ist im Bulk-Lake für {start}..{end} aufgelöst. "
@@ -215,7 +253,7 @@ def _load_via_bulk(
     combined.columns.names = ["symbol", "field"]
     combined = combined.sort_index().dropna(how="all")
 
-    return MarketData(
+    md = MarketData(
         universe=universe,
         symbols=sorted(per_out),
         # Bis hierher stand die Lücke nur im Log (`log.warning` oben). Von dort
@@ -230,6 +268,9 @@ def _load_via_bulk(
         calendar=calendar or DEFAULT_CALENDAR,
         frame=combined,
     )
+    # Die Mitgliedschaft kommt mit zurück: sie kann oben auf Anzeigenamen
+    # umgeschrieben worden sein, und der Aufrufer maskiert damit.
+    return md, membership
 
 
 # ---------------------------------------------------------------------------
