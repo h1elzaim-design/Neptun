@@ -81,6 +81,12 @@ RESOLVED_PREFIX = "us_equities_resolved"
 #: Die Instrumenten-Übersicht der Schicht. Eine Datei, damit Coverage und
 #: Auswahl **einen** Read kosten und nicht einen pro Instrument.
 MANIFEST_PATH = f"{RESOLVED_PREFIX}/_manifest.parquet"
+#: Die Handelstage des Lakes — Tage, an denen **mindestens ein** Code eine
+#: Kurszeile hat. Nicht dasselbe wie die Partitionsliste: ein leeres Parquet
+#: ist eine Partition ohne Handelstag, und der Loader schreibt solche bewusst.
+#: Gebraucht wird das für die Lückenmessung, die in *Lake*-Handelstagen zählt
+#: und nicht in Kalendertagen (#313).
+LAKE_DAYS_PATH = f"{RESOLVED_PREFIX}/_lake_days.parquet"
 
 #: Ab wann eine Lücke als Besitzerwechsel gilt — in **Lake-Handelstagen**,
 #: nicht in Kalendertagen.
@@ -539,6 +545,191 @@ def _isin_candidate(code: str) -> str | None:
     return isin if isin_checksum_ok(isin) else None
 
 
+def segments_incremental(
+    vorhandene: Sequence[Segment],
+    *,
+    gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS,
+) -> tuple[list[Segment], list[date]]:
+    """Segmente fortschreiben, statt den ganzen Lake neu zu lesen (#313).
+
+    **Warum das geht.** Die Tagesnummerierung läuft aufsteigend nach Datum.
+    Kommen hinten Tage dazu, ändert sich für alle älteren nichts: die Nummern
+    bleiben, die Lücken bleiben, die Schnitte bleiben. Nur zwei Fälle:
+
+    * Ein Code taucht in den neuen Tagen auf → sein letztes Segment wächst,
+      oder es beginnt ein neues, falls die Lücke die Schwelle überschritten hat.
+    * Ein Code taucht nicht auf → unverändert. Eine Lücke wird erst dann zum
+      Schnitt, wenn der Code **wieder** erscheint; tut er das nie, endet sein
+      Segment ohnehin dort.
+
+    **Was hier NICHT passiert, und das ist der Grund, warum es sicher ist.**
+    ``min_segment_bars`` und die Frage, ob ein Segment „bis an die Front reicht",
+    wirken randabhängig — sie ändern ihre Antwort, wenn die Front weiterwandert.
+    Beide sitzen aber in ``build_identity_map``, und die läuft über die
+    **vollständige** Segmentliste, also auch inkrementell über alles. Sie
+    bewertet jedes Mal neu. Fortgeschrieben wird nur die Segmentierung.
+
+    **Die Bezugsgröße der Lücken sind Lake-Handelstage**, nicht Kalendertage und
+    nicht Partitionen: ein leeres Parquet ist eine Partition ohne Handelstag.
+    Deshalb wird die Tagesliste mitgeführt (`write_lake_days`) statt aus dem
+    Verzeichnis abgeleitet — sonst misst der inkrementelle Lauf andere Lücken
+    als der Vollscan, und die Karten liefen auseinander.
+
+    Returns
+    -------
+    (segmente, alle_handelstage)
+        Beides gehört zusammen geschrieben: die Tagesliste ist der Zustand, den
+        der nächste inkrementelle Lauf braucht.
+    """
+    alte_tage = read_lake_days()
+    if alte_tage is None:
+        # Einmalig nachholen. Kostet einen Durchlauf über **eine** Spalte —
+        # spürbar, aber ein Bruchteil der Segmentierung, und nur beim ersten Mal.
+        log.info("Keine Handelstagsliste im Lake — wird einmalig erhoben.")
+        alte_tage = lake_trading_days()
+        if not alte_tage:
+            return list(vorhandene), []
+
+    stand = max(alte_tage)
+
+    # **Selbstheilung gegen auseinandergelaufenen Zustand.** Tagesliste und
+    # Karte gehören zusammen geschrieben. Ist die Liste älter als die Karte —
+    # etwa nach einem Vollscan, der sie nicht mitgeschrieben hat —, würden die
+    # Tage dazwischen ein zweites Mal gezählt und `n_bars` liefe hoch. Lieber
+    # einmal teuer neu erheben als still falsch fortschreiben.
+    karten_stand = max((s.last for s in vorhandene), default=None)
+    if karten_stand is not None and karten_stand > stand:
+        log.warning(
+            "Handelstagsliste (%s) ist älter als die Karte (%s) — wird neu erhoben.",
+            stand,
+            karten_stand,
+        )
+        alte_tage = lake_trading_days()
+        if not alte_tage:
+            return list(vorhandene), []
+        stand = max(alte_tage)
+
+    offen = [t for t in storage.list_day_partitions(US_EQUITY_PREFIX) if t > stand]
+    if not offen:
+        return list(vorhandene), alte_tage
+
+    pfade = [
+        storage.cache_path(f"{US_EQUITY_PREFIX}/date={t.isoformat()}/data.parquet")
+        for t in offen
+    ]
+    con = storage._duckdb_conn()
+    try:
+        platzhalter = ",".join(["?"] * len(pfade))
+        neu_df = con.execute(
+            f"""
+            SELECT code,
+                   COALESCE(NULLIF(TRIM(exchange_short_name), ''), 'US') AS exchange,
+                   date
+            FROM read_parquet([{platzhalter}], union_by_name=true, hive_partitioning=true)
+            WHERE code IS NOT NULL
+            GROUP BY 1, 2, 3
+            ORDER BY 1, 2, 3
+            """,
+            pfade,
+        ).df()
+    finally:
+        con.close()
+
+    if neu_df.empty:
+        return list(vorhandene), alte_tage
+
+    neu_df["date"] = pd.to_datetime(neu_df["date"]).dt.date
+    neue_tage = sorted(set(neu_df["date"]))
+    alle_tage = alte_tage + [t for t in neue_tage if t > stand]
+    rang = {t: i for i, t in enumerate(alle_tage)}
+
+    # Letztes Segment und höchster Index je (Code, Börse).
+    letztes: dict[tuple[str, str], Segment] = {}
+    hoechster: dict[tuple[str, str], int] = {}
+    for s in vorhandene:
+        schluessel = (s.code, s.exchange)
+        hoechster[schluessel] = max(hoechster.get(schluessel, 0), s.index)
+        if schluessel not in letztes or s.last > letztes[schluessel].last:
+            letztes[schluessel] = s
+
+    geaendert: dict[int, Segment] = {}  # id(alt) → neu
+    zusaetzlich: list[Segment] = []
+
+    for (code, exchange), teil in neu_df.groupby(["code", "exchange"], sort=True):
+        schluessel = (str(code), str(exchange))
+        tage = sorted(teil["date"])
+        vorheriges = letztes.get(schluessel)
+        naechster_index = hoechster.get(schluessel, 0) + 1
+
+        # Anschluss an das bestehende Segment prüfen.
+        offen_seg: Segment | None = None
+        start = 0
+        if vorheriges is not None and rang[tage[0]] - rang[vorheriges.last] <= gap_trading_days:
+            offen_seg = vorheriges
+        if offen_seg is None:
+            offen_seg = Segment(schluessel[0], schluessel[1], naechster_index, tage[0], tage[0], 1)
+            naechster_index += 1
+            start = 1
+            zusaetzlich.append(offen_seg)
+            neu_start, neu_last, neu_bars = offen_seg.first, offen_seg.last, offen_seg.n_bars
+        else:
+            neu_start, neu_last, neu_bars = offen_seg.first, offen_seg.last, offen_seg.n_bars
+
+        vorheriger_tag = neu_last
+        for t in tage[start:]:
+            if rang[t] - rang[vorheriger_tag] > gap_trading_days:
+                fertig = Segment(schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars)
+                if offen_seg in zusaetzlich:
+                    zusaetzlich[zusaetzlich.index(offen_seg)] = fertig
+                else:
+                    geaendert[id(offen_seg)] = fertig
+                offen_seg = Segment(schluessel[0], schluessel[1], naechster_index, t, t, 1)
+                naechster_index += 1
+                zusaetzlich.append(offen_seg)
+                neu_start, neu_last, neu_bars = t, t, 1
+            else:
+                neu_last, neu_bars = t, neu_bars + 1
+            vorheriger_tag = t
+
+        fertig = Segment(schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars)
+        if offen_seg in zusaetzlich:
+            zusaetzlich[zusaetzlich.index(offen_seg)] = fertig
+        else:
+            geaendert[id(offen_seg)] = fertig
+
+    ergebnis = [geaendert.get(id(s), s) for s in vorhandene] + zusaetzlich
+    ergebnis.sort(key=lambda s: (s.code, s.exchange, s.index))
+    return ergebnis, alle_tage
+
+
+def segments_from_manifest(manifest: pd.DataFrame | None = None) -> list[Segment]:
+    """Die Segmente aus der geschriebenen Karte zurücklesen.
+
+    Der Einstieg für den inkrementellen Aufbau: was gestern galt, steht im
+    Manifest — Code, Börse, Segmentnummer, Fenster und Bar-Zahl.
+    """
+    df = read_manifest() if manifest is None else manifest
+    if df.empty:
+        return []
+    # **Die Nummer steht in der Spalte, nicht im Schlüssel.** Sie aus
+    # `code.ACL.US.s2` zu parsen sähe naheliegend aus und wäre falsch: ein
+    # Instrument mit belegter ISIN heisst `isin.US78462F1030` und trägt gar
+    # keine Nummer im Namen. Zwei Segmente eines solchen Codes kämen beide als
+    # `1` zurück, der nächste inkrementelle Lauf zählte falsch weiter, und die
+    # Karte liefe auseinander — unsichtbar, weil beide Zeilen plausibel aussehen.
+    return [
+        Segment(
+            code=str(r.code),
+            exchange=str(r.exchange),
+            index=int(r.segment),
+            first=r.first,
+            last=r.last,
+            n_bars=int(r.n_bars),
+        )
+        for r in df.itertuples(index=False)
+    ]
+
+
 def build_identity_map(
     calendar: pd.DataFrame | None = None,
     *,
@@ -677,6 +868,51 @@ def write_manifest(imap: IdentityMap) -> str:
     storage.write_parquet(imap.to_frame(), path)
     _drop_manifest_cache()
     return path
+
+
+def write_lake_days(tage: Sequence[date]) -> str:
+    """Die Handelstage des Lakes festhalten — die Bezugsgröße der Lücken.
+
+    Ohne sie kann ein inkrementeller Aufbau die Lücken nicht so messen wie ein
+    Vollscan: der zählt Tage, an denen *irgendein* Code handelte, und die
+    Partitionsliste enthält auch leere Tage.
+    """
+    path = storage.cache_path(LAKE_DAYS_PATH)
+    storage.write_parquet(pd.DataFrame({"date": sorted(set(tage))}), path)
+    return path
+
+
+def read_lake_days() -> list[date] | None:
+    """Die festgehaltenen Handelstage, oder ``None``, wenn es sie nicht gibt."""
+    path = storage.cache_path(LAKE_DAYS_PATH)
+    if not storage.exists(path):
+        return None
+    df = storage.read_parquet(path)
+    if df.empty:
+        return []
+    return sorted(pd.to_datetime(df["date"]).dt.date)
+
+
+def lake_trading_days(*, nach: date | None = None) -> list[date]:
+    """Tage mit mindestens einer Kurszeile — optional nur nach ``nach``.
+
+    Eine Spalte, ein Durchlauf. Deutlich billiger als die Segmentierung, aber
+    nicht gratis: über den vollen Lake liest es jede Partition einmal an.
+    """
+    if not storage.list_day_partitions(US_EQUITY_PREFIX):
+        return []
+    glob = _prices_glob()
+    con = storage._duckdb_conn()
+    try:
+        wo = "WHERE code IS NOT NULL"
+        if nach is not None:
+            wo += f" AND date > DATE '{nach.isoformat()}'"
+        df = con.execute(
+            f"SELECT DISTINCT date FROM read_parquet('{glob}', hive_partitioning=true) {wo}"
+        ).df()
+    finally:
+        con.close()
+    return [] if df.empty else sorted(pd.to_datetime(df["date"]).dt.date)
 
 
 def read_manifest() -> pd.DataFrame:
