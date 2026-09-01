@@ -25,6 +25,9 @@ Provider-Wissen.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
@@ -54,7 +57,7 @@ class UnadjustableActionError(ValueError):
     bedeutungslos statt bloss ungenau — ohne dass irgendwo etwas rot wird.
     """
 
-    def __init__(self, message: str, *, tage: list = ()) -> None:
+    def __init__(self, message: str, *, tage: Sequence[Any] = ()) -> None:
         super().__init__(message)
         #: Die verantwortlichen Tage — damit der Aufrufer sie nennen kann,
         #: statt nur „irgendwo in dieser Reihe".
