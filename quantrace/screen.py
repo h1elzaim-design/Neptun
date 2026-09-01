@@ -134,8 +134,34 @@ class ScreenCriteria:
     min_price: float = 5.0
     min_coverage: float = DEFAULT_MIN_COVERAGE
     top_n: int | None = None
+    #: Erster Rang, der genommen wird. ``1`` ist die Spitze; ``51`` mit
+    #: ``top_n=500`` ergibt die Ränge 51–550.
+    #:
+    #: **Wozu ein Rangband.** Die liquidesten Papiere sind auch die, in denen
+    #: Indexfonds handeln: Aufnahme in einen grossen Index erzeugt mechanische
+    #: Nachfrage, Ausschluss spiegelbildlich Zwangsverkäufe. Wer diesem
+    #: Rauschen ausweichen will, verschiebt das Band nach unten statt die
+    #: Auswahl zu verkleinern — liquide genug für vernünftige Kosten, aber
+    #: ausserhalb der Zone, in der die Ströme am dicksten sind.
+    rank_from: int = 1
     #: Leer = alle Börsen des Feeds. Sonst z.B. ``("NYSE", "NASDAQ")``.
     exchanges: tuple[str, ...] = ()
+    #: Erlaubte Ticker, aus einer Quelle **ausserhalb** des Kursfeeds — in der
+    #: Praxis der Instrumentenkatalog: US-Börse, Währung USD, Wertpapierart
+    #: Stammaktie. ``None`` heisst: keine Einschränkung.
+    #:
+    #: **Warum die Liste hereingereicht wird statt hier gebaut.** Der Katalog
+    #: liegt in Postgres, dieses Modul kennt nur den Lake. Die Trennung ist
+    #: keine Formalie: der Screen bleibt eine reine Funktion über Kursdaten und
+    #: damit ohne Datenbank testbar. Wer filtert, entscheidet der Aufrufer.
+    #:
+    #: **Und warum das nötig ist.** Im Kursfeed steht bei *jeder* Zeile
+    #: ``exchange_short_name = 'US'`` — fremdgelistete Titel in Fremdwährung
+    #: (`HSBA` in Pence, `SBER` in Rubel), Warrants, die das Volumen der
+    #: Stammaktie erben (`BAC-WS-A` trägt exakt BACs Stückzahl), und recycelte
+    #: Codes sind dort nicht unterscheidbar. Am 2026-09-01 waren im Median 4 %
+    #: jedes Korbs solche Fremdkörper (#297).
+    allowed_codes: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if self.lookback_days < 1:
@@ -152,6 +178,8 @@ class ScreenCriteria:
             )
         if self.top_n is not None and self.top_n < 1:
             raise ScreenError("top_n muss mindestens 1 sein, oder None für alle.")
+        if self.rank_from < 1:
+            raise ScreenError("rank_from ist ein Rang und beginnt bei 1, nicht bei 0.")
 
     def as_dict(self) -> dict[str, object]:
         """Die Regel als YAML-fähige Abbildung — die Reproduzierbarkeitszusage."""
@@ -162,7 +190,11 @@ class ScreenCriteria:
             "min_price": float(self.min_price),
             "min_coverage": float(self.min_coverage),
             "top_n": self.top_n,
+            "rank_from": self.rank_from,
             "exchanges": list(self.exchanges),
+            # Die Liste selbst kann Tausende Einträge haben — ins YAML gehört
+            # die Tatsache, dass gefiltert wurde, nicht ihr Inhalt.
+            "catalog_filtered": self.allowed_codes is not None,
         }
 
 
@@ -510,14 +542,31 @@ def screen(
         agg = agg[agg["exchange"].astype(str).str.upper().isin(erlaubt)]
         trichter[f"Börse nicht in {', '.join(sorted(erlaubt))}"] = vorher - len(agg)
 
+    if criteria.allowed_codes is not None:
+        # **Vor dem Rang, nicht danach.** Hinterher zu streichen liesse Lücken
+        # im Korb: 500 angefordert, 480 geliefert. Die Plätze gehören an die
+        # nächstliquiden zulässigen Papiere.
+        vorher = len(agg)
+        agg = agg[agg["code"].astype(str).str.upper().isin(criteria.allowed_codes)]
+        trichter["nicht im Katalog (Börse/Währung/Art)"] = vorher - len(agg)
+
     agg = agg.sort_values("dollar_volume", ascending=False).reset_index(drop=True)
     trichter["zulässig"] = len(agg)
 
+    if criteria.rank_from > 1:
+        vorher = len(agg)
+        agg = agg.iloc[criteria.rank_from - 1 :].reset_index(drop=True)
+        trichter[f"Rang unter {criteria.rank_from}"] = vorher - len(agg)
+
     if criteria.top_n is not None and len(agg) > criteria.top_n:
-        trichter[f"Rang über {criteria.top_n}"] = len(agg) - criteria.top_n
+        letzter = criteria.rank_from + criteria.top_n - 1
+        trichter[f"Rang über {letzter}"] = len(agg) - criteria.top_n
         agg = agg.head(criteria.top_n).reset_index(drop=True)
 
-    agg["rank"] = range(1, len(agg) + 1)
+    # Der ausgewiesene Rang ist der **echte** — bei einem verschobenen Band
+    # beginnt er nicht bei 1. Sonst sähe ein Korb aus den Rängen 51-550 aus
+    # wie einer aus 1-500, und die Regel im YAML widerspräche der Tabelle.
+    agg["rank"] = range(criteria.rank_from, criteria.rank_from + len(agg))
     trichter["ausgewählt"] = len(agg)
 
     codes = [str(c) for c in agg["code"]]
