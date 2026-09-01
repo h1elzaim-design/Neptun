@@ -82,3 +82,45 @@ def test_knowledge_note_markdown_roundtrip():
 
 def test_strategy_status_enum():
     assert StrategyStatus.APPROVED.value == "approved"
+
+
+# -----------------------------------------------------------------------------
+# Datenabdeckung: angefordert gegen tatsächlich (#307)
+# -----------------------------------------------------------------------------
+
+
+def test_coverage_meldet_ein_gekapptes_fenster(synthetic_md):
+    """Der Fall, der am 2026-08-30 unbemerkt durchlief: ein Sweep über
+    2000–2019 auf Daten, die 2015 endeten."""
+    from datetime import date
+
+    md = synthetic_md.model_copy(update={"end": date(2030, 1, 1)})
+    cov = md.coverage
+
+    assert cov.requested_end == date(2030, 1, 1)
+    assert cov.actual_end == synthetic_md.frame.index[-1].date()
+    assert cov.truncated_end and not cov.truncated_start
+    assert not cov.complete
+    fehlt = cov.shortfall()
+    assert fehlt and "endet schon" in fehlt and "2030-01-01" in fehlt
+
+
+def test_coverage_zaehlt_fehlende_symbole_mit(synthetic_md):
+    """Ein Korb aus 16 ETFs, von denen 15 Daten haben, ist ein anderer Korb.
+    Bis hierher stand das nur im Log des Loaders."""
+    md = synthetic_md.model_copy(update={"missing_symbols": ["XLRE"]})
+    cov = md.coverage
+
+    assert not cov.complete
+    assert cov.n_symbols_requested == len(synthetic_md.symbols) + 1
+    assert cov.n_symbols_loaded == len(synthetic_md.symbols)
+    assert "XLRE" in (cov.shortfall() or "")
+
+
+def test_coverage_schweigt_wenn_alles_da_ist(synthetic_md):
+    """`shortfall()` ist keine Statuszeile, sondern ein Vorbehalt — ohne
+    Vorbehalt gibt es nichts zu sagen."""
+    cov = synthetic_md.coverage
+
+    assert cov.complete
+    assert cov.shortfall() is None

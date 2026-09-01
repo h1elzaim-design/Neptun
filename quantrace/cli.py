@@ -21,7 +21,7 @@ from rich.table import Table
 
 from quantrace import membership, strategy_registry
 from quantrace.data_agent import close_prices, equal_weight_benchmark, load_universe
-from quantrace.models import BacktestConfig, StrategySpec, Timeframe, WalkForwardResult
+from quantrace.models import BacktestConfig, MarketData, StrategySpec, Timeframe, WalkForwardResult
 from quantrace.sweep import SweepResult
 from quantrace.sweep import sweep as run_sweep
 from quantrace.walk_forward import walk_forward as run_walk_forward
@@ -62,6 +62,29 @@ def _universe_data(universe: str, cfg: dict, start: date, end: date, **extra):
         membership=membership.from_universe_config(cfg),
         **extra,
     )
+
+
+def _coverage_melden(md: MarketData) -> None:
+    """Sagen, wenn auf weniger gerechnet wurde als angefordert (#307).
+
+    **Warum das nicht bei der `WARNING`-Zeile bleiben durfte.** Der Loader
+    meldet ein gekapptes Fenster längst — pro Symbol, im Log, zwischen zwanzig
+    anderen Zeilen, und Minuten bevor die Ergebnistabelle erscheint. Wer die
+    Sharpe-Zahl liest, hat das nicht mehr vor Augen; der Dateiname darunter
+    trägt weiter das *angeforderte* Fenster. Genau so ist am 2026-08-30 ein
+    Sweep über 2000–2019 als solcher in den Vault gegangen, der in Wahrheit
+    2015 endete.
+
+    Deshalb steht der Hinweis hier: nach dem Ergebnis, als Letztes, und in der
+    Farbe, die man nicht überliest.
+    """
+    fehlt = md.coverage.shortfall()
+    if fehlt:
+        console.print(f"\n[bold yellow]⚠ Datenabdeckung:[/bold yellow] {fehlt}")
+        console.print(
+            "[dim]  Das Ergebnis gilt für das tatsächliche Fenster, nicht für das "
+            "angeforderte — auch wenn der Dateiname das angeforderte trägt.[/dim]"
+        )
 
 
 @app.command()
@@ -159,6 +182,7 @@ def backtest(
     )
     _print_result(result)
     console.print(f"[blue]→[/blue] {result_path}")
+    _coverage_melden(md)
 
 
 @app.command()
@@ -242,6 +266,7 @@ def sweep(
         _json.dumps(result.model_dump(mode="json", exclude_none=True), indent=2, default=str)
     )
     console.print(f"[blue]→[/blue] {result_path}")
+    _coverage_melden(md)
 
 
 def _backtest_config(cost_model: str, capital_model: str = "shared") -> BacktestConfig:
@@ -392,6 +417,7 @@ def walkforward(
         _json.dumps(result.model_dump(mode="json", exclude_none=True), indent=2, default=str)
     )
     console.print(f"[blue]→[/blue] {result_path}")
+    _coverage_melden(md)
 
 
 def _print_walkforward_result(wf: WalkForwardResult) -> None:
@@ -865,6 +891,20 @@ def regime(
 _ERLAUBTES_PREFIX = ("python", "-m", "quantrace")
 
 
+#: Abstand zwischen zwei `running`-Meldungen eines lokalen Laufs.
+#:
+#: Die API setzt Runs ohne Lebenszeichen nach ``PIPELINE_STALE_RUN_MINUTES``
+#: (90) auf `failed`. Ein Sweep über ein grosses Universum läuft länger als
+#: das, und bis hierher meldete `run-local` genau **einmal** `running` — beim
+#: Start. Ein Lauf über zwei Stunden war damit tot, bevor er fertig war, und
+#: sein `done` lief anschliessend in den Idempotenz-Riegel.
+#:
+#: Fünf Minuten sind knapp genug, dass ein abgestürztes Terminal binnen 90
+#: Minuten auffällt, und selten genug, dass ein Achtstundenlauf keine hundert
+#: Requests kostet.
+HEARTBEAT_SEKUNDEN = 300.0
+
+
 @app.command("run-local")
 def run_local(
     run_id: str = typer.Option(..., help="Run-ID aus der Webapp"),
@@ -913,15 +953,29 @@ def run_local(
         )
     kopf = {"Authorization": f"Bearer {schluessel}"}
 
-    def melden(client: httpx.Client, **payload) -> None:
-        """Statusmeldung — Fehler hier dürfen den Lauf nicht mitreißen."""
+    def melden(client: httpx.Client, **payload) -> int | None:
+        """Statusmeldung — Fehler hier dürfen den Lauf nicht mitreißen.
+
+        Rückgabe ist der HTTP-Status (oder ``None``, wenn die Anfrage gar nicht
+        durchkam). Der Heartbeat wertet ihn aus: eine 409 heisst, der Run ist
+        serverseitig nicht mehr offen, und das soll der Operator erfahren,
+        solange sein Rechner noch rechnet — nicht erst nach drei Stunden.
+        """
         try:
             r = client.post(
                 f"{basis}/api/pipeline/runs/{run_id}/report", json=payload, headers=kopf
             )
             r.raise_for_status()
+            return r.status_code
+        except httpx.HTTPStatusError as e:
+            console.print(
+                f"[yellow]Statusmeldung '{payload.get('status')}' abgelehnt "
+                f"(HTTP {e.response.status_code})."
+            )
+            return e.response.status_code
         except httpx.HTTPError as e:
             console.print(f"[yellow]Statusmeldung '{payload.get('status')}' fehlgeschlagen: {e}")
+            return None
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         try:
@@ -944,21 +998,41 @@ def run_local(
         melden(client, status="running")
 
     # Außerhalb des Clients: der Lauf dauert Minuten bis Stunden, und eine
-    # offene Verbindung so lange zu halten hat keinen Zweck.
-    ergebnis = subprocess.run(cmd, cwd=str(Path.cwd()))
+    # offene Verbindung so lange zu halten hat keinen Zweck. Stattdessen alle
+    # `HEARTBEAT_SEKUNDEN` eine kurze Meldung — siehe unten, warum.
+    prozess = subprocess.Popen(cmd, cwd=str(Path.cwd()))
+    verwaist = False
+    while True:
+        try:
+            rc = prozess.wait(timeout=HEARTBEAT_SEKUNDEN)
+            break
+        except subprocess.TimeoutExpired:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                status = melden(client, status="running")
+            if status == 409 and not verwaist:
+                # Der Run ist serverseitig settled — typisch: ein API-Neustart
+                # hat ihn beim Boot beerdigt. Der Lauf hier ist deshalb nicht
+                # falsch, aber sein Ergebnis wird die Webapp nicht mehr
+                # annehmen. Einmal sagen, nicht bei jedem Heartbeat.
+                verwaist = True
+                console.print(
+                    "[yellow]Der Run gilt serverseitig als beendet. Es wird "
+                    "weitergerechnet, das Ergebnis landet aber nur lokal und im "
+                    "Vault — die Run-Zeile in der Webapp nimmt es nicht mehr an."
+                )
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        if ergebnis.returncode == 0:
+        if rc == 0:
             melden(client, status="done")
             console.print("[green]Fertig — das Ergebnis steht in der Webapp.")
         else:
             melden(
                 client,
                 status="failed",
-                error=f"Lokaler Lauf endete mit Exit-Code {ergebnis.returncode}.",
+                error=f"Lokaler Lauf endete mit Exit-Code {rc}.",
             )
-            console.print(f"[red]Fehlgeschlagen (Exit {ergebnis.returncode}).")
-            raise typer.Exit(ergebnis.returncode)
+            console.print(f"[red]Fehlgeschlagen (Exit {rc}).")
+            raise typer.Exit(rc)
 
 
 @app.command()

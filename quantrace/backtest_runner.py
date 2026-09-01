@@ -141,6 +141,10 @@ def _execute(
         periods_per_year=annualization,
         start=_to_date(close.index[0]),
         end=_to_date(close.index[-1]),
+        # `start`/`end` oben sind längst die tatsächlichen Grenzen — was fehlte,
+        # war das **angeforderte** Fenster daneben. Ohne beides nebeneinander
+        # kann ein Leser den Unterschied nicht bemerken (#307).
+        coverage=data.coverage,
         total_return=metrics["total_return"],
         cagr=metrics["cagr"],
         sharpe=metrics["sharpe"],

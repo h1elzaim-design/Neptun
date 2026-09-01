@@ -28,11 +28,9 @@ source_notes: |
   waren, und delisted_included/point_in_time bewusst nachziehen.
 # Ein Universum beginnt mit seinem zuletzt aufgelegten Symbol — deshalb das
 # Maximum über die Coverage-Starts, nicht das Minimum.
-# VORLÄUFIG — nicht alle Symbole liegen im Lake. Der Wert ist aus den
-# bekannten gerechnet und kann sich nach hinten schieben, sobald der Rest
-# gefetcht ist. `scripts/universe_window_audit.py --check` korrigiert ihn.
 usable_window:
-  start: 2026-08-16
+  # KORREKTUR (2026-08-31): stand auf 2026-08-16. Gemessen über 3/3 Symbole aus der Quelle lake; begrenzt durch GOOGL.
+  start: 2004-08-19
   end: null
 symbols:
   - AAPL

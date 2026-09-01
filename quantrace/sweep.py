@@ -28,6 +28,7 @@ from quantrace.backtest_runner import run_backtest
 from quantrace.models import (
     BacktestConfig,
     BacktestResult,
+    DataCoverage,
     MarketData,
     StrategySpec,
 )
@@ -157,6 +158,11 @@ class SweepResult(BaseModel):
     # is excluded from the JSON to keep payloads small). None on old results.
     best_skew: float | None = None
     best_kurt: float | None = None
+    #: Angefordertes gegen tatsächliches Datenfenster (#307). Für einen Sweep
+    #: gilt es für **alle** Läufe gemeinsam: sie rechnen auf demselben
+    #: MarketData, und ein gekapptes Fenster kappt jede Kombination gleich.
+    #: ``None`` auf Ergebnissen von vor der Einführung.
+    coverage: DataCoverage | None = None
     # Statistical discipline of the selection, computed at sweep time from the
     # in-memory return paths (exact — no summary-statistics fallback needed):
     # - best_n_obs: T behind the winner (drives the Mertens SE downstream)
@@ -713,6 +719,7 @@ def sweep(
         best_metric_value=best_value,
         best_skew=best_skew,
         best_kurt=best_kurt,
+        coverage=data.coverage,
         best_n_obs=best_n_obs,
         best_dsr=best_dsr,
         best_psr=best_psr,

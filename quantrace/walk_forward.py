@@ -52,6 +52,11 @@ def _slice_market_data(md: MarketData, start: pd.Timestamp, end: pd.Timestamp) -
         start=actual_start,
         end=actual_end,
         adjusted=md.adjusted,
+        # Ein Fold schneidet die Zeit, nicht das Universum: welche Symbole im
+        # Lake fehlten, gilt für jeden Fold gleich (#307). Das Fenster dagegen
+        # ist hier per Konstruktion vollständig — `start`/`end` sind die
+        # Grenzen des Schnitts selbst.
+        missing_symbols=list(md.missing_symbols),
         frame=sliced_frame,
     )
 
@@ -301,6 +306,7 @@ def walk_forward(
         n_folds=len(folds),  # tatsächlich evaluierte Folds (degenerierte übersprungen)
         rank_by=rank_by,
         folds=folds,
+        coverage=data.coverage,
         is_sharpe_mean=is_sharpe_mean,
         oos_sharpe_mean=oos_sharpe_mean,
         degradation=degradation,

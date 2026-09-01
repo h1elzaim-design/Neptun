@@ -21,7 +21,12 @@ from quantrace.graph.compiler import (
 from quantrace.graph.nodes import CATALOG, catalog_payload
 from quantrace.graph.presets import PRESETS
 from quantrace.graph.schema import GraphNode, GraphSpec
-from quantrace.graph.strategy import GraphStrategy, apply_param_overrides
+from quantrace.graph.strategy import (
+    DEFAULT_MAX_COMBOS,
+    GraphStrategy,
+    apply_param_overrides,
+    derive_param_space,
+)
 from quantrace.graph.vault import (
     UNVERIFIED,
     GraphSpecNotFoundError,
@@ -33,6 +38,7 @@ from quantrace.graph.vault import (
 
 __all__ = [
     "CATALOG",
+    "DEFAULT_MAX_COMBOS",
     "CompiledGraph",
     "GraphNode",
     "GraphSpec",
@@ -46,6 +52,7 @@ __all__ = [
     "build_spec",
     "catalog_payload",
     "compile_graph",
+    "derive_param_space",
     "is_graph_spec",
     "list_graph_specs",
     "load_graph",

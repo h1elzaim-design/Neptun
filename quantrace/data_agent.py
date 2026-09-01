@@ -218,6 +218,10 @@ def _load_via_bulk(
     return MarketData(
         universe=universe,
         symbols=sorted(per_out),
+        # Bis hierher stand die Lücke nur im Log (`log.warning` oben). Von dort
+        # kam sie nie bis zum Ergebnis, und ein Backtest über 15 statt 16
+        # Symbole sah aus wie einer über das ganze Universum (#307).
+        missing_symbols=sorted(fehlend),
         timeframe=timeframe,
         start=start,
         end=end,

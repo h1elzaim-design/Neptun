@@ -47,6 +47,80 @@ class StrategyStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class DataCoverage(BaseModel):
+    """Was angefordert wurde und was wirklich da war (#307).
+
+    **Der Fehler, gegen den das gebaut ist.** Ein Sweep über
+    ``2000-01-03 … 2019-03-01`` rechnete am 2026-08-30 auf Daten, die am
+    2015-02-04 endeten — vier Jahre und 1.024 Handelstage kürzer. Gemeldet
+    wurde das als ``WARNING`` im Log, also an einer Stelle, die niemand liest,
+    der später die Zahl ansieht. Der Dateiname trug weiter das angeforderte
+    Fenster, die Vault-Note auch, und die neun Sharpe-Werte standen ohne
+    Vorbehalt daneben.
+
+    Der Unterschied zu den vorhandenen Feldern ist genau der Punkt:
+    ``BacktestResult.start/end`` sind längst die *tatsächlichen* Grenzen — nur
+    stand nirgends, dass sie von den angeforderten abweichen. Ein Leser, der
+    beide nicht nebeneinander sieht, kann den Unterschied nicht bemerken.
+    Deshalb tragen Ergebnisse beides, und ``shortfall()`` sagt es in einem Satz.
+
+    ``missing_symbols`` gehört dazu, weil es dieselbe Art von Lücke ist: ein
+    Universum aus 16 ETFs, von denen 15 Daten haben, ist ein anderes Universum
+    — und XLRE fehlte in genau dem Lauf, der oben gemeint ist.
+    """
+
+    requested_start: date
+    requested_end: date
+    actual_start: date
+    actual_end: date
+    #: Symbole des Universums, für die im Fenster **keine** Daten lagen.
+    missing_symbols: list[str] = Field(default_factory=list)
+    n_symbols_requested: int = 0
+    n_symbols_loaded: int = 0
+
+    @property
+    def truncated_start(self) -> bool:
+        return self.actual_start > self.requested_start
+
+    @property
+    def truncated_end(self) -> bool:
+        return self.actual_end < self.requested_end
+
+    @property
+    def complete(self) -> bool:
+        """Alles da: volles Fenster **und** alle Symbole."""
+        return not (self.truncated_start or self.truncated_end or self.missing_symbols)
+
+    def shortfall(self) -> str | None:
+        """Ein Satz für Log, CLI, Note und UI — oder ``None``, wenn nichts fehlt.
+
+        Bewusst ein Satz und nicht ein Flag: wer ``complete=False`` liest, weiß
+        noch nicht, ob ihm vier Jahre am Ende oder ein Symbol von sechzehn
+        fehlen, und die beiden führen zu verschiedenen Entscheidungen.
+        """
+        if self.complete:
+            return None
+        teile: list[str] = []
+        if self.truncated_start:
+            fehlt = (self.actual_start - self.requested_start).days
+            teile.append(
+                f"beginnt erst {self.actual_start} statt {self.requested_start} "
+                f"({fehlt} Kalendertage fehlen am Anfang)"
+            )
+        if self.truncated_end:
+            fehlt = (self.requested_end - self.actual_end).days
+            teile.append(
+                f"endet schon {self.actual_end} statt {self.requested_end} "
+                f"({fehlt} Kalendertage fehlen am Ende)"
+            )
+        if self.missing_symbols:
+            teile.append(
+                f"{len(self.missing_symbols)} von {self.n_symbols_requested} Symbolen "
+                f"ohne Daten: {', '.join(self.missing_symbols)}"
+            )
+        return "Gerechnet wurde auf weniger als angefordert — " + "; ".join(teile) + "."
+
+
 class MarketData(BaseModel):
     """OHLCV-Bündel für ein Universum, normalisiert und versioniert.
 
@@ -78,6 +152,10 @@ class MarketData(BaseModel):
         default=None,
         description="Fallback-Kostenklasse aus dem Universe-YAML (konstruierte Universen).",
     )
+    #: Symbole des Universums, für die im Fenster keine Reihe geladen wurde
+    #: (#307). Der Loader wusste das immer und schrieb es ins Log; von dort
+    #: kam es nie bis zum Ergebnis. Leere Liste heißt: alle da.
+    missing_symbols: list[str] = Field(default_factory=list)
     frame: Any = Field(..., exclude=True)  # pd.DataFrame — lazy import, see module docstring
     #: Boolesche Maske (Index × Symbol): **durfte** dieses Papier an diesem Bar
     #: gehalten werden? Gesetzt von zeitvariablen Universen (#255); ``None``
@@ -100,6 +178,24 @@ class MarketData(BaseModel):
         auf den Default zurückfallen — dann wäre die Annualisierung falsch,
         ohne dass es jemand merkt."""
         return get_calendar(v).name
+
+    @property
+    def coverage(self) -> DataCoverage:
+        """Angefordertes gegen tatsächliches Fenster (#307).
+
+        ``start``/``end`` sind das, was der Aufrufer wollte; der Rahmen ist,
+        was der Lake hergab. Abgeleitet statt gespeichert — zwei Felder, die
+        dasselbe behaupten, laufen auseinander.
+        """
+        return DataCoverage(
+            requested_start=self.start,
+            requested_end=self.end,
+            actual_start=self.frame.index[0].date(),
+            actual_end=self.frame.index[-1].date(),
+            missing_symbols=list(self.missing_symbols),
+            n_symbols_requested=len(self.symbols) + len(self.missing_symbols),
+            n_symbols_loaded=len(self.symbols),
+        )
 
     @property
     def periods_per_year(self) -> float:
@@ -282,6 +378,12 @@ class BacktestResult(BaseModel):
     # Per-regime performance breakdown (written to JSON; computed at backtest time).
     regime_metrics: dict[str, Any] | None = None
 
+    #: Angefordertes gegen tatsächliches Datenfenster (#307). ``None`` auf
+    #: Ergebnissen von vor der Einführung — dort ist unbekannt, ob das Fenster
+    #: gehalten hat, und *unbekannt* ist nicht *vollständig*: die Leser
+    #: unterscheiden beide Fälle.
+    coverage: DataCoverage | None = None
+
     # Rohartefakte (optional, nicht serialisiert in JSON)
     equity_curve: Any | None = Field(default=None, exclude=True)  # pd.Series — lazy
     artifacts_path: str | None = None
@@ -355,6 +457,12 @@ class WalkForwardResult(BaseModel):
     #: einem Grund, der nichts mit der Strategie zu tun hat.
     #: ``None`` auf Alt-Ergebnissen — dort ist die Annahme unbekannt, nicht null.
     config: BacktestConfig | None = None
+
+    #: Angefordertes gegen tatsächliches Datenfenster über **alle** Folds
+    #: (#307). Die Folds selbst sind per Konstruktion vollständig — sie
+    #: schneiden das, was da war. Ob das, was da war, dem entsprach, was
+    #: angefordert wurde, steht nur hier.
+    coverage: DataCoverage | None = None
 
     # Aggregierte Metriken
     is_sharpe_mean: float = Field(0.0, description="Durchschnitt Sharpe In-Sample")

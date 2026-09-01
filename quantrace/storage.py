@@ -409,6 +409,35 @@ def write_coverage(symbol: str, start: date, end: date) -> None:
     )
 
 
+#: Obergrenze für DuckDBs Arbeitsspeicher, bevor es in `temp_directory`
+#: auslagert. Bewusst klein: der Deckel bremst eine große Abfrage, sein Fehlen
+#: legt die Maschine lahm.
+DEFAULT_DUCKDB_MEMORY_LIMIT = "2GB"
+
+
+def duckdb_memory_limit() -> str:
+    """Wie viel Arbeitsspeicher darf DuckDB nehmen, bevor es auslagert?
+
+    **Warum das gesetzt gehört.** Ohne Angabe nimmt DuckDB rund 80 % des
+    *System*-RAM — auf einem Arbeitsplatz mit 15 GB also 12 GB für eine
+    einzelne Abfrage, neben der noch Browser und Editor laufen. Ausgelagert
+    wird erst darüber, und bis dahin ist der Rechner längst am Swappen.
+
+    Am 2026-08-31 hat `resolve.segments_from_lake` genau so zugeschlagen: die
+    Fensterfunktionen über rund 60 Mio Code-Tage (6.109 Handelstage × ~10.000
+    Codes) standen bei 10,8 GB und stiegen weiter, als der Lauf abgebrochen
+    werden musste. Der Speicher war nicht das Problem der Abfrage, sondern das
+    fehlende Limit: mit Deckel spillt DuckDB auf die Platte und läuft
+    langsamer statt gar nicht.
+
+    Überschreibbar mit ``QUANTRACE_DUCKDB_MEMORY_LIMIT`` (DuckDB-Syntax, z. B.
+    ``"6GB"``) — mehr Speicher heisst weniger Auslagern und damit schneller,
+    solange die Maschine ihn übrig hat.
+    """
+    gesetzt = os.environ.get("QUANTRACE_DUCKDB_MEMORY_LIMIT", "").strip()
+    return gesetzt or DEFAULT_DUCKDB_MEMORY_LIMIT
+
+
 def _duckdb_conn():  # pragma: no cover - dünner Adapter
     import duckdb
 
@@ -422,6 +451,9 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
     if tmp_dir:
         os.makedirs(tmp_dir, exist_ok=True)
         con.execute(f"SET temp_directory='{tmp_dir}';")
+    # Erst der Ort, dann der Deckel: ohne Ziel für den Stapel wäre ein Limit
+    # nur eine andere Art zu scheitern.
+    con.execute(f"SET memory_limit='{duckdb_memory_limit()}';")
     if is_remote():
         con.execute("INSTALL httpfs; LOAD httpfs;")
         # DuckDB will den Host ohne Schema — die Normalisierung selbst steckt

@@ -56,7 +56,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -706,6 +706,64 @@ def read_manifest() -> pd.DataFrame:
             df[col] = pd.to_datetime(df[col]).dt.date
     _manifest_memo = (key, now, df)
     return df.copy()
+
+
+def identity_map_from_manifest(manifest: pd.DataFrame | None = None) -> IdentityMap:
+    """Die geschriebene Karte als ``IdentityMap`` zurücklesen.
+
+    **Warum das reicht.** ``materialise()`` liest aus jeder Zeile genau fünf
+    Felder — ``instrument``, ``code``, ``exchange``, ``first``, ``last`` — und
+    alle fünf stehen im Manifest. Die Karte dafür neu zu rechnen kostet einen
+    Vollscan über sämtliche Kurspartitionen; am 2026-09-01 waren das 32 Minuten
+    für 6.109 Tage, und der Aufwand wächst mit dem Lake.
+
+    Gedacht für den Fall „Karte ist aktuell, es fehlen nur Kursdateien" — der
+    Normalfall, sobald ein Universum dazukommt. Wer die Karte selbst erneuern
+    will, braucht weiter ``segments_from_lake`` + ``build_identity_map``.
+
+    Die Kennzahlen (``lake_first``/``lake_last``) kommen aus den Zeilen selbst,
+    damit ein zurückgelesenes Objekt nicht so tut, als wüsste es weniger als
+    ein frisch gebautes.
+    """
+    df = read_manifest() if manifest is None else manifest
+    if df.empty:
+        return IdentityMap(rows=[])
+    rows = df.to_dict("records")
+    return IdentityMap(
+        rows=rows,
+        lake_first=min(r["first"] for r in rows),
+        lake_last=max(r["last"] for r in rows),
+    )
+
+
+def instruments_for_codes(
+    codes: Iterable[str], *, manifest: pd.DataFrame | None = None
+) -> tuple[list[str], list[str]]:
+    """Alle Instrument-Schlüssel zu diesen Tickern — **jedes** Segment.
+
+    Nicht ``resolve_symbols``: das löst einen Ticker für *ein* Fenster auf und
+    wirft bei einem Besitzerwechsel darin. Für die Materialisierung ist genau
+    die Vorsicht falsch — wer die Kursdateien schreibt, weiß noch nicht, über
+    welches Fenster später gerechnet wird. Ein Segment mehr kostet eine Datei;
+    ein Segment zu wenig kostet einen Backtest, der mit „keine Kursdateien"
+    abbricht.
+
+    Returns
+    -------
+    (instrumente, unbekannt)
+        ``unbekannt`` sind Ticker ohne jede Zeile in der Karte — eine Auskunft,
+        kein Fehler: ein Universum darf Papiere führen, die der Lake (noch)
+        nicht hat.
+    """
+    df = read_manifest() if manifest is None else manifest
+    gesucht = {str(c).strip().upper() for c in codes if str(c).strip()}
+    if df.empty or not gesucht:
+        return [], sorted(gesucht)
+
+    code_spalte = df["code"].astype(str).str.upper()
+    treffer = df[code_spalte.isin(gesucht)]
+    gefunden = set(code_spalte[code_spalte.isin(gesucht)])
+    return sorted(treffer["instrument"].astype(str)), sorted(gesucht - gefunden)
 
 
 def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
