@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -264,6 +265,55 @@ def run_bounds(runs: list[dict[str, str]]) -> tuple[date, date] | None:
     if not runs:
         return None
     return date.fromisoformat(runs[0]["start"]), date.fromisoformat(runs[0]["end"])
+
+
+def delete_trees(root: str, unterpfade: Sequence[str]) -> int:
+    """Viele Unterbäume unter einem gemeinsamen Wurzelpfad löschen — **einmal
+    auflisten statt einmal pro Pfad.**
+
+    `delete_tree` ist die schmale Primitive: ein Pfad, eine Auflistung, ein
+    Löschaufruf. Für einen Pfad ist das richtig; für zweitausend ist es der
+    Unterschied zwischen Sekunden und einer Dreiviertelstunde. Am 2026-09-01
+    stieg die Materialisierung von 5 auf 43 Minuten, nachdem sie anfing, ihre
+    2.041 Zielpartitionen vorher zu räumen — nicht wegen der Löschungen,
+    sondern wegen zweitausend einzelner Rundreisen zu S3.
+
+    Hier wird der gemeinsame Wurzelpfad **einmal** aufgelistet, lokal gefiltert
+    und in einem Rutsch gelöscht. Objektspeicher nehmen Sammel-Löschungen
+    ohnehin gebündelt entgegen.
+
+    ``unterpfade`` sind die Namen *unter* ``root`` (z.B. ``instrument=code.BP.US.s1``),
+    nicht volle Pfade — das macht die Filterung eindeutig und verhindert, dass
+    ein Präfix versehentlich einen längeren Namen mittrifft (``…s1`` gegen
+    ``…s10``).
+    """
+    gewuenscht = {u.strip("/") for u in unterpfade if u.strip("/")}
+    if not gewuenscht:
+        return 0
+
+    if root.startswith("s3://"):
+        import fsspec
+
+        fs, _, paths = fsspec.get_fs_token_paths(root, storage_options=_s3_storage_options())
+        basis = paths[0].rstrip("/")
+        try:
+            alle = fs.find(basis)
+        except FileNotFoundError:
+            return 0
+        treffer = [
+            obj
+            for obj in alle
+            if obj[len(basis) + 1 :].split("/", 1)[0] in gewuenscht
+        ]
+        if not treffer:
+            return 0
+        fs.rm(treffer)
+        return len(treffer)
+
+    n = 0
+    for unter in sorted(gewuenscht):
+        n += delete_tree(str(Path(root) / unter))
+    return n
 
 
 def delete_tree(path: str) -> int:

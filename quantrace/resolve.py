@@ -1056,8 +1056,10 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
     # ``OVERWRITE`` wäre der naheliegende Schalter und ist die falsche Wahl:
     # gemessen räumt es den **ganzen** Zielbaum, nicht nur die geschriebenen
     # Partitionen. Mit ``only=[…]`` würde aus dem Bugfix ein Datenverlust.
-    for schluessel in sorted({str(r["instrument"]) for r in rows}):
-        storage.delete_tree(storage.cache_path(f"{RESOLVED_PREFIX}/instrument={schluessel}"))
+    storage.delete_trees(
+        storage.cache_path(RESOLVED_PREFIX),
+        [f"instrument={r['instrument']}" for r in rows],
+    )
 
     con = storage._duckdb_conn()
     try:
