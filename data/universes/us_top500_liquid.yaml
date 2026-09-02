@@ -193,8 +193,19 @@ source_notes: |
   nicht „der S&P 500" — für echte PIT-Constituents fehlt die Quelle.
 # Ein Regel-Universum beginnt an seinem Stichtag: davor existiert diese Auswahl
 # nicht, weil sie Papiere enthält, die es später erst gab oder nicht mehr gibt.
+#
+# **2000-01-04, nicht 2000-01-03 — einen Tag nach dem Stichtag.** Am 2026-09-02
+# gegen den neu gebauten Lake gemessen (`universe_window_audit.py --source
+# lake`): ein Mitglied, `EGCO`, hat am Stichtag selbst keine Zeile. Der Korb
+# ist damit erst am Folgetag vollständig, und die Zusage sagt das jetzt, statt
+# einen Tag zu versprechen, den sie nicht hält.
+#
+# `EGCO` ist Electricity Generating PCL, ein thailändisches Papier — es wird
+# über den Fremdwährungs-Pfad (#297) ohnehin herausfallen. Bis dahin bestimmt
+# es diese Grenze, und das aufzuschreiben ist ehrlicher, als den Widerspruch
+# jede Nacht neu melden zu lassen.
 usable_window:
-  start: 2000-01-03
+  start: 2000-01-04
   end: null
 symbols:
   - "A"
