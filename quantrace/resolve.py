@@ -954,6 +954,82 @@ def read_lake_days() -> list[date] | None:
     return sorted(pd.to_datetime(df["date"]).dt.date)
 
 
+#: Bis wohin die Kursdateien geschrieben sind — der Zustand fuer den
+#: inkrementellen Materialisierungslauf (#315). Neben ``LAKE_DAYS_PATH``, weil
+#: es eine andere Frage beantwortet: jener sagt, was Schicht 1 haelt, dieser,
+#: was Schicht 2 davon schon abgeschrieben hat.
+MATERIALISED_THROUGH_PATH = f"{RESOLVED_PREFIX}/_materialised_through.parquet"
+
+
+def write_materialised_through(tag: date) -> str:
+    """Festhalten, bis zu welchem Tag die Kursdateien geschrieben sind.
+
+    **Erst nach dem Schreiben aufrufen.** Ein Marker, der vor dem Lauf gesetzt
+    wird, ueberlebt dessen Absturz — und der naechste Lauf haelt dann fuer
+    erledigt, was nie geschrieben wurde. Genau die Sorte Luecke, die der
+    naechtliche Abgleich spaeter als Bruch meldet, ohne dass jemand die
+    Ursache kennt.
+    """
+    path = storage.cache_path(MATERIALISED_THROUGH_PATH)
+    storage.write_parquet(pd.DataFrame({"date": [tag]}), path)
+    return path
+
+
+def read_materialised_through() -> date | None:
+    """Der Marker, oder ``None`` — dann muss vollstaendig geschrieben werden."""
+    path = storage.cache_path(MATERIALISED_THROUGH_PATH)
+    if not storage.exists(path):
+        return None
+    df = storage.read_parquet(path)
+    if df.empty:
+        return None
+    return pd.to_datetime(df["date"]).max().date()
+
+
+def drop_materialised_through() -> None:
+    """Den Marker verwerfen — nach einem Kartenneubau.
+
+    Ein Vollscan kann Instrument-Schluessel verschieben (ein Segment mehr, ein
+    Kuerzel neu geteilt). Die bestehenden Kursdateien gehoeren dann teilweise
+    zu Schluesseln, die es nicht mehr gibt, und ein inkrementeller Lauf
+    schriebe die neuen nie. Nach einem Vollscan gilt deshalb: alles neu.
+    """
+    path = storage.cache_path(MATERIALISED_THROUGH_PATH)
+    if storage.exists(path):
+        storage.delete_tree(path)
+
+
+def codes_ab(tag: date) -> set[tuple[str, str]]:
+    """(Code, Boerse) mit mindestens einer Zeile ab ``tag`` — ein kleiner Scan.
+
+    Der Punkt der ganzen Uebung: statt alle 5.845 Tagespartitionen zu lesen,
+    liest diese Abfrage nur die seit dem letzten Lauf dazugekommenen. Am
+    2026-09-02 gemessen kostete `materialise` 884 s Fixkosten fuer den
+    Vollscan plus 0,645 s je Instrument — die Fixkosten bleiben, aber die
+    2.027 Instrumente schrumpfen auf die ~922, die ueberhaupt noch handeln.
+    """
+    tage = [t for t in storage.list_day_partitions(US_EQUITY_PREFIX) if t >= tag]
+    if not tage:
+        return set()
+    pfade = [storage.cache_path(f"{US_EQUITY_PREFIX}/date={t.isoformat()}/*.parquet") for t in tage]
+    platzhalter = ",".join(["?"] * len(pfade))
+    con = storage._duckdb_conn()
+    try:
+        df = con.execute(
+            f"""
+            SELECT DISTINCT
+                upper(code) AS code,
+                upper(COALESCE(NULLIF(TRIM(exchange_short_name), ''), 'US')) AS exchange
+            FROM read_parquet([{platzhalter}], union_by_name=true)
+            WHERE code IS NOT NULL
+            """,
+            pfade,
+        ).df()
+    finally:
+        con.close()
+    return {(str(r.code), str(r.exchange)) for r in df.itertuples()}
+
+
 def lake_trading_days(*, nach: date | None = None) -> list[date]:
     """Tage mit mindestens einer Kurszeile — optional nur nach ``nach``.
 
