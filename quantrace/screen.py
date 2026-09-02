@@ -94,6 +94,24 @@ MIN_SUPPORTED_DOLLAR_VOLUME = 1_000_000.0
 #: ``_fenster``.
 MAX_WINDOW_STALENESS_DAYS = 30
 
+#: Höchstanteil eines Papiers am Median-Dollarvolumen des Querschnitts.
+#: Begründung und Messwerte an ``ScreenCriteria.max_volume_share``.
+MAX_VOLUME_SHARE = 0.05
+
+#: Ab wie vielen zulässigen Papieren die Anteilsgrenze überhaupt gilt.
+#:
+#: **Ohne diese Bedingung wäre die Grenze bei kleinen Querschnitten eine
+#: Selbstzerstörung.** Tragen alle Papiere gleich viel bei, hat jedes ``1/n``:
+#: bei drei Papieren also 33 %, bei zehn 10 % — beide über der 5-%-Grenze,
+#: obwohl nichts kaputt ist. Der Screen verwürfe dann seinen ganzen
+#: Querschnitt, und zwar am zuverlässigsten dort, wo am wenigsten Auswahl ist.
+#:
+#: 100 ist der Punkt, ab dem ``1/n`` (1 %) mit Abstand unter der Grenze liegt.
+#: Die echten Querschnitte sind zwei bis drei Grössenordnungen darüber (12.573
+#: Kandidaten zum 2000-01-03, 43.872 zum 2020-01-02); die Bedingung schützt
+#: also Tests und Prototypen auf Miniatur-Lakes, nicht den Regelbetrieb.
+MIN_CROSS_SECTION_FOR_SHARE = 100
+
 #: EODHDs Sentinel für „kein Kurs ermittelbar" — kein Nullwert, sondern eine
 #: konkrete Zahl, die wie ein echter Kurs aussieht. Gefunden am 2026-08-26 beim
 #: Bau der ersten Point-in-Time-Universen: ein Screen zum 2007-06-29 wählte auf
@@ -162,12 +180,54 @@ class ScreenCriteria:
     #: Codes sind dort nicht unterscheidbar. Am 2026-09-01 waren im Median 4 %
     #: jedes Korbs solche Fremdkörper (#297).
     allowed_codes: frozenset[str] | None = None
+    #: Höchstanteil eines einzelnen Papiers am Median-Dollarvolumen des ganzen
+    #: Querschnitts. ``None`` schaltet die Prüfung ab.
+    #:
+    #: **Warum es diese Grenze gibt.** Am 2026-09-02 über drei Stichtage
+    #: gemessen, jeweils der Spitzenreiter nach Dollarvolumen::
+    #:
+    #:     2000-01-03   VEXPQ   2.539 Mrd $   89,9 % des Querschnitts
+    #:     2010-01-04   IBTD      379 Mrd $   62,8 %
+    #:     2020-01-02   IBTD      374 Mrd $   50,2 %
+    #:
+    #: Ein Papier kann nicht neun Zehntel des Marktumsatzes tragen.
+    #:
+    #: **Warum der Wert nicht geraten ist.** Der Maßstab ist SPY, das
+    #: liquideste Papier überhaupt: 2,15 % (2000), 2,15 % (2010), 1,88 %
+    #: (2020). Die Grenze liegt bei ``MAX_VOLUME_SHARE`` und damit um Faktor
+    #: 2,3 darüber — kein real handelbares Papier stösst daran an, und die
+    #: Ausreisser liegen eine Grössenordnung darüber, nicht knapp daneben.
+    #:
+    #: **Dies ist ein Netz, keine Lösung — und das gehört hierher, damit
+    #: niemand die Grenze für eine hält.** Gemessen am 2026-09-02 nimmt sie je
+    #: Stichtag **genau ein** Papier heraus. Danach stehen immer noch `HSBA`,
+    #: `SBER`, `CELSIA`, `ISA` vor AAPL und GOOG (2010), `LDG`, `VPI`, `HVN`
+    #: vor AAPL und AMZN (2020). Dahinter liegen zwei Ursachen, die beide
+    #: eigene Arbeit sind:
+    #:
+    #: 1. **Fremdwährung.** Der US-Bulk führt fremdgelistete Titel in ihrer
+    #:    Heimatwährung, der Screen rechnet sie als Dollar. Belegt an `HSBA`:
+    #:    689,50 im Jahr 2010 — HSBC in London, in Pence. Der Katalog kann es
+    #:    nicht auffangen, dort trägt jede der 116.688 Zeilen ``USD``
+    #:    (#297 Punkt 2, bis heute offen).
+    #: 2. **Der Screen kennt keine Segmente.** ``_aggregat`` gruppiert nach
+    #:    ``code``, während Schicht 2 längst weiss, dass ein Kürzel mehreren
+    #:    Papieren gehören kann. `LDG` hat zwei Segmente — Longs Drug Stores
+    #:    (1997–2008, von CVS gekauft) und ab 2015 ein fremdes Papier. Ein
+    #:    Screen zum 2020 rechnet mit dessen Kursen und trägt den Namen der
+    #:    toten Firma. Dieselbe Falle wie BBBY (ADR-013), eine Ebene höher.
+    max_volume_share: float | None = MAX_VOLUME_SHARE
 
     def __post_init__(self) -> None:
         if self.lookback_days < 1:
             raise ScreenError("lookback_days muss mindestens 1 sein.")
         if not 0.0 <= self.min_coverage <= 1.0:
             raise ScreenError("min_coverage ist ein Anteil zwischen 0 und 1.")
+        if self.max_volume_share is not None and not 0.0 < self.max_volume_share <= 1.0:
+            raise ScreenError(
+                "max_volume_share ist ein Anteil zwischen 0 (exklusiv) und 1 — "
+                "`None` schaltet die Prüfung ab."
+            )
         if self.min_dollar_volume < MIN_SUPPORTED_DOLLAR_VOLUME:
             raise ScreenError(
                 f"Liquiditätsschwelle {self.min_dollar_volume:,.0f} $ liegt unter "
@@ -541,6 +601,20 @@ def screen(
         vorher = len(agg)
         agg = agg[agg["exchange"].astype(str).str.upper().isin(erlaubt)]
         trichter[f"Börse nicht in {', '.join(sorted(erlaubt))}"] = vorher - len(agg)
+
+    if criteria.max_volume_share is not None and len(agg) >= MIN_CROSS_SECTION_FOR_SHARE:
+        # **Der Anteil wird gegen die Menge gemessen, die die Hürden genommen
+        # hat**, nicht gegen alle Kandidaten. Sonst verwässerten zehntausende
+        # Papiere ohne nennenswerten Umsatz den Nenner, und die Grenze bedeutete
+        # an jedem Stichtag etwas anderes.
+        gesamt = float(agg["dollar_volume"].sum())
+        if gesamt > 0:
+            grenze = gesamt * criteria.max_volume_share
+            vorher = len(agg)
+            agg = agg[agg["dollar_volume"] <= grenze]
+            trichter[
+                f"Umsatzanteil über {criteria.max_volume_share:.0%} des Querschnitts"
+            ] = vorher - len(agg)
 
     if criteria.allowed_codes is not None:
         # **Vor dem Rang, nicht danach.** Hinterher zu streichen liesse Lücken

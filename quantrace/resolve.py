@@ -54,6 +54,7 @@ einen Rebuild, keinen zweiten Download.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -254,6 +255,60 @@ def _prices_glob() -> str:
     return storage.cache_path(f"{US_EQUITY_PREFIX}/date=*/*.parquet")
 
 
+#: Ab wann Schicht 1 überhaupt gelesen wird. Alles davor bleibt im Lake
+#: liegen — es wird nur nie gelesen.
+#:
+#: **Der Grund ist nicht Sparsamkeit, sondern eine Lücke.** Der Lake besteht
+#: aus zwei Blöcken: ``1996-01-02 … 1999-09-29`` und ``2000-01-03 …`` heute,
+#: dazwischen fehlen 65 NYSE-Sessions. Sie werden bewusst nicht nachgeladen
+#: (`docs/PLAN.md` §1: es würde Segmentgrenzen und damit Instrument-Schlüssel
+#: bewegen, für Jahre, die niemand liest). Damit trägt **jede** Zeitreihe, die
+#: beide Blöcke umfasst, ein stilles Loch von drei Monaten — eine Reihe, die
+#: lückenlos aussieht und es nicht ist. Genau die Sorte Fehler, die keine
+#: Fehlermeldung wirft.
+#:
+#: Dass der Schnitt nebenbei 946 der 6.791 Tagespartitionen (13,9 %) von jedem
+#: Vollscan nimmt, ist die Zugabe, nicht der Zweck.
+#:
+#: Überschreibbar mit ``QUANTRACE_LAKE_START`` (ISO-Datum). ``none`` hebt die
+#: Grenze auf — dann gilt wieder der ganze Lake **samt** seiner Lücke.
+DEFAULT_LAKE_START = date(2000, 1, 1)
+
+
+def lake_start() -> date | None:
+    """Die Untergrenze für jeden Lesezugriff auf Schicht 1.
+
+    ``None`` heisst „keine Grenze" und ist eine bewusste Angabe, kein
+    Vorgabewert: wer sie setzt, liest über die Lücke hinweg.
+    """
+    roh = os.environ.get("QUANTRACE_LAKE_START", "").strip()
+    if not roh:
+        return DEFAULT_LAKE_START
+    if roh.lower() in {"none", "kein", "keine"}:
+        return None
+    try:
+        return date.fromisoformat(roh)
+    except ValueError:
+        log.warning(
+            "QUANTRACE_LAKE_START='%s' ist kein ISO-Datum — es gilt %s.",
+            roh,
+            DEFAULT_LAKE_START,
+        )
+        return DEFAULT_LAKE_START
+
+
+def _ab_klausel(spalte: str = "date") -> str:
+    """Die Untergrenze als SQL-Fragment, oder leer.
+
+    Ein **expliziter** Filter auf der Partitionsspalte, kein Join-Prädikat:
+    nur so überspringt DuckDB die Partitionen, statt sie zu lesen und dann zu
+    verwerfen. Der Join in ``materialise`` hat ``date BETWEEN first AND last``
+    schon — daraus lässt sich kein Pruning ableiten.
+    """
+    ab = lake_start()
+    return "" if ab is None else f" AND {spalte} >= DATE '{ab.isoformat()}'"
+
+
 def code_calendar(*, limit_days: int | None = None) -> pd.DataFrame:
     """Wann ist welcher Code im Lake zu sehen? Eine Zeile je (Code, Börse, Tag).
 
@@ -280,10 +335,13 @@ def code_calendar(*, limit_days: int | None = None) -> pd.DataFrame:
     con = storage._duckdb_conn()
     try:
         bedingungen = ["code IS NOT NULL"]
+        ab = lake_start()
+        if ab is not None:
+            bedingungen.append(f"date >= DATE '{ab.isoformat()}'")
         if limit_days:
             tage = con.execute(
                 f"SELECT DISTINCT date FROM read_parquet('{glob}', hive_partitioning=true) "
-                "ORDER BY date LIMIT ?",
+                f"WHERE TRUE{_ab_klausel()} ORDER BY date LIMIT ?",
                 [int(limit_days)],
             ).df()
             if tage.empty:
@@ -446,17 +504,17 @@ def segments_from_lake(
     glob = _prices_glob()
     con = storage._duckdb_conn()
     try:
-        bis_klausel = ""
+        bis_klausel = _ab_klausel().lstrip()
         if limit_days:
             tage = con.execute(
                 f"SELECT DISTINCT date FROM read_parquet('{glob}', hive_partitioning=true) "
-                "ORDER BY date LIMIT ?",
+                f"WHERE TRUE{_ab_klausel()} ORDER BY date LIMIT ?",
                 [int(limit_days)],
             ).df()
             if tage.empty:
                 return []
             bis = pd.to_datetime(tage["date"]).max().date()
-            bis_klausel = f"AND date <= DATE '{bis.isoformat()}'"
+            bis_klausel += f" AND date <= DATE '{bis.isoformat()}'"
 
         # `GROUP BY` im ersten Schritt, weil ein Tag denselben Code zweimal
         # tragen kann (zwei Handelsplätze, doppelte Zeile im Feed). Ohne das
@@ -904,7 +962,7 @@ def lake_trading_days(*, nach: date | None = None) -> list[date]:
     glob = _prices_glob()
     con = storage._duckdb_conn()
     try:
-        wo = "WHERE code IS NOT NULL"
+        wo = f"WHERE code IS NOT NULL{_ab_klausel()}"
         if nach is not None:
             wo += f" AND date > DATE '{nach.isoformat()}'"
         df = con.execute(
@@ -1061,6 +1119,12 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
         [f"instrument={r['instrument']}" for r in rows],
     )
 
+    # Der Filter steht als eigene WHERE-Klausel, nicht im Join: DuckDB
+    # überspringt Partitionen nur nach einem Prädikat auf der Partitionsspalte.
+    # Aus `date BETWEEN m.first AND m.last` (Join) folgt kein Pruning — es
+    # liest jede Partition und verwirft danach.
+    ab = _ab_klausel("p.date")
+
     con = storage._duckdb_conn()
     try:
         con.register("identitaet", karte)
@@ -1078,6 +1142,7 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
                   ON p.code = m.code
                  AND COALESCE(NULLIF(TRIM(p.exchange_short_name), ''), 'US') = m.exchange
                  AND p.date >= m.first AND p.date <= m.last
+                WHERE TRUE{ab}
                 ORDER BY m.instrument, p.date
             ) TO '{ziel}'
             (FORMAT PARQUET, PARTITION_BY (instrument), OVERWRITE_OR_IGNORE)
