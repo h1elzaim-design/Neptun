@@ -41,8 +41,16 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+#: Von Hand belegte Fremdlistings — für die Börsen, die EODHD gar nicht führt.
+#: Begründung und Aufnahmekriterium stehen in der Datei selbst.
+MANUAL_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "data_sources" / "foreign_listings.yaml"
+)
 
 #: Notierungen in Bruchteilen der Hauptwährung. EODHD führt London in ``GBX``
 #: (Pence) und Johannesburg in ``ZAC`` (Cent) — beide sind ein Hundertstel
@@ -163,3 +171,77 @@ def resolve_currencies(
             )
         )
     return sorted(treffer, key=lambda t: t.code)
+
+
+@lru_cache(maxsize=1)
+def manual_listings(path: str | None = None) -> dict[str, CurrencyFinding]:
+    """Die von Hand belegten Fremdlistings, Kürzel → Befund.
+
+    **Warum es sie neben `resolve_currencies` gibt.** Das Skript liest die
+    Symbollisten der 69 Börsen, die EODHD führt — und findet damit nichts, was
+    dort fehlt. Vietnam, Kolumbien, Russland und Thailand fehlen, und genau
+    deren Papiere stehen 2020 auf den vordersten Rängen jedes US-Screens
+    (`PVD`, `LDG`, `VPI`, `HVN`, `KDH`, `ISA`, `TTB`).
+
+    **Warum eine Liste und kein Filter.** Am 2026-09-02 wurden vier
+    datengetriebene Tests durchgemessen; keiner trennt. Der schärfste — nie
+    adjustiert *und* Kurs über 300 $ — hätte `BRK-A` (99.600 $) und `ADBE`
+    (334 $) mitgenommen, also Adobe aus jedem Universum geworfen. Die fehlende
+    Information ist aus Kursen nicht rekonstruierbar; sie muss von aussen
+    kommen. Eine Liste, in der jede Zeile ihren Beleg trägt, ist dann
+    ehrlicher als eine Regel, die daneben greift.
+    """
+    import yaml
+
+    pfad = Path(path) if path else MANUAL_PATH
+    if not pfad.exists():
+        return {}
+    daten = yaml.safe_load(pfad.read_text()) or {}
+    out: dict[str, CurrencyFinding] = {}
+    for eintrag in daten.get("listings") or []:
+        code = str(eintrag.get("code") or "").strip()
+        waehrung = str(eintrag.get("currency") or "").strip().upper()
+        # **Ohne Beleg kein Eintrag.** Eine geratene Waehrung macht den Kurs
+        # plausibel und den Fehler damit unsichtbar — teurer als gar keine
+        # Angabe, weil danach niemand mehr hinsieht.
+        if not code or not waehrung or not str(eintrag.get("evidence") or "").strip():
+            log.warning(
+                "foreign_listings: Eintrag ohne Code, Waehrung oder Beleg — ignoriert: %r", eintrag
+            )
+            continue
+        out[code] = CurrencyFinding(
+            code=code,
+            currency=waehrung,
+            exchange="(manuell)",
+            name=str(eintrag.get("name") or ""),
+            subunit=SUBUNITS.get(waehrung),
+        )
+    return out
+
+
+def all_findings(
+    resolved: list[CurrencyFinding], *, manual: dict[str, CurrencyFinding] | None = None
+) -> list[CurrencyFinding]:
+    """Automatisch aufgeloeste und von Hand belegte Befunde, zusammengefuehrt.
+
+    **Das Automatische gewinnt.** Es steht auf EODHDs eigener Symbolliste einer
+    Boerse, an der das Papier wirklich notiert; ein Handeintrag ist eine
+    Ableitung aus dem Firmennamen. Wo beide etwas sagen, ist die Quelle die
+    bessere Auskunft — und ein Widerspruch gehoert ins Log, weil dann einer
+    von beiden falsch ist.
+    """
+    hand = dict(manual_listings() if manual is None else manual)
+    zusammen = {t.code: t for t in resolved}
+    for code, befund in hand.items():
+        vorhanden = zusammen.get(code)
+        if vorhanden is None:
+            zusammen[code] = befund
+        elif vorhanden.currency.upper() != befund.currency.upper():
+            log.warning(
+                "%s: Boersenliste sagt %s, foreign_listings.yaml sagt %s — "
+                "die Boersenliste gilt. Einer der beiden ist falsch.",
+                code,
+                vorhanden.currency,
+                befund.currency,
+            )
+    return sorted(zusammen.values(), key=lambda t: t.code)
