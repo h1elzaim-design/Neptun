@@ -672,8 +672,7 @@ def segments_incremental(
         return list(vorhandene), alte_tage
 
     pfade = [
-        storage.cache_path(f"{US_EQUITY_PREFIX}/date={t.isoformat()}/data.parquet")
-        for t in offen
+        storage.cache_path(f"{US_EQUITY_PREFIX}/date={t.isoformat()}/data.parquet") for t in offen
     ]
     con = storage._duckdb_conn()
     try:
@@ -736,7 +735,9 @@ def segments_incremental(
         vorheriger_tag = neu_last
         for t in tage[start:]:
             if rang[t] - rang[vorheriger_tag] > gap_trading_days:
-                fertig = Segment(schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars)
+                fertig = Segment(
+                    schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars
+                )
                 if offen_seg in zusaetzlich:
                     zusaetzlich[zusaetzlich.index(offen_seg)] = fertig
                 else:
@@ -749,7 +750,9 @@ def segments_incremental(
                 neu_last, neu_bars = t, neu_bars + 1
             vorheriger_tag = t
 
-        fertig = Segment(schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars)
+        fertig = Segment(
+            schluessel[0], schluessel[1], offen_seg.index, neu_start, neu_last, neu_bars
+        )
         if offen_seg in zusaetzlich:
             zusaetzlich[zusaetzlich.index(offen_seg)] = fertig
         else:
@@ -1060,6 +1063,44 @@ def instruments_for_codes(
     return sorted(treffer["instrument"].astype(str)), sorted(gesucht - gefunden)
 
 
+def codes_mit_eindeutiger_identitaet(*, manifest: pd.DataFrame | None = None) -> frozenset[str]:
+    """Ticker, hinter denen genau **ein** Papier steht (#314).
+
+    **Wozu.** Der Instrumentenkatalog kennt keine Zeit: er fuehrt einen Eintrag
+    je Kuerzel — Boerse, Wertpapierart, Name, ISIN. Schicht 2 weiss dagegen
+    laengst, dass ein Kuerzel mehreren Papieren nacheinander gehoeren kann.
+    Wo das zutrifft, beschreibt die Katalogauskunft **hoechstens eines** davon,
+    und welches, sagt niemand.
+
+    Am 2026-09-02 gemessen: `LDG` traegt drei Segmente — Longs Drug Stores
+    (2000–2008, von CVS gekauft), ab 2015 die vietnamesische LDG Investment,
+    ab 2021 ein drittes Papier. Der Katalog nennt „Longs Drug Stores Corp",
+    also s1. Ein Screen zum 2020-01-02 rechnete mit den Kursen von s2 und
+    bekam seine Zulassung von s1 — und `LDG` stand damit auf **Rang 1** eines
+    Top-500, vor AAPL und AMZN. Dieselbe Falle wie BBBY (ADR-013), eine Ebene
+    hoeher: dort auf Kursebene, hier auf Katalogebene.
+
+    **Warum die Regel so grob ist, wie sie ist.** Naheliegend waere, das zum
+    Stichtag aktive Segment zu bestimmen und nur dessen Katalogauskunft zu
+    nehmen. Dafuer braeuchte es eine Zuordnung Katalogeintrag → Segment, und
+    die gibt es nicht: beobachtet ist nur, dass der Katalog bei `LDG`, `VPI`
+    und `ACL` jeweils die *erste* Firma nennt — drei Faelle sind keine Regel.
+    Solange das so ist, ist „mehr als ein Segment" gleichbedeutend mit „die
+    Auskunft ist nicht belegt".
+
+    **Die Richtung des Fehlers.** Ein zu Unrecht ausgeschlossener Ticker fehlt
+    in einem Korb von 500, und sein Platz geht an den naechstliquiden. Ein zu
+    Unrecht aufgenommener steht ganz oben und verdraengt einen echten Titel.
+    Gemessen kostet die Regel 3,8 % der Ticker in `us_top500_liquid`.
+    """
+    df = read_manifest() if manifest is None else manifest
+    if df.empty:
+        return frozenset()
+    codes = df["code"].astype(str).str.upper()
+    je_code = codes.value_counts()
+    return frozenset(je_code[je_code == 1].index)
+
+
 def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
     """Schreibt je Instrument eine Parquet-Datei aus Schicht 1.
 
@@ -1228,10 +1269,7 @@ def resolve_membership(
     # sind rund 2.000 Zeilen — dieselbe Antwort, ein Vierzigstel der Arbeit.
     if not man.empty:
         alle_codes = {
-            str(s).strip().upper()
-            for _, _, symbole in perioden
-            for s in symbole
-            if str(s).strip()
+            str(s).strip().upper() for _, _, symbole in perioden for s in symbole if str(s).strip()
         }
         man = man[man["code"].astype(str).str.upper().isin(alle_codes)]
 
@@ -1395,9 +1433,7 @@ def resolve_symbols(
             # übrig, ist es ein Besitzerwechsel und der Abbruch bleibt.
             lang = pd.to_numeric(passend["n_bars"], errors="coerce").fillna(0) >= min_segment_bars
             aktiv = (
-                passend["active"].fillna(True).astype(bool)
-                if "active" in passend.columns
-                else True
+                passend["active"].fillna(True).astype(bool) if "active" in passend.columns else True
             )
             substanziell = passend[lang | aktiv]
             if len(substanziell) == 1:
@@ -1592,9 +1628,11 @@ def stichprobe(karte: pd.DataFrame, *, n: int) -> list[str]:
     if kandidaten.empty:
         return []
 
-    gereiht = kandidaten.sort_values(
-        ["n_bars", "instrument"], ascending=[False, True]
-    )["instrument"].astype(str).tolist()
+    gereiht = (
+        kandidaten.sort_values(["n_bars", "instrument"], ascending=[False, True])["instrument"]
+        .astype(str)
+        .tolist()
+    )
     if len(gereiht) <= n:
         return gereiht
 
@@ -1615,9 +1653,7 @@ def _datei_stand(schluessel: list[str]) -> dict[str, tuple[int, date | None]]:
     """
     if not schluessel:
         return {}
-    pfade = [
-        storage.cache_path(f"{RESOLVED_PREFIX}/instrument={k}/*.parquet") for k in schluessel
-    ]
+    pfade = [storage.cache_path(f"{RESOLVED_PREFIX}/instrument={k}/*.parquet") for k in schluessel]
     con = storage._duckdb_conn()
     try:
         df = con.execute(
@@ -1724,6 +1760,7 @@ USABLE_CIK_STATUS = frozenset({"confirmed", "unverified", "resolved_by_name"})
 
 #: Lake-Pfad der Namenskarte aus `scripts/build_cik_map.py`.
 CIK_HISTORY_PATH = "cik_history/_map.parquet"
+
 
 def _history_for(schluessel: str) -> pd.DataFrame:
     """Nur die Zeilen zu **einem** Namensschlüssel — gezielt, nicht alles.
