@@ -58,6 +58,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -1177,6 +1178,90 @@ def codes_mit_eindeutiger_identitaet(*, manifest: pd.DataFrame | None = None) ->
     return frozenset(je_code[je_code == 1].index)
 
 
+#: Wer gerade materialisiert. Verhindert, dass zwei Laeufe dieselben
+#: Instrument-Partitionen schreiben.
+MATERIALISE_LOCK_PATH = f"{RESOLVED_PREFIX}/_materialise.lock.json"
+
+#: Ab wann eine Sperre als verwaist gilt. Der laengste gemessene Lauf brauchte
+#: 2.192 Sekunden (2.027 Instrumente, 2026-09-02); zwei Stunden lassen Raum
+#: fuer einen `--all`-Lauf, ohne dass eine Sperre nach einem Absturz ewig
+#: stehen bleibt.
+MATERIALISE_LOCK_STALE_S = 7200
+
+
+class MaterialiseLockedError(RuntimeError):
+    """Ein anderer Lauf schreibt gerade Kursdateien."""
+
+
+@contextmanager
+def materialise_lock(*, stale_after_s: int = MATERIALISE_LOCK_STALE_S):
+    """Sperre gegen zwei gleichzeitige Materialisierungslaeufe.
+
+    **Warum es sie gibt.** `materialise` raeumt die Zielpartitionen vor dem
+    Schreiben (`delete_trees`) — das ist der Schutz gegen die doppelten
+    Zeitstempel aus #311. Er greift innerhalb *eines* Laufs. Laufen zwei
+    gleichzeitig, raeumt der zweite, waehrend der erste schreibt, und beide
+    legen ihre Dateien nebeneinander.
+
+    Am 2026-09-03 genau so passiert: zwei Messlaeufe ueberlappten sich auf dem
+    produktiven Lake, und `code.AGCO.US.s1` trug danach 11.220 Zeilen statt
+    5.845. Derselbe Schaden wie #311, andere Ursache — dort verschiedene
+    DuckDB-Parallelitaet innerhalb eines Laufs, hier zwei Laeufe.
+
+    **Was die Sperre nicht ist.** Kein verteiltes Lock. Objektspeicher kennt
+    kein atomares „anlegen, falls nicht vorhanden", und zwei Laeufe, die in
+    derselben Sekunde starten, koennen beide durchkommen. Sie faengt den Fall,
+    der real vorkommt — ein zweiter Lauf, waehrend der erste noch arbeitet —
+    und sagt dann, **wer** sperrt und seit wann. Das ist der Unterschied
+    zwischen einem stillen Datenschaden und einer Fehlermeldung.
+    """
+    import json
+    import os
+    import socket
+    from datetime import datetime, timezone
+
+    pfad = storage.cache_path(MATERIALISE_LOCK_PATH)
+    if storage.exists(pfad):
+        try:
+            halter = json.loads(storage._read_text(pfad))
+            seit = datetime.fromisoformat(halter["seit"])
+            alter = (datetime.now(timezone.utc) - seit).total_seconds()
+        except Exception:  # noqa: BLE001 - eine kaputte Sperre ist keine Sperre
+            halter, alter = {}, stale_after_s + 1
+        if alter <= stale_after_s:
+            raise MaterialiseLockedError(
+                f"Ein anderer Lauf materialisiert seit {halter.get('seit', '?')} "
+                f"({halter.get('host', '?')}, PID {halter.get('pid', '?')}). "
+                f"Zwei gleichzeitige Laeufe erzeugen doppelte Zeitstempel — siehe "
+                f"#311. Warten, oder die Sperre loeschen, wenn der Lauf tot ist: "
+                f"{MATERIALISE_LOCK_PATH}"
+            )
+        log.warning(
+            "Verwaiste Materialisierungs-Sperre (%.0f s alt) wird uebergangen.", alter
+        )
+
+    storage._write_text(
+        pfad,
+        json.dumps(
+            {
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+                "seit": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        ),
+    )
+    try:
+        yield
+    finally:
+        # **Auch nach einem Fehler.** Eine Sperre, die einen Absturz
+        # ueberlebt, blockiert die naechste Nacht — und der Betreiber sieht nur
+        # eine Kette, die nichts tut.
+        try:
+            storage.delete_tree(pfad)
+        except Exception:  # noqa: BLE001 - der Lauf ist wichtiger als sein Aufraeumen
+            log.warning("Materialisierungs-Sperre liess sich nicht loeschen: %s", pfad)
+
+
 def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
     """Schreibt je Instrument eine Parquet-Datei aus Schicht 1.
 
@@ -1231,16 +1316,32 @@ def materialise(imap: IdentityMap, *, only: list[str] | None = None) -> int:
     # ``OVERWRITE`` wäre der naheliegende Schalter und ist die falsche Wahl:
     # gemessen räumt es den **ganzen** Zielbaum, nicht nur die geschriebenen
     # Partitionen. Mit ``only=[…]`` würde aus dem Bugfix ein Datenverlust.
-    storage.delete_trees(
-        storage.cache_path(RESOLVED_PREFIX),
-        [f"instrument={r['instrument']}" for r in rows],
-    )
-
+    #
+    # **Und beides gehört unter dieselbe Sperre.** Das Räumen schützt gegen
+    # zwei Dateien aus *einem* Lauf; gegen zwei gleichzeitige Läufe schützt es
+    # nicht — dort räumt der zweite, während der erste schreibt. Am 2026-09-03
+    # genau so passiert (`materialise_lock`).
+    #
     # Der Filter steht als eigene WHERE-Klausel, nicht im Join: DuckDB
     # überspringt Partitionen nur nach einem Prädikat auf der Partitionsspalte.
     # Aus `date BETWEEN m.first AND m.last` (Join) folgt kein Pruning — es
     # liest jede Partition und verwirft danach.
     ab = _ab_klausel("p.date")
+
+    with materialise_lock():
+        return _materialise_unlocked(rows, karte, glob, ziel, ab)
+
+
+def _materialise_unlocked(rows, karte, glob, ziel, ab) -> int:
+    """Räumen und Schreiben — nur aus `materialise` heraus aufrufen.
+
+    Getrennt, damit die Sperre **beides** umschliesst. Ein Lauf, der nur den
+    COPY sperrt, hat dasselbe Problem eine Zeile weiter oben.
+    """
+    storage.delete_trees(
+        storage.cache_path(RESOLVED_PREFIX),
+        [f"instrument={r['instrument']}" for r in rows],
+    )
 
     con = storage._duckdb_conn()
     try:
