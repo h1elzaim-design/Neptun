@@ -72,17 +72,21 @@ def _signals(index, columns, on: dict[str, list[int]]) -> pd.DataFrame:
     return df
 
 
-def _config(capital_model: str) -> BacktestConfig:
+def _config(capital_model: str, **extra) -> BacktestConfig:
     # Zero costs + lag opt-out → hand-computable equities. The look-ahead lag
     # has its own dedicated tests; here it would only shift the script by a bar.
     return BacktestConfig(
-        fees_bps=0.0, slippage_bps=0.0, execution_lag=0, capital_model=capital_model
+        fees_bps=0.0,
+        slippage_bps=0.0,
+        execution_lag=0,
+        capital_model=capital_model,
+        **extra,
     )
 
 
-def _run(md: MarketData, entries, exits, capital_model: str):
+def _run(md: MarketData, entries, exits, capital_model: str, **extra):
     return run_inline(
-        "scripted", ScriptedStrategy(entries, exits), md, _config(capital_model)
+        "scripted", ScriptedStrategy(entries, exits), md, _config(capital_model, **extra)
     )
 
 
@@ -281,7 +285,11 @@ class TestUntradable:
         0,95. Exakt die Hälfte des Ergebnisses, ohne Fehlermeldung.
         """
         md, entries, exits = self._szenario()
-        res = _run(md, entries, exits, "shared")
+        # `delisting_return=0` ist hier kein Detail, sondern der Gegenstand:
+        # dieser Test rechnet die *Kapitalmechanik* von Hand nach und will den
+        # Verkauf zum letzten Kurs. Was ein Delisting wirklich einbringt, hat
+        # seit #318 eigene Tests (`test_delisting_rendite.py`).
+        res = _run(md, entries, exits, "shared", delisting_return=0.0)
 
         assert res.total_return == pytest.approx(0.95, abs=1e-3)
 

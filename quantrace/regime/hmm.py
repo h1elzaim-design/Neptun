@@ -305,18 +305,29 @@ class GaussianHMM:
         landen, und sämtliche Regime-Labels darunter hingen daran, ohne dass es
         irgendwo sichtbar wurde.
 
-        Volle Restarts wären ``n_init``-mal so teuer. Stattdessen laufen alle
-        Startpunkte erst ``n_init_iter`` Iterationen (Sichtung); auskonvergiert
-        werden dann **zwei** Finalisten: der deterministische Start und der beste
-        der Zufallsstarts. Das Ergebnis ist der bessere von beiden.
+        Volle Restarts wären ``n_init``-mal so teuer. Stattdessen läuft jeder
+        Startpunkt erst gegen einen zurückgehaltenen Validierungsteil (Sichtung,
+        höchstens ``n_iter`` Iterationen — gezählt wird die, bei der das
+        Validierungs-LL am höchsten stand); auskonvergiert werden dann **zwei**
+        Finalisten: der deterministische Start und der beste der Zufallsstarts.
+        Das Ergebnis ist der bessere von beiden.
 
         Warum zwei und nicht nur der Sichtungssieger: gemessen kann die kurze
         Sichtung danebenliegen. Ein Startpunkt, der nach 10 Iterationen führt,
         konvergiert nicht zwangsläufig höher — in einem Testfall verlor der
         Sichtungssieger am Ende um ΔLL = −1.36 gegen den deterministischen Start.
-        Mit dem deterministischen Start als gesetztem Finalisten gilt: **das
-        Ergebnis ist nie schlechter als vor #210**, nur manchmal deutlich besser
-        (gemessen bis ΔLL = +105).
+        Er läuft deshalb immer mit, und **von den beiden auskonvergierten
+        Modellen gewinnt das mit der höheren Likelihood**.
+
+        Was hier bis #316 stand — „das Ergebnis ist nie schlechter als vor #210"
+        — gilt so nicht mehr, und zwar aus einem guten Grund: vor #210 lief ein
+        einzelner Start über feste 30 Iterationen. Diese Zahl ist inzwischen
+        durch das Early-Stopping aus der Validierung ersetzt, und das gibt
+        Trainings-Likelihood absichtlich her (siehe ``_em_with_validation``). Ein
+        Vergleich beider Betriebsarten auf der Trainings-Likelihood misst
+        deshalb das Early-Stopping und nicht den Multi-Restart. Der Satz war ein
+        Rest der Fassung von vor der Validierung — so wie ``n_init_iter``, das es
+        seither nicht mehr gibt.
 
         Kosten dadurch rund das 2,3-fache eines einzelnen vollen Fits statt des
         ``n_init``-fachen.
@@ -362,29 +373,59 @@ class GaussianHMM:
         # besten Validierungs-LL — und mitgeschrieben, nach wie vielen
         # Iterationen er das erreicht hat. Diese Iterationszahl *ist* das
         # Early-Stopping: sie ersetzt die geratene 30.
-        best_val = -np.inf
-        best_index = 0
-        best_iter = 1
+        # **Der Startpunkt wird festgehalten, nicht nachgespielt.** Bis #316 lief
+        # hier eine Schleife, die die RNG-Sequenz bis zum Sieger wiederholte —
+        # nur zog sie dabei aus `x` statt aus `fit_x`, also aus einer anderen
+        # Grundgesamtheit und mit anderem Generatorverbrauch. Nachgemessen kam
+        # nicht einmal Kandidat 0 zurück, der deterministische Quantil-Split:
+        # auf dem vollen Fenster liegen die Quantile woanders. Die gesamte
+        # Sichtungsarbeit wurde damit verworfen und ein unabhängiger Startpunkt
+        # auskonvergiert.
+        starts: list[dict[str, np.ndarray]] = []
+        gesichtet: list[tuple[float, int]] = []  # (bestes Validierungs-LL, Iteration)
 
         for i in range(n_init):
             self._init_params(fit_x, rng=None if i == 0 else rng)
-            val_ll, at_iter = self._em_with_validation(fit_x, val_x, self.n_iter)
-            if val_ll > best_val:
-                best_val, best_index, best_iter = val_ll, i, at_iter
+            starts.append(self._params_snapshot())
+            gesichtet.append(self._em_with_validation(fit_x, val_x, self.n_iter))
 
-        # --- Refit auf allen Daten, mit der gewählten Iterationszahl ----------
+        # **Zwei Finalisten, und der deterministische ist gesetzt.** Gemessen kann
+        # die kurze Sichtung danebenliegen: ein Startpunkt, der nach zehn
+        # Iterationen führt, konvergiert nicht zwangsläufig höher — in einem
+        # Testfall verlor der Sichtungssieger am Ende um ΔLL = −1,36. Nur weil
+        # der Start von vor #210 immer mitläuft, gilt: **das Ergebnis ist nie
+        # schlechter als davor.**
+        finalisten = [0]
+        if n_init > 1:
+            finalisten.append(max(range(1, n_init), key=lambda i: gesichtet[i][0]))
+
+        # --- Auskonvergieren auf allen Daten ---------------------------------
         # Der Validierungsteil darf im finalen Modell nicht fehlen: für die
         # Regime-Erkennung ist gerade das *jüngste* Stück das interessante.
         # Getunt wird auf dem Split, gefittet wird auf allem — Standardvorgehen.
-        rng_final = np.random.default_rng(self.random_state)
-        for i in range(best_index + 1):
-            self._init_params(x, rng=None if i == 0 else rng_final)
-        self._run_em(x, best_iter)
+        #
+        # `_init_params(x)` vorweg nur wegen `_global_var`: der Kovarianzboden
+        # gehört zu den Daten, auf denen gefittet wird, nicht zu denen der
+        # Sichtung. Die Parameter darüber überschreibt `_restore` gleich wieder.
+        self._init_params(x)
+        bestes: tuple[float, int, dict[str, np.ndarray], int, bool] | None = None
+        for i in finalisten:
+            self._restore(starts[i])
+            ll = self._run_em(x, gesichtet[i][1])
+            if bestes is None or ll > bestes[0]:
+                bestes = (ll, i, self._params_snapshot(), self.n_iter_run_, self.converged_)
+
+        assert bestes is not None
+        ll, gewinner, params, n_iter_run, converged = bestes
+        self._restore(params)
+        self.log_likelihood_ = ll
+        self.n_iter_run_ = n_iter_run
+        self.converged_ = converged
 
         self.n_init_run_ = n_init
-        self.best_init_ = best_index
-        self.selected_iter_ = best_iter
-        self.validation_ll_ = best_val
+        self.best_init_ = gewinner
+        self.selected_iter_ = gesichtet[gewinner][1]
+        self.validation_ll_ = gesichtet[gewinner][0]
         return self
 
     def _m_step(

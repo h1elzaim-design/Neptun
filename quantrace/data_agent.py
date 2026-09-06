@@ -25,6 +25,7 @@ Storage entscheidet lokal vs. R2 allein über Env (QUANTRACE_DATA_LAKE).
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -136,6 +137,96 @@ def load_universe(
 # ---------------------------------------------------------------------------
 
 
+def _unbrauchbare_symbole(report: quality.QualityReport) -> dict[str, str]:
+    """Symbole mit ``error``-Befund → Grund. Sie fliegen raus, statt alles zu stoppen.
+
+    **Warum nicht mehr abgebrochen wird** (#322). Ein Data-Quality-Fehler ist
+    eine Aussage über *ein* Symbol; der Abbruch machte daraus eine über das
+    ganze Universum. Am 2026-09-05 kostete das genau einen Bar: `PNLYY` trägt
+    am 2011-06-08 ``high=9,74`` bei ``low=10,00`` — high und low vertauscht,
+    ein schlechter Tick von EODHD. Damit war **jeder** Backtest über
+    `us_top500_liquid` unmöglich, dessen Fenster dieses Datum enthält, für
+    alle 1.934 Kürzel und alle Strategien.
+
+    Das skaliert falsch herum: ein survivorship-freies Universum über zwanzig
+    Jahre enthält mit Sicherheit weitere solche Ticks, und je länger das
+    Fenster, desto sicherer der Abbruch. Der Querschnitts-Backtest aus #300
+    wäre daran nie angekommen.
+
+    **Die Strenge bleibt, die Reichweite nicht.** ``high < low`` bleibt ein
+    Fehler und kein Warnhinweis — wer das durchlässt, rechnet jeden
+    Range-Indikator still auf Unsinn. Das Symbol wird deshalb entfernt und
+    nicht repariert: welcher der vier Werte der falsche ist, weiss niemand,
+    und ein geratener Kurs ist teurer als ein fehlender.
+
+    **Und der Rauswurf reist mit.** Er steht in ``MarketData.unusable_symbols``
+    und damit im Ergebnis, dieselbe Bauform wie ``missing_symbols`` (#307).
+    Ein Ausschluss, der nur im Log steht, ist ein Ausschluss, den beim Lesen
+    der Kennzahlen niemand mehr vor Augen hat.
+    """
+    aus: dict[str, str] = {}
+    for i in report.issues:
+        if i.severity != "error":
+            continue
+        grund = f"{i.kind}: {i.detail}"
+        aus[i.symbol] = f"{aus[i.symbol]} | {grund}" if i.symbol in aus else grund
+    return aus
+
+
+def _erloes_annahmen(
+    combined: pd.DataFrame, aufgeloest: Mapping[str, str], end: date
+) -> dict[str, float]:
+    """Wo der Katalog dem Rahmen widerspricht: „aufgehört" ist nicht „gestorben".
+
+    Endet die Reihe eines Symbols vor dem letzten Bar des Rahmens, verkauft der
+    Backtest zwangsweise und bucht dabei den Delisting-Abschlag
+    (`backtest_runner._close_untradable`). Für die meisten dieser Symbole ist
+    das richtig — der Lake ist survivorship-frei, und ein Papier, das aufhört,
+    hat aufgehört.
+
+    Für einige ist es das nicht: die Karte führt für ihr Instrument Kurse
+    **nach** dem Fenster. Dann endete nicht das Papier, sondern die Abdeckung —
+    eine fehlende Partition, eine lange Handelsaussetzung, ein Kürzel, das im
+    Fenster ruhte. Diesen Symbolen einen Insolvenz-Abschlag aufzubuchen, wäre
+    dieselbe Sorte Fehler wie der, den `delisting_return` behebt, nur mit
+    umgekehrtem Vorzeichen.
+
+    **Nur der widerlegte Fall wird eingetragen.** Wo die Karte schweigt oder
+    zustimmt, bleibt es bei der Vorgabe aus `BacktestConfig` — ein Eintrag hier
+    ist eine Aussage über ein Papier, kein Platzhalter für alle.
+    """
+    from quantrace import resolve
+
+    if combined.empty or "close" not in set(combined.columns.get_level_values("field")):
+        return {}
+    close = combined.xs("close", level="field", axis=1)
+    letzter_bar = close.index[-1]
+    abbricht = [
+        str(sym)
+        for sym in close.columns
+        if (ende := close[sym].last_valid_index()) is not None and ende < letzter_bar
+    ]
+    if not abbricht:
+        return {}
+
+    # Anzeigename → Instrument, aber nur für die Symbole, bei denen es eine
+    # Rolle spielt. Ein LIST über die ganze Karte für 1.900 Symbole zu filtern,
+    # von denen zwanzig abbrechen, wäre Arbeit ohne Frage.
+    kandidaten = {aufgeloest[s]: s for s in abbricht if s in aufgeloest}
+    if not kandidaten:
+        return {}
+    lebend = resolve.mit_kursen_nach(kandidaten, end)
+    if lebend:
+        log.info(
+            "%d Symbole enden im Rahmen, führen laut Karte aber nach %s noch Kurse — "
+            "für sie gilt kein Delisting-Abschlag: %s",
+            len(lebend),
+            end,
+            ", ".join(sorted(kandidaten[i] for i in lebend)[:10]),
+        )
+    return {kandidaten[i]: 0.0 for i in lebend}
+
+
 def _load_via_bulk(
     universe: str,
     symbols: list[str],
@@ -245,9 +336,22 @@ def _load_via_bulk(
         per_out, calendar=calendar, expected_start=start, expected_end=end
     )
     report.log()
-    if not report.ok:
-        errs = [(i.symbol, i.kind, i.detail) for i in report.issues if i.severity == "error"]
-        raise ValueError(f"Data-Quality-Fehler im Universum {universe}: {errs}")
+    unbrauchbar = _unbrauchbare_symbole(report)
+    if unbrauchbar:
+        for sym in unbrauchbar:
+            per_out.pop(sym, None)
+        log.error(
+            "%s: %d Symbole wegen Data-Quality-Fehlern ausgeschlossen — gerechnet "
+            "wird ohne sie: %s",
+            universe,
+            len(unbrauchbar),
+            "; ".join(f"{s} ({g})" for s, g in sorted(unbrauchbar.items())),
+        )
+    if not per_out:
+        raise ValueError(
+            f"Kein Symbol aus {universe} ist im Fenster {start}..{end} brauchbar. "
+            f"Data-Quality-Fehler: {unbrauchbar}"
+        )
 
     combined = pd.concat(per_out, axis=1)
     combined.columns.names = ["symbol", "field"]
@@ -260,6 +364,10 @@ def _load_via_bulk(
         # kam sie nie bis zum Ergebnis, und ein Backtest über 15 statt 16
         # Symbole sah aus wie einer über das ganze Universum (#307).
         missing_symbols=sorted(fehlend),
+        # Getrennt von `missing_symbols`, weil es etwas anderes heisst: dort
+        # lag nichts, hier lag etwas Kaputtes. Wer die Zahlen später liest,
+        # muss „nie geladen" von „geladen und verworfen" unterscheiden können.
+        unusable_symbols=unbrauchbar,
         timeframe=timeframe,
         start=start,
         end=end,
@@ -267,6 +375,7 @@ def _load_via_bulk(
         adjusted=adjusted,
         calendar=calendar or DEFAULT_CALENDAR,
         frame=combined,
+        delisting_returns=_erloes_annahmen(combined, aufgeloest, end),
     )
     # Die Mitgliedschaft kommt mit zurück: sie kann oben auf Anzeigenamen
     # umgeschrieben worden sein, und der Aufrufer maskiert damit.

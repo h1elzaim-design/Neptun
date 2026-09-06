@@ -18,7 +18,6 @@ importiert es selbst. Hier nur TYPE_CHECKING-Guard für Typ-Annotationen.
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import UTC, date, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
@@ -156,6 +155,22 @@ class MarketData(BaseModel):
     #: (#307). Der Loader wusste das immer und schrieb es ins Log; von dort
     #: kam es nie bis zum Ergebnis. Leere Liste heißt: alle da.
     missing_symbols: list[str] = Field(default_factory=list)
+    #: Erlös-Annahme je Symbol beim Zwangsverkauf, wo der Katalog eine hat
+    #: (#318). Schlägt ``BacktestConfig.delisting_return``, das nur die Vorgabe
+    #: für den unbekannten Fall ist.
+    #:
+    #: Gefüllt wird ausschließlich, was der Katalog **widerlegt**: ein Symbol,
+    #: dessen Reihe im Rahmen endet, dessen Instrument aber nach dem Fenster
+    #: noch Kurse führt, ist nicht gestorben — dort steht ``0.0``. Der
+    #: umgekehrte Fall bleibt leer und fällt auf die vorsichtige Vorgabe
+    #: zurück; ein Eintrag hier ist eine Aussage, kein Platzhalter.
+    delisting_returns: dict[str, float] = Field(default_factory=dict)
+    #: Symbole, die geladen wurden und **verworfen** sind: Symbol → Befund
+    #: (#322). Getrennt von ``missing_symbols``, weil es etwas anderes heisst —
+    #: dort lag nichts, hier lag etwas Kaputtes. Wer die Kennzahlen später
+    #: liest, muss „nie geladen" von „geladen und verworfen" unterscheiden
+    #: können; beides sieht in einer Symbolliste gleich aus.
+    unusable_symbols: dict[str, str] = Field(default_factory=dict)
     frame: Any = Field(..., exclude=True)  # pd.DataFrame — lazy import, see module docstring
     #: Boolesche Maske (Index × Symbol): **durfte** dieses Papier an diesem Bar
     #: gehalten werden? Gesetzt von zeitvariablen Universen (#255); ``None``
@@ -316,6 +331,42 @@ class BacktestConfig(BaseModel):
     allow_shorts: bool = False
     freq: str = "1D"
     annualization: int = 252
+    #: Was ein Delisting einbringt, relativ zum letzten beobachteten Schluss.
+    #: ``-0.30`` heisst: die Zwangsschliessung fillt zu 70 % des letzten Prints.
+    #:
+    #: **Warum nicht 0.** Bis #318 wurde zum letzten beobachteten Schluss
+    #: verkauft. Das ist der Kurs, zu dem zuletzt *jemand* gehandelt hat — nicht
+    #: der Erlös. CRSP-Delisting-Renditen liegen bei performance-bedingten
+    #: Streichungen im Mittel um -30 % (NYSE/AMEX) und darunter fuer NASDAQ/OTC,
+    #: **zusaetzlich** zum letzten Print (Shumway 1997; Shumway & Warther 1999).
+    #:
+    #: Der Fehler wirkt einseitig nach oben und trifft bevorzugt Strategien, die
+    #: Verlierer halten — also genau die, fuer die ein survivorship-freier
+    #: Datensatz geladen wird. Survivorship im *Universum* loest der Screen;
+    #: Survivorship im *Ausstieg* loest diese Zahl.
+    #:
+    #: Ohne bekannten Grund gilt die vorsichtige Annahme: dieselbe Abwaegung wie
+    #: bei der Kostenklasse — zu teuer gerechnet verwirft eine gute Strategie,
+    #: zu billig gerechnet gibt eine schlechte frei. Wo der Grund bekannt ist
+    #: (Fusion, Uebernahme, freiwilliger Rueckzug), gehoert 0 dorthin, und zwar
+    #: je Symbol ueber ``MarketData.delisting_returns``.
+    #: **Warum die -1 ausgeschlossen ist.** Der Abschlag wirkt als Faktor auf
+    #: den Kurs, zu dem der Zwangsverkauf fillt; bei -1 ist dieser Kurs null,
+    #: und eine Order zum Preis null ist keine Order — vectorbt weist sie ab
+    #: (``order.price must be finite and greater than 0``). Ein Totalverlust
+    #: wird deshalb als -0.999 geschrieben und nicht als -1. Der Unterschied
+    #: ist in jeder Kennzahl unsichtbar und in der Ausfuehrung der zwischen
+    #: einem Ergebnis und einem Abbruch.
+    delisting_return: float = Field(
+        -0.30,
+        gt=-1.0,
+        le=0.0,
+        description=(
+            "Rendite der Zwangsschliessung bei endgueltigem Delisting, relativ "
+            "zum letzten beobachteten Schluss. 0 = zum letzten Print verkaufen. "
+            "-1 ist ausgeschlossen: eine Order zum Preis null ist keine Order."
+        ),
+    )
     execution_lag: int = Field(
         1,
         ge=0,
@@ -536,8 +587,3 @@ class KnowledgeNote(BaseModel):
         fm["purpose"] = self.purpose
         front = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
         return f"---\n{front}\n---\n\n{self.body.strip()}\n"
-
-
-def dump_json(model: BaseModel) -> str:
-    """Konsistente JSON-Serialisierung für Persistenz."""
-    return json.dumps(model.model_dump(mode="json"), indent=2, default=str)

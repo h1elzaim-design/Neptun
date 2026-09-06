@@ -156,7 +156,26 @@ def check_symbol(
             report.add(symbol, "nan", f"{col}: {n_nan} NaN-Werte")
         n_nonpos = int((s <= 0).sum())
         if n_nonpos:
-            report.add(symbol, "nonpositive_price", f"{col}: {n_nonpos} Werte <= 0")
+            # **Nur `close` ist ein Fehler, und zwar weil daran gehandelt wird.**
+            # Er ist der Preis, zu dem jede Order fillt; vectorbt weist eine
+            # Order mit `price <= 0` ab (`order.price must be finite and greater
+            # than 0`) — mitten im Lauf, Minuten nach einem Load, der eine halbe
+            # Stunde gebraucht hat. Schlimmer waere, wenn er es nicht taete:
+            # -100 % auf dem Nullbar und der Kehrwert am Tag danach sind keine
+            # Kennzahlen, sondern Rauschen mit Vorzeichen.
+            #
+            # Der haeufigste Ausloeser ist seit #322 keiner mehr: EODHDs
+            # Null-Bars werden in `bulk_read` als Luecke gelesen statt als Kurs.
+            # Was hier noch ankommt, ist ein Einzelfall — und ein Symbol dafuer
+            # auszuschliessen ist billiger als ein Lauf, der auf halber Strecke
+            # abbricht. Ausgeschlossen wird es, nicht abgebrochen: siehe
+            # `data_agent._unbrauchbare_symbole`.
+            #
+            # open/high/low bleiben Warnung: an ihnen wird nicht ausgefuehrt,
+            # und ein Symbol wegen eines kaputten Eroeffnungskurses zu
+            # verwerfen, waere teurer als die Auskunft wert ist.
+            schwere = "error" if col == "close" else "warning"
+            report.add(symbol, "nonpositive_price", f"{col}: {n_nonpos} Werte <= 0", schwere)
 
     if {"high", "low"} <= set(frame.columns):
         bad = int((frame["high"] < frame["low"]).sum())

@@ -92,6 +92,24 @@ def adjust_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     split = pd.Series(1.0, index=df.index) if split is None else split.astype(float)
     split = split.replace(0.0, 1.0).fillna(1.0)
 
+    # **Der Schutz war asymmetrisch.** Ein nicht-positiver Dividendenfaktor
+    # wirft seit dem WY-Fall (siehe `UnadjustableActionError`), ein absurder
+    # Split-Faktor lief ungeprueft durch — dabei kippt ein negativer Wert das
+    # Vorzeichen der ganzen Reihe genauso, und die Null wurde stillschweigend zu
+    # Eins. Eine Reihe mit negativen Kursen ist schlimmer als keine: Renditen
+    # kehren sich um, Positionsgroessen aus `capital / price` werden negativ,
+    # und jede Kennzahl darueber ist bedeutungslos statt bloss ungenau.
+    unmoeglich = split <= 0.0
+    if bool(unmoeglich.any()):
+        tage = list(df.index[unmoeglich])
+        raise UnadjustableActionError(
+            f"Split-Faktor {float(split[unmoeglich].iloc[0])} am "
+            f"{getattr(tage[0], 'date', lambda: tage[0])()}: ein Split teilt oder "
+            f"legt zusammen, er dreht nicht das Vorzeichen. "
+            f"({len(tage)} betroffene(r) Tag(e))",
+            tage=tage,
+        )
+
     div = df.get("divCash")
     div = pd.Series(0.0, index=df.index) if div is None else div.astype(float).fillna(0.0)
 

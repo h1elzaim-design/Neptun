@@ -270,6 +270,61 @@ def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.D
         con.close()
 
 
+#: Die vier Spalten, die zusammen einen Bar ausmachen.
+_OHLC_SPALTEN = ("open", "high", "low", "close")
+
+
+def _nullbars_als_luecke(prices: pd.DataFrame) -> pd.DataFrame:
+    """Ein Bar aus lauter Nullen ist keine Beobachtung, sondern eine Lücke.
+
+    **Der Fall.** EODHD schreibt für manche Tage eine Zeile mit
+    ``open=high=low=close=volume=0``. Am 2026-09-05 gemessen: 136 von 2.245
+    Zeilen bei ``ANG``, ``DIC`` und ``IVL``. Eine Aktie hat an keinem Tag zu
+    0,00 $ gehandelt — die Null ist ein Platzhalter für „nichts geliefert",
+    kein Kurs.
+
+    **Warum das nicht durchgehen darf.** Das Qualitätstor stuft
+    ``nonpositive_price`` als *Warnung* ein, also kommen die Nullen bis in den
+    Backtest. Dort brach vectorbt den Lauf ab —
+    ``order.price must be finite and greater than 0`` —, und zwar Minuten nach
+    einem Load, der eine halbe Stunde gebraucht hat. Schlimmer wäre der Fall,
+    in dem er *nicht* abbricht: eine Rendite von −100 % auf dem Nullbar und
+    +∞ am Tag danach ist keine Kennzahl, sondern Rauschen mit Vorzeichen.
+
+    **Warum Zeile löschen und nicht Kurs raten.** Die Zeile zu behalten und
+    fortzuschreiben hiesse, einen Handel zu behaupten, den es nicht gab. Der
+    Lake stellt „kein Handel" ohnehin als fehlende Zeile dar; eine Null-Zeile
+    ist dieselbe Aussage in schlechterer Schreibweise, und sie wird hier in die
+    richtige übersetzt. Was danach passiert, ist gelöst und getestet: die
+    Qualitätsprüfung meldet die Lücke, und
+    ``backtest_runner._close_untradable`` unterscheidet sie vom Ende eines
+    Papiers.
+
+    Ein *einzelner* Nullwert neben positiven bleibt stehen — das ist ein
+    anderer Defekt, und die Warnung dafür soll ihn weiter treffen.
+    """
+    vorhanden = [c for c in _OHLC_SPALTEN if c in prices.columns]
+    if not vorhanden:
+        return prices
+    leer = (prices[vorhanden] <= 0).all(axis=1)
+    if not bool(leer.any()):
+        return prices
+
+    if "code" in prices.columns:
+        je_code = prices.loc[leer, "code"].value_counts()
+        details = ", ".join(f"{c}: {n}" for c, n in list(je_code.items())[:8])
+    else:
+        details = f"{int(leer.sum())} Zeilen"
+    log.warning(
+        "%d Bars aus lauter Nullen als Lücke gelesen statt als Kurs (%s). "
+        "Eine Aktie handelt an keinem Tag zu 0,00 — die Null ist ein "
+        "Platzhalter des Feeds.",
+        int(leer.sum()),
+        details,
+    )
+    return prices.loc[~leer].reset_index(drop=True)
+
+
 def read_instruments(
     instruments: list[str],
     start: date,
@@ -313,6 +368,7 @@ def read_instruments(
         return prices, Adjustment(status="none")
 
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
+    prices = _nullbars_als_luecke(prices)
 
     if not adjust:
         return prices, Adjustment(status="none")

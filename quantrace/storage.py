@@ -465,6 +465,18 @@ def write_coverage(symbol: str, start: date, end: date) -> None:
 DEFAULT_DUCKDB_MEMORY_LIMIT = "2GB"
 
 
+def _sql_literal(wert: str) -> str:
+    """Ein DuckDB-Stringliteral aus einem Konfigurationswert.
+
+    ``SET`` kennt keine gebundenen Parameter, der Wert muss also in den Text.
+    Kein Angriffsweg von aussen — die Werte kommen aus der Job-Konfiguration —,
+    aber ein Zugangsschluessel mit Apostroph erzeugt sonst einen SQL-Fehler an
+    einer Stelle, an der niemand ihn sucht, und die Fehlermeldung traegt das
+    Secret in den Log.
+    """
+    return "'" + str(wert).replace("'", "''") + "'"
+
+
 def duckdb_memory_limit() -> str:
     """Wie viel Arbeitsspeicher darf DuckDB nehmen, bevor es auslagert?
 
@@ -500,10 +512,10 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
     tmp_dir = os.environ.get("QUANTRACE_DUCKDB_TEMP_DIR", "").strip()
     if tmp_dir:
         os.makedirs(tmp_dir, exist_ok=True)
-        con.execute(f"SET temp_directory='{tmp_dir}';")
+        con.execute(f"SET temp_directory={_sql_literal(tmp_dir)};")
     # Erst der Ort, dann der Deckel: ohne Ziel für den Stapel wäre ein Limit
     # nur eine andere Art zu scheitern.
-    con.execute(f"SET memory_limit='{duckdb_memory_limit()}';")
+    con.execute(f"SET memory_limit={_sql_literal(duckdb_memory_limit())};")
     if is_remote():
         con.execute("INSTALL httpfs; LOAD httpfs;")
         # DuckDB will den Host ohne Schema — die Normalisierung selbst steckt
@@ -513,7 +525,7 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
         endpoint = r2_endpoint()
         if endpoint:
             host = endpoint.split("://", 1)[1]
-            con.execute(f"SET s3_endpoint='{host}';")
+            con.execute(f"SET s3_endpoint={_sql_literal(host)};")
         con.execute("SET s3_url_style='path';")
         con.execute(
             f"SET s3_use_ssl={'true' if endpoint.startswith('https://') or not endpoint else 'false'};"
@@ -522,9 +534,9 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
         ak = os.environ.get("AWS_ACCESS_KEY_ID", "")
         sk = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
         if ak:
-            con.execute(f"SET s3_access_key_id='{ak}';")
+            con.execute(f"SET s3_access_key_id={_sql_literal(ak)};")
         if sk:
-            con.execute(f"SET s3_secret_access_key='{sk}';")
+            con.execute(f"SET s3_secret_access_key={_sql_literal(sk)};")
         # Der Default (= CPU-Kerne, auf Heroku Basic nur eine Hand voll) bremst
         # nichts CPU-Gebundenes hier — es sind lauter kleine R2-GETs, eins je
         # Tagespartition. Gemessen (#Actions-Read über 17 Jahre AAPL):

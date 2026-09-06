@@ -17,6 +17,7 @@ Kapitalmodell (ADR-003):
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import date
 from typing import TYPE_CHECKING
 
@@ -98,7 +99,12 @@ def _execute(
     # NACH dem Lag: der Zwangs-Exit ist keine Strategie-Entscheidung, die
     # verzögert gehandelt würde, sondern eine Ausführungsschranke.
     close, entries, exits = _close_untradable(
-        close, entries, exits, getattr(data, "tradable", None)
+        close,
+        entries,
+        exits,
+        getattr(data, "tradable", None),
+        delisting_return=config.delisting_return,
+        je_symbol=getattr(data, "delisting_returns", None),
     )
 
     fees, slippage, config = _cost_inputs(close, config, data)
@@ -240,6 +246,9 @@ def _close_untradable(
     entries: pd.DataFrame,
     exits: pd.DataFrame,
     tradable: pd.DataFrame | None = None,
+    *,
+    delisting_return: float = 0.0,
+    je_symbol: Mapping[str, float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """**Was keinen Kurs hat, kann nicht gehalten werden — aber Lücke ≠ Ende.**
 
@@ -262,7 +271,12 @@ def _close_untradable(
       nicht ab — sie meldet ``NaN`` als *Warnung*, nicht als Fehler.
       **Also: durchhalten und den letzten Kurs fortschreiben.**
     * **Kein Kurs mehr, nie wieder.** Delisting, Insolvenz. Der Lauf endet für
-      dieses Papier. **Also: verkaufen**, zum letzten beobachteten Schluss.
+      dieses Papier. **Also: verkaufen** — aber nicht zum letzten beobachteten
+      Schluss. Der ist der Kurs, zu dem zuletzt *jemand* gehandelt hat, nicht
+      der Erlös: CRSP-Delisting-Renditen liegen bei performance-bedingten
+      Streichungen im Mittel um -30 % darunter (#318). ``delisting_return``
+      ist dieser Abschlag, ``je_symbol`` überschreibt ihn dort, wo der Grund
+      bekannt ist — eine Fusion zahlt aus, eine Insolvenz nicht.
 
     Unterschieden wird an genau einem Merkmal: liegt *irgendwann später* noch
     ein Kurs? Das ist Buchhaltung über ein abgeschlossenes Ereignis, keine
@@ -275,6 +289,11 @@ def _close_untradable(
     von einer Handelsaussetzung nicht zu unterscheiden, und je nach Rateweg
     würde entweder durchgehalten (falsch) oder bei jeder Lücke verkauft (auch
     falsch).
+
+    Dieselbe Maske entscheidet mit, wo der Abschlag **nicht** gilt. ``apply``
+    setzt die Kurse außerhalb der Mitgliedschaft auf ``NaN``; im Rahmen ist ein
+    Abgang aus dem Index von einem Delisting nicht zu unterscheiden, und ohne
+    die Maske bekäme jede Rekonstitution den Insolvenz-Abschlag aufgebucht.
     """
     handelbar = close.notna()
     voll = bool(handelbar.all().all())
@@ -282,22 +301,72 @@ def _close_untradable(
         return close, entries, exits
 
     raus = pd.DataFrame(False, index=close.index, columns=close.columns)
+    # Die Mitgliedschaftsmaske wird **vor** dem Kursteil gebraucht statt erst
+    # danach: sie entscheidet mit, ob ein NaN-Schwanz das Ende des Papiers ist
+    # oder nur das Ende seiner Zugehörigkeit.
+    im_universum = (
+        tradable.reindex(index=close.index, columns=close.columns).fillna(False).astype(bool)
+        if tradable is not None
+        else None
+    )
 
     if not voll:
         # Gibt es an oder nach diesem Bar noch einen Kurs? Rückwärts-cummax
         # über die Handelbarkeit. Nur wo das False ist, endet der Lauf.
         spaeter = handelbar[::-1].cummax()[::-1].astype(bool)
         endgueltig = ~spaeter & handelbar.shift(fill_value=False)
+        if im_universum is not None:
+            # `membership.apply` setzt die Kurse außerhalb der Mitgliedschaft
+            # auf NaN — im Rahmen sieht das genauso aus wie ein Delisting. Ein
+            # rekonstituiertes Universum wirft aber *quartalsweise* Papiere
+            # hinaus, die weiterhandeln: ohne diese Zeile bekäme jeder Abgang
+            # aus `us_top500_liquid` (1.934 Kürzel über 20 Jahre) den
+            # Insolvenz-Abschlag. Der Ausstieg wird weiter gebucht — unten, aus
+            # der Maske, und dort zum letzten Kurs, weil er einer ist.
+            endgueltig &= im_universum
+            spaeter = spaeter | ~im_universum
         raus |= endgueltig
         close = close.ffill()
+        # Der Abschlag gilt ab dem ersten Bar ohne Kurs — genau dem, auf dem
+        # der Zwangsverkauf fillt. Dass er auch danach steht, ist nur
+        # Konsistenz: die Position ist zu dem Zeitpunkt weg.
+        close = _delisting_abschlag(close, spaeter, delisting_return, je_symbol)
 
-    if tradable is not None:
+    if im_universum is not None:
         # Ausgeschieden: gestern Mitglied, heute nicht.
-        mask = tradable.reindex(index=close.index, columns=close.columns).fillna(False)
-        raus |= mask.shift(fill_value=False).astype(bool) & ~mask.astype(bool)
-        handelbar &= mask.astype(bool)
+        raus |= im_universum.shift(fill_value=False).astype(bool) & ~im_universum
+        handelbar &= im_universum
 
     return close, entries & handelbar, exits | raus
+
+
+def _delisting_abschlag(
+    close: pd.DataFrame | pd.Series,
+    spaeter: pd.DataFrame | pd.Series,
+    vorgabe: float,
+    je_symbol: Mapping[str, float] | None,
+) -> pd.DataFrame | pd.Series:
+    """Den letzten beobachteten Schluss auf den Erlös herunterziehen (#318).
+
+    ``spaeter`` ist wahr, solange es an oder nach diesem Bar noch einen Kurs
+    gibt; ``~spaeter`` markiert damit genau den Schwanz nach dem Verschwinden.
+    Auf dessen erstem Bar fillt der Zwangsverkauf.
+
+    ``je_symbol`` schlägt die Vorgabe — dort steht, was der Katalog über den
+    *Grund* weiss. Eine Übernahme zahlt den letzten Kurs (0), eine Insolvenz
+    nicht. Fehlt der Grund, gilt die vorsichtige Annahme: zu teuer gerechnet
+    verwirft eine gute Strategie, zu billig gerechnet gibt eine schlechte frei.
+    """
+    je_symbol = dict(je_symbol or {})
+    if isinstance(close, pd.Series):
+        r = float(je_symbol.get(close.name, vorgabe))
+        return close if r == 0.0 else close.mask(~spaeter, close * (1.0 + r))
+    faktor = pd.Series(
+        {c: 1.0 + float(je_symbol.get(c, vorgabe)) for c in close.columns}, dtype=float
+    )
+    if bool((faktor == 1.0).all()):
+        return close
+    return close.mask(~spaeter, close.mul(faktor, axis=1))
 
 
 def _held_mask(entries: pd.DataFrame, exits: pd.DataFrame) -> pd.DataFrame:

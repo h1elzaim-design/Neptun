@@ -366,6 +366,16 @@ class Membership:
             adjusted=md.adjusted,
             calendar=md.calendar,
             cost_class=md.cost_class,
+            # Beide Felder sind Aussagen über die geladenen Daten und werden
+            # vom Beschneiden nicht wahrer oder falscher. Sie hier wegzulassen
+            # hiess: `missing_symbols` fiel für *jedes* rekonstituierte
+            # Universum leer aus — also für genau die, bei denen Lücken die
+            # Regel sind —, und der Coverage-Hinweis aus #307 erschien nie.
+            missing_symbols=md.missing_symbols,
+            unusable_symbols=md.unusable_symbols,
+            delisting_returns={
+                s: r for s, r in md.delisting_returns.items() if s in set(uebrig)
+            },
             frame=maskiert,
             tradable=handelbar,
             content_hash=digest.hexdigest()[:16],

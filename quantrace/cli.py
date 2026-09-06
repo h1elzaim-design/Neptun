@@ -16,6 +16,7 @@ from pathlib import Path
 
 import typer
 import yaml
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -86,6 +87,20 @@ def _coverage_melden(md: MarketData) -> None:
             "angeforderte — auch wenn der Dateiname das angeforderte trägt.[/dim]"
         )
 
+    # Aus demselben Grund wie oben, nur eine Stufe härter: hier fehlt nicht
+    # Abdeckung, hier wurde etwas **verworfen**. Seit #322 bricht der Loader
+    # dafür nicht mehr ab — der Preis dieser Erleichterung ist, dass der
+    # Ausschluss sichtbar bleibt, statt in einer Logzeile zu versanden.
+    if md.unusable_symbols:
+        console.print(
+            f"\n[bold red]⚠ Ausgeschlossen:[/bold red] {len(md.unusable_symbols)} Symbole "
+            "mit Data-Quality-Fehlern — gerechnet wurde ohne sie."
+        )
+        for sym, grund in sorted(md.unusable_symbols.items())[:5]:
+            console.print(f"[dim]  {sym}: {grund}[/dim]")
+        if len(md.unusable_symbols) > 5:
+            console.print(f"[dim]  … und {len(md.unusable_symbols) - 5} weitere[/dim]")
+
 
 @app.command()
 def fetch(
@@ -148,6 +163,14 @@ def backtest(
         help="Kapitalmodell: 'shared' (ein Konto, Equal-Weight über aktive "
         "Positionen) oder 'independent' (Alt: unabhängige Sleeves, Mittelwert)",
     ),
+    delisting_return: float | None = typer.Option(
+        None,
+        "--delisting-return",
+        help="Erlös beim Zwangsverkauf eines delisteten Papiers, als Rendite auf "
+        "den letzten Kurs. Vorgabe -0.30 (CRSP-Näherung für performance-bedingte "
+        "Streichungen). 0 rechnet wie vor #318 — für den Vergleich mit "
+        "Altergebnissen, nicht als Annahme.",
+    ),
     out: Path = typer.Option(Path("backtests/results"), help="Ergebnis-Verzeichnis"),
 ) -> None:
     """Führt einen Backtest aus und schreibt das Ergebnis als JSON."""
@@ -163,7 +186,7 @@ def backtest(
     else:
         params = _legacy_params(strategy, fast, slow, lookback, entry_z, exit_z)
     strategy_id, spec = _resolve_spec(strategy, graph_spec, universe, cfg, params)
-    result = run_backtest(spec, md, _backtest_config(cost_model, capital_model))
+    result = run_backtest(spec, md, _backtest_config(cost_model, capital_model, delisting_return))
 
     # Attach regime-conditioned performance metrics while equity_curve is in memory.
     if result.equity_curve is not None:
@@ -218,6 +241,14 @@ def sweep(
         "shared",
         help="Kapitalmodell: 'shared' (ein Konto) oder 'independent' (Alt-Semantik)",
     ),
+    delisting_return: float | None = typer.Option(
+        None,
+        "--delisting-return",
+        help="Erlös beim Zwangsverkauf eines delisteten Papiers, als Rendite auf "
+        "den letzten Kurs. Vorgabe -0.30 (CRSP-Näherung für performance-bedingte "
+        "Streichungen). 0 rechnet wie vor #318 — für den Vergleich mit "
+        "Altergebnissen, nicht als Annahme.",
+    ),
     out: Path = typer.Option(Path("backtests/sweeps"), help="Ergebnis-Verzeichnis"),
 ) -> None:
     """Führt einen Parameter-Sweep aus: alle Kombinationen, sortiert nach Metrik."""
@@ -251,7 +282,7 @@ def sweep(
     result = run_sweep(
         spec,
         md,
-        config=_backtest_config(cost_model, capital_model),
+        config=_backtest_config(cost_model, capital_model, delisting_return),
         rank_by=rank_by,
         # 0 heißt „entscheide selbst" — Typer kennt kein optionales int ohne Wert.
         max_workers=workers or None,
@@ -269,8 +300,18 @@ def sweep(
     _coverage_melden(md)
 
 
-def _backtest_config(cost_model: str, capital_model: str = "shared") -> BacktestConfig:
-    """BacktestConfig aus CLI-Optionen — validiert Kosten- + Kapitalmodell früh."""
+def _backtest_config(
+    cost_model: str,
+    capital_model: str = "shared",
+    delisting_return: float | None = None,
+) -> BacktestConfig:
+    """BacktestConfig aus CLI-Optionen — validiert Kosten- + Kapitalmodell früh.
+
+    ``delisting_return`` bleibt ``None``, wenn niemand es gesetzt hat: die
+    Vorgabe steht in ``BacktestConfig`` und soll dort stehen bleiben. Sie hier
+    zu wiederholen wäre eine zweite Wahrheit über eine Annahme, die im Ergebnis
+    protokolliert wird — genau die Bauform, an der #317 gescheitert ist.
+    """
     from quantrace.models import CAPITAL_MODELS, COST_MODELS
 
     if cost_model not in COST_MODELS:
@@ -281,7 +322,19 @@ def _backtest_config(cost_model: str, capital_model: str = "shared") -> Backtest
         raise typer.BadParameter(
             f"Unbekanntes Kapitalmodell '{capital_model}'. Erlaubt: {', '.join(CAPITAL_MODELS)}."
         )
-    return BacktestConfig(cost_model=cost_model, capital_model=capital_model)  # type: ignore[arg-type]
+    extra = {} if delisting_return is None else {"delisting_return": delisting_return}
+    try:
+        return BacktestConfig(cost_model=cost_model, capital_model=capital_model, **extra)  # type: ignore[arg-type]
+    except ValidationError as exc:
+        # Pydantics Meldung nennt das Feld, nicht die Option — und wer über die
+        # CLI kommt, sucht nach der Option.
+        raise typer.BadParameter(
+            f"--delisting-return {delisting_return}: erlaubt ist (-1, 0]. Ein "
+            "Delisting bringt nicht mehr als den letzten Kurs (0) und nicht weniger "
+            "als nichts; die -1 selbst ist ausgeschlossen, weil eine Order zum Preis "
+            f"null keine Order ist — Totalverlust ist -0.999. {exc.error_count()} "
+            "Verletzung(en)."
+        ) from exc
 
 
 def _default_param_space(strategy: str) -> dict:
@@ -371,6 +424,14 @@ def walkforward(
         "shared",
         help="Kapitalmodell: 'shared' (ein Konto) oder 'independent' (Alt-Semantik)",
     ),
+    delisting_return: float | None = typer.Option(
+        None,
+        "--delisting-return",
+        help="Erlös beim Zwangsverkauf eines delisteten Papiers, als Rendite auf "
+        "den letzten Kurs. Vorgabe -0.30 (CRSP-Näherung für performance-bedingte "
+        "Streichungen). 0 rechnet wie vor #318 — für den Vergleich mit "
+        "Altergebnissen, nicht als Annahme.",
+    ),
     out: Path = typer.Option(Path("backtests/walkforward"), help="Ergebnis-Verzeichnis"),
 ) -> None:
     """Führt eine Walk-Forward-Validation durch (Sweep auf Train, Test auf Test, rollierend)."""
@@ -401,7 +462,7 @@ def walkforward(
     result = run_walk_forward(
         spec,
         md,
-        config=_backtest_config(cost_model, capital_model),
+        config=_backtest_config(cost_model, capital_model, delisting_return),
         n_folds=folds,
         train_ratio=train_ratio,
         rank_by=rank_by,

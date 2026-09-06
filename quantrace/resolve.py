@@ -1140,6 +1140,45 @@ def instruments_for_codes(
     return sorted(treffer["instrument"].astype(str)), sorted(gesucht - gefunden)
 
 
+def mit_kursen_nach(
+    instrumente: Iterable[str], stichtag: date, *, manifest: pd.DataFrame | None = None
+) -> set[str]:
+    """Welche dieser Instrumente führen im Lake noch Kurse **nach** ``stichtag``?
+
+    Die eine Frage, die der Katalog über ein verschwundenes Papier beantworten
+    kann — und die einzige, die er hier beantworten muss. Der Backtest sieht
+    nur, dass eine Reihe im Rahmen aufhört; ob das Papier endete oder die
+    Abdeckung, steht nicht in den Kursen. Hier steht es: reicht das Segment
+    über das Fenster hinaus, war das Ende im Rahmen keines.
+
+    ``active`` zählt mit, weil ``last`` allein den Fall am Lake-Rand nicht
+    trifft: liegt das Fensterende auf der Front, hat auch ein lebendes Papier
+    keine Kurse *danach*.
+
+    **Was hier nicht steht.** Ob eine Streichung eine Insolvenz oder eine
+    Übernahme war. EODHDs ``exchange-symbol-list`` führt keinen Grund, und die
+    Karte hat nichts, woraus sich einer ableiten ließe (siehe #318). Diese
+    Funktion trennt „endete" von „endete nicht" — und wo sie „endete" sagt,
+    bleibt die vorsichtige Annahme stehen.
+    """
+    karte = read_manifest() if manifest is None else manifest
+    gesucht = {str(i) for i in instrumente}
+    if karte.empty or not gesucht or "instrument" not in karte.columns:
+        return set()
+
+    treffer = karte[karte["instrument"].astype(str).isin(gesucht)]
+    if treffer.empty:
+        return set()
+
+    weiter = pd.Series(False, index=treffer.index)
+    if "last" in treffer.columns:
+        letzte = pd.to_datetime(treffer["last"], errors="coerce")
+        weiter |= (letzte > pd.Timestamp(stichtag)).fillna(False)
+    if "active" in treffer.columns:
+        weiter |= treffer["active"].fillna(False).astype(bool)
+    return set(treffer.loc[weiter, "instrument"].astype(str))
+
+
 def codes_mit_eindeutiger_identitaet(*, manifest: pd.DataFrame | None = None) -> frozenset[str]:
     """Ticker, hinter denen genau **ein** Papier steht (#314).
 
