@@ -48,13 +48,7 @@ import pandas as pd
 
 from quantrace import storage
 from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
-from quantrace.einheiten import (
-    AUSSCHLAG,
-    STUFE,
-    faktorkurve,
-    klassifiziere,
-    rekonstruiere_aktion,
-)
+from quantrace.einheiten import AUSSCHLAG, faktorkurve, klassifiziere
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
@@ -537,16 +531,6 @@ def read_instruments(
     return angewandt, info
 
 
-def _stufen_grenzen(k: pd.DataFrame) -> list[int]:
-    """Positionen, an denen ein ``stufe``-Segment beginnt.
-
-    Genau dort fehlt im Aktionsfeed ein Eintrag: die Faktorkurve hat ihr
-    Niveau gewechselt und kommt nicht zurück, und der Rohkurs ist gebrochen.
-    """
-    art = k["art"].to_numpy()
-    return [i for i in range(1, len(art)) if art[i] == STUFE and art[i - 1] != STUFE]
-
-
 def _apply_actions(
     prices: pd.DataFrame, splits: pd.DataFrame, divs: pd.DataFrame
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -590,9 +574,6 @@ def _apply_actions(
     unadjustierbar: dict[str, str] = {}
     #: Zeilen, die auf falscher Stückzahl standen: Instrument → Anzahl (#324).
     einheiten_raus: dict[str, int] = {}
-    #: Aktionen, die im Feed fehlten und aus der Faktorkurve zurückgeholt
-    #: wurden: Instrument → [(Tag, Faktor)] (#324).
-    rekonstruiert: dict[str, list[tuple[str, float]]] = {}
     for instrument, teil in prices.groupby("instrument", sort=True):
         teil = teil.sort_values("date").reset_index(drop=True)
         code = str(teil["code"].iloc[0])
@@ -623,34 +604,6 @@ def _apply_actions(
                 )
                 k = klassifiziere(kurve, aktion, close_roh)
                 schlecht = (k["art"] == AUSSCHLAG).to_numpy()
-
-                # **Eine Stufe ist eine fehlende Aktion, keine kaputte Zeile.**
-                # `J` splittete am 2001-05-18 zwei zu eins — der Rohkurs
-                # halbierte sich, und weder der Bulk-Feed noch EODHDs
-                # Einzelsymbol-Endpunkt führen die Aktion (beide am 2026-09-06
-                # abgefragt, beide leer). Ohne den Eintrag erscheint die
-                # Halbierung als **echter Verlust von 49 %**.
-                #
-                # Zurückgeholt wird sie aus dem Schritt der Faktorkurve, mit
-                # zwei Bedingungen: der Faktor muss den Rohkursbruch erklären
-                # (eine Naht bewegt den Kurs nicht) und ein glattes Verhältnis
-                # sein (ein Einheitenfehler ergibt 1:2,1). Siehe
-                # `einheiten.rekonstruiere_aktion`.
-                for grenze in _stufen_grenzen(k):
-                    faktor = rekonstruiere_aktion(
-                        float(k["f"].iloc[grenze - 1]),
-                        float(k["f"].iloc[grenze]),
-                        float(close_roh.iloc[grenze - 1]),
-                        float(close_roh.iloc[grenze]),
-                    )
-                    if faktor is None:
-                        continue
-                    tag = teil["date"].iloc[grenze]
-                    split_map[(code, tag)] = split_map.get((code, tag), 1.0) * faktor
-                    rekonstruiert.setdefault(str(instrument), []).append(
-                        (str(tag), float(faktor))
-                    )
-
                 if schlecht.any():
                     einheiten_raus[str(instrument)] = int(schlecht.sum())
                     teil = teil.loc[~schlecht].reset_index(drop=True)
@@ -709,16 +662,6 @@ def _apply_actions(
                 neu[col] = adj[col].to_numpy()
         teile.append(neu)
 
-    if rekonstruiert:
-        log.warning(
-            "%d Instrument(e) mit Aktionen, die im Feed fehlten und aus der "
-            "Faktorkurve zurückgeholt wurden (#324): %s",
-            len(rekonstruiert),
-            "; ".join(
-                f"{i}: {', '.join(f'{t}×{f:g}' for t, f in v)}"
-                for i, v in sorted(rekonstruiert.items())[:10]
-            ),
-        )
     if einheiten_raus:
         log.warning(
             "%d Instrument(e) mit Zeilen auf falscher Stückzahl — %d Zeilen "
