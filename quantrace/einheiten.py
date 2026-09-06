@@ -59,6 +59,8 @@ zwei Fassungen wären zwei Wahrheiten, die auseinanderlaufen.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import pandas as pd
 
 #: Ab hier gilt ein Sprung der Faktorkurve als Befund und nicht als Rundung.
@@ -173,6 +175,125 @@ def klassifiziere(
     return pd.DataFrame({"f": f, "segment": segment, "seg_laenge": laenge, "art": art})
 
 
+#: Wie nah der wiedergewonnene Faktor an einem glatten Verhaeltnis liegen muss.
+#:
+#: **Ein Split ist n zu m mit kleinen ganzen Zahlen** — 2:1, 3:1, 3:2, 1:10.
+#: Kein Unternehmen splittet 1 zu 2,1. Das ist die zweite und schaerfere
+#: Bedingung, und sie ist noetig: die Kursprobe allein haette bei ``HON``
+#: 2002-10-15 einen „Split" von 1:2,1 erfunden, wo in Wahrheit ein
+#: Einheitenfehler sitzt (der Kurs vor dem Bruch steht bei 9,99 $, wo `HON` in
+#: Wirklichkeit um 22 $ handelte).
+#:
+#: 2 % lassen einer echten Aktion Luft — `J` 2001-05-18 kommt auf 1,9802 statt
+#: 2,0 — und lassen 1:2,1 (4,7 % von 1:2 entfernt) durchfallen.
+GLATT = 0.02
+
+#: Welche Verhaeltnisse ueberhaupt als Split gelten.
+#:
+#: **Nicht alle ``n/m``.** Mit Zaehler und Nenner bis 20 gibt es 400
+#: Kandidaten, die den Zahlenstrahl so dicht abdecken, dass fast jeder Wert
+#: innerhalb von 2 % einen trifft — `HON`s 0,4737 kam als 9:19 durch, und das
+#: ist kein Split, den je ein Unternehmen beschlossen hat.
+#:
+#: Echte Verhaeltnisse haben eine Form: **eine Seite ist 1** (2:1, 3:1, 1:10,
+#: 1:50) **oder beide sind klein** (3:2, 5:4, 5:2). Genau das steht hier.
+GLATT_EINSEITIG_MAX = 100
+GLATT_BEIDSEITIG_MAX = 5
+
+#: Wie genau der wiedergewonnene Faktor den Rohkursbruch erklaeren muss.
+#: Grosszuegig, weil am Aktionstag auch echte Kursbewegung dazukommt — ein
+#: 2:1-Split an einem Tag, an dem das Papier 3 % verliert, ergibt 0,485 statt
+#: 0,5. Eng genug, dass ein Faktor, der *nichts* erklaert, durchfaellt.
+ERKLAERT = 0.10
+
+
+def rekonstruiere_aktion(
+    f_vorher: float, f_nachher: float, close_vorher: float, close_nachher: float
+) -> float | None:
+    """Der Aktionsfaktor an einer Bruchstelle — oder ``None``, wenn er nicht passt.
+
+    **Warum das ueberhaupt geht.** An 52 Bruchstellen ueber 40 Papiere fehlt im
+    Aktionsfeed ein Eintrag, den es gegeben hat: ``J`` (Jacobs Engineering)
+    splittete am 2001-05-18 zwei zu eins, der Rohkurs halbierte sich von 144,17
+    auf 74,20 — und weder der Bulk-Feed noch EODHDs Einzelsymbol-Endpunkt
+    fuehren die Aktion. Ihr eigener ``adjusted_close`` kennt sie: die
+    Faktorkurve laeuft 0,096 → 0,190.
+
+    Ohne den Eintrag rechnet unsere Adjustierung den Split nicht heraus, und
+    die Halbierung erscheint als **echter Verlust von 49 %**. Das ist keine
+    Ungenauigkeit, sondern eine erfundene Rendite.
+
+    **Warum das kein Rueckfall auf ``adjusted_close`` ist.** Benutzt wird nicht
+    sein Niveau — das traegt Look-ahead, und genau deshalb rekonstruiert
+    ``bulk_read`` die Reihe aus den Aktionsfeeds. Benutzt wird der *Schritt an
+    einem Tag*, aus dem sich alle spaeteren Aktionen herauskuerzen. Gerechnet
+    wird weiter mit unserer eigenen Formel.
+
+    **Warum die Probe unverzichtbar ist.** Ein Sprung in ``adjusted_close``
+    allein koennte auch eine Naht zweier Ladelaeufe sein. Eine Naht bewegt aber
+    den **Rohkurs nicht** — deshalb wird der wiedergewonnene Faktor daran
+    gemessen: er muss den Kursbruch erklaeren. Tut er es nicht, gibt es keinen
+    Faktor, sondern eine Meldung.
+
+    Returns
+    -------
+    float | None
+        Der Split-Faktor im Tiingo-Sinn (2,0 fuer einen 2:1-Split), oder
+        ``None``, wenn er den Kursbruch nicht erklaert.
+    """
+    if not (f_vorher and f_nachher and close_vorher and close_nachher):
+        return None
+    # ratio = f_{t-1}/f_t ist der Tagesfaktor; day_ratio = 1/split, also
+    # split = 1/ratio = f_t/f_{t-1}.
+    ratio = f_vorher / f_nachher
+    if ratio <= 0:
+        return None
+    split = 1.0 / ratio
+    if split <= 0:
+        return None
+    # Erste Bedingung: mit dem Split zurueckgerechnet muss der Kurs stetig sein.
+    erwartet = close_nachher * split
+    if abs(erwartet / close_vorher - 1.0) > ERKLAERT:
+        return None
+    # Zweite Bedingung: ein Split ist ein glattes Verhaeltnis. Sie ist die
+    # schaerfere — siehe `GLATT`.
+    glatt = _naechstes_glattes_verhaeltnis(split)
+    if glatt is None:
+        return None
+    return glatt
+
+
+def _naechstes_glattes_verhaeltnis(wert: float) -> float | None:
+    """``n/m`` mit ``n, m <= GLATT_MAX``, wenn eines nah genug liegt.
+
+    Zurueckgegeben wird das **glatte** Verhaeltnis, nicht der gemessene Wert:
+    ein Split ist 2,0 und nicht 1,9802. Die 0,99 % Abweichung sind Kursbewegung
+    am Aktionstag, und sie gehoeren nicht in den Faktor.
+    """
+    if wert <= 0:
+        return None
+    bester, abstand = None, GLATT
+    for n, m in _glatte_verhaeltnisse():
+        kandidat = n / m
+        d = abs(wert / kandidat - 1.0)
+        if d < abstand:
+            bester, abstand = kandidat, d
+    return bester
+
+
+@lru_cache(maxsize=1)
+def _glatte_verhaeltnisse() -> tuple[tuple[int, int], ...]:
+    """Alle Verhaeltnisse, die als Corporate Action vorkommen. Siehe `GLATT_*`."""
+    aus: set[tuple[int, int]] = set()
+    for k in range(1, GLATT_EINSEITIG_MAX + 1):
+        aus.add((k, 1))
+        aus.add((1, k))
+    for n in range(1, GLATT_BEIDSEITIG_MAX + 1):
+        for m in range(1, GLATT_BEIDSEITIG_MAX + 1):
+            aus.add((n, m))
+    return tuple(sorted(aus))
+
+
 __all__ = [
     "AUSSCHLAG",
     "CLOSE_BRUCH",
@@ -180,6 +301,11 @@ __all__ = [
     "GLEICH",
     "SPRUNG",
     "STUFE",
+    "ERKLAERT",
+    "GLATT",
+    "GLATT_BEIDSEITIG_MAX",
+    "GLATT_EINSEITIG_MAX",
     "faktorkurve",
     "klassifiziere",
+    "rekonstruiere_aktion",
 ]
