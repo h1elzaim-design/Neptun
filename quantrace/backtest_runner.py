@@ -209,9 +209,34 @@ def _cost_inputs(
         np.array([table[str(s)].effective_slippage_bps for s in symbols], dtype=float)
         / 10_000.0
     )
+
+    # **Der Spread skaliert mit dem Kursniveau** (#323). Die Klassenzahl steht
+    # pro Symbol und gilt für den ganzen Backtest — richtig, solange das Papier
+    # auf normalem Niveau handelt. Fällt es auf zwei Zehntelcent, stimmt sie um
+    # Grössenordnungen nicht mehr: eine Bewegung von 0,0002 auf 0,0003 ist
+    # +50 % und dabei genau ein Tick.
+    #
+    # Gemessen am 2026-09-05: 0,5–0,7 % der Kurszellen tragen 99,7 % der
+    # Rendite, durchweg insolvente Papiere kurz vor dem Delisting.
+    # `buy_and_hold` kam über 2007–2012 auf CAGR +2.333 % bei 99 % Drawdown —
+    # beides zusammen gibt es nicht.
+    #
+    # Deshalb wird die Slippage hier **pro Zelle** statt pro Spalte: das
+    # Maximum aus der Klassenzahl und dem kleinstmöglichen Halbspread an
+    # diesem Kurs. Eine Untergrenze, also kann sie Kosten nur erhöhen.
+    from quantrace.costs import spread_untergrenze_bps
+
+    boden = spread_untergrenze_bps(close.to_numpy()) / 10_000.0
+    slippage_je_zelle = np.maximum(np.broadcast_to(slippage, boden.shape), boden)
+
     if isinstance(close, pd.Series):
-        # Einzel-Symbol: Skalare statt 1-Element-Arrays (vectorbt-Broadcasting).
-        fees, slippage = float(fees[0]), float(slippage[0])
+        # Einzel-Symbol: Skalar für die Fees, die Slippage bleibt zeitvariabel.
+        fees = float(fees[0])
+        slippage = pd.Series(slippage_je_zelle, index=close.index)
+    else:
+        slippage = pd.DataFrame(
+            slippage_je_zelle, index=close.index, columns=close.columns
+        )
 
     config = config.model_copy(update={"symbol_costs": dict(table)})
     return fees, slippage, config

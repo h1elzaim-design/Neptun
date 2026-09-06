@@ -31,6 +31,26 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+#: Ab welchem Anteil des Vortagsschlusses eine behauptete Ausschüttung gross
+#: genug ist, dass der Kurs am Ex-Tag darüber urteilen kann. Darunter
+#: entscheidet die Tagesvolatilität und nicht die Ausschüttung — eine
+#: 1-%-Dividende verschwindet im Rauschen.
+GROSSE_AUSSCHUETTUNG = 0.10
+
+#: Wieviel des behaupteten Rückgangs im Kurs **fehlen** darf, bevor der
+#: Eintrag als widerlegt gilt.
+#:
+#: Gemessen am 2026-09-06 über `us_top500_liquid`, 2000–2023, 55.080
+#: Dividendenereignisse: bei den **echten** grossen Ausschüttungen bleibt
+#: höchstens 4,8 Prozentpunkte unerklärt (`DF` 2007; `AABA` 2019 mit 51,50 $
+#: auf 70,80 $ liegt bei 0,3). Bei den widerlegten sind es mindestens 96.
+#: Dazwischen liegt so viel Luft, dass die genaue Zahl nicht entscheidet —
+#: 0,20 lässt der echten Seite das Vierfache ihres beobachteten Maximums.
+#:
+#: Nur **positiv**: ein stärkerer Rückgang als die Dividende ist an einem
+#: schlechten Markttag völlig normal und kein Befund.
+UNERKLAERT_MAX = 0.20
+
 RAW_COLUMNS = ["open", "high", "low", "close", "volume"]
 CORP_COLUMNS = ["divCash", "splitFactor"]
 ALL_RAW_COLUMNS = RAW_COLUMNS + CORP_COLUMNS
@@ -113,6 +133,31 @@ def adjust_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     div = df.get("divCash")
     div = pd.Series(0.0, index=df.index) if div is None else div.astype(float).fillna(0.0)
 
+    # **Was der Kurs am Ex-Tag dazu sagt** (#312). Eine Barausschüttung von
+    # x % des Kurses zeigt sich als Rückgang von ungefähr x %; eine erfundene
+    # zeigt sich gar nicht:
+    #
+    #   WY   2010-07-20  behauptet -160 %   16,52 → 15,94  =  -3,5 %   Müll
+    #   JNUG 2017-03-21  behauptet  -65 %    7,08 →  7,37  =  +4,1 %   Müll
+    #   MIL  2014-07-24  behauptet  -96 %    7,82 →  7,68  =  -1,8 %   Müll
+    #   AABA 2019-09-24  behauptet  -73 %   70,80 → 19,51  = -72,4 %   echt
+    #
+    # Der bestehende Guard oben fängt nur, wo das Vorzeichen kippt — gemessen
+    # 32 Ereignisse, während 1.888 still durchliefen. Diese Prüfung fängt die
+    # stillen: der Eintrag wird verworfen, **die Reihe bleibt**. Bei `JNUG`
+    # ist ein einziger Eintrag von 2017 kaputt und die übrigen zwanzig Jahre
+    # sind in Ordnung.
+    #
+    # Der Split muss heraus: an einem 2:1-Tag halbiert sich der Kurs ohne jede
+    # Ausschüttung.
+    quote = (div / prev_close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    bewegung = ((close / split) / prev_close - 1.0).fillna(0.0)
+    widerlegt = (quote > GROSSE_AUSSCHUETTUNG) & ((bewegung + quote) > UNERKLAERT_MAX)
+    verworfen: list[Any] = []
+    if bool(widerlegt.any()):
+        verworfen = list(df.index[widerlegt])
+        div = div.where(~widerlegt, 0.0)
+
     # Dividenden-Faktor der Aktion an Tag t (wirkt auf Tage < t). Erste Zeile hat
     # keinen Vortagsschluss → kein Faktor (1.0).
     div_factor = (1.0 - div / prev_close).replace([np.inf, -np.inf], np.nan).fillna(1.0)
@@ -121,6 +166,14 @@ def adjust_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
     # Siehe `UnadjustableActionError`: eine Dividende über dem Vortagsschluss
     # kippt jede frühere Zeile ins Negative. Lieber keine Reihe als eine mit
     # negativen Kursen.
+    #
+    # **Warum das jetzt das Netz ist und nicht mehr die Regel.** Bis zum
+    # 2026-09-06 stand dieser Guard vorn und warf bei `WY` die *ganze Reihe*
+    # weg — zwanzig Jahre Kurse wegen eines Eintrags von 2010. Die Kursprüfung
+    # oben entscheidet dieselben Fälle besser: sie verwirft den Eintrag und
+    # behält die Reihe. Was bis hierher kommt, hat sie nicht beurteilen können
+    # (kein Vortagsschluss, oder eine Ausschüttung unter der Grössenschwelle,
+    # die den Faktor trotzdem kippt), und dann bleibt es beim alten Urteil.
     schlecht = div_factor <= 0.0
     if bool(schlecht.any()):
         tage = list(df.index[schlecht])
@@ -147,4 +200,7 @@ def adjust_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
             out[col] = (df[col].astype(float) * price_factor).astype(float)
     if "volume" in df.columns:
         out["volume"] = (df["volume"].astype(float) * vol_factor).astype(float)
+    # Die verworfenen Aktionstage reisen am Ergebnis mit, nicht in einem Log.
+    # Eine Annahme, die man später nicht mehr ablesen kann, ist keine.
+    out.attrs["verworfene_aktionen"] = verworfen
     return out

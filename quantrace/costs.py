@@ -92,6 +92,55 @@ _LIQUIDITY_CLASSES: tuple[tuple[float, str], ...] = (
 )
 
 
+#: Mindestpreisschritte am US-Aktienmarkt — SEC Rule 612 („Sub-Penny Rule"):
+#: ein Cent ab 1,00 $, ein Hundertstelcent darunter. **Eine Marktregel, keine
+#: Annahme** — anders als jede bps-Zahl in `costs.yaml`.
+TICK_AB_EIN_DOLLAR = 0.01
+TICK_UNTER_EIN_DOLLAR = 0.0001
+
+
+def spread_untergrenze_bps(preis):
+    """Der kleinstmögliche Halbspread an diesem Kursniveau, in bps.
+
+    **Warum das gebraucht wird** (#323). Die Kostenklassen in `costs.yaml`
+    stehen in bps und gelten pro Symbol für den ganzen Backtest. Das ist
+    richtig, solange ein Papier auf normalem Kursniveau handelt. Fällt es auf
+    zwei Zehntelcent, stimmt die Zahl nicht mehr um Grössenordnungen: eine
+    Bewegung von 0,0002 auf 0,0003 ist **+50 %** und dabei genau ein Tick.
+
+    Gemessen am 2026-09-05 über `us_top500_liquid`: 0,5–0,7 % der Kurszellen
+    tragen 99,7 % der Rendite, und es sind durchweg insolvente Papiere kurz
+    vor dem Delisting. `buy_and_hold` kam über 2007–2012 auf **CAGR +2.333 %
+    bei 99 % Drawdown** — beides zusammen gibt es nicht, also hat keine der
+    beiden Zahlen gemessen, was sie behauptet.
+
+    Die Untergrenze trifft die Ursache statt des Symptoms und braucht keinen
+    gesetzten Grenzwert: der Tick ist vorgeschrieben, und wer über den Spread
+    handelt, zahlt mindestens einen halben davon.
+
+        Kurs      Tick       Halbspread   in bps
+        100,00 $  0,01 $     0,005 $         0,5
+          5,00 $  0,01 $     0,005 $        10
+          0,02 $  0,0001 $   0,00005 $      25
+          0,001 $ 0,0001 $   0,00005 $     500
+          0,0002 $ 0,0001 $  0,00005 $   2.500
+
+    **Sie ist eine Untergrenze und bleibt optimistisch.** Reale Spreads auf
+    solchen Papieren liegen weit darüber, und Market Impact kommt obendrauf.
+    Was sie belastbar macht, ist die Richtung: sie kann Kosten nur erhöhen,
+    nie senken — dieselbe Konvention wie bei `dollar_volume`.
+    """
+    import numpy as np
+
+    p = np.asarray(preis, dtype=float)
+    tick = np.where(p < 1.0, TICK_UNTER_EIN_DOLLAR, TICK_AB_EIN_DOLLAR)
+    # Nicht-positive Kurse gibt es im Lesepfad nicht mehr (#322/#324); käme
+    # doch einer durch, wäre eine unendliche Kostenzahl schlimmer als keine.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bps = (tick / 2.0) / p * 10_000.0
+    return np.where(np.isfinite(bps) & (p > 0), bps, 0.0)
+
+
 class UnpriceableError(ValueError):
     """Für diese Liquidität gibt es keine ehrliche bps-Zahl."""
 
@@ -184,7 +233,10 @@ def resolve_symbol_costs(
 
 __all__ = [
     "DEFAULT_COSTS_PATH",
+    "TICK_AB_EIN_DOLLAR",
+    "TICK_UNTER_EIN_DOLLAR",
     "UnpriceableError",
     "class_for_liquidity",
     "resolve_symbol_costs",
+    "spread_untergrenze_bps",
 ]

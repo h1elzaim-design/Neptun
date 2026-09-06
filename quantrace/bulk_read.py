@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
@@ -47,6 +48,7 @@ import pandas as pd
 
 from quantrace import storage
 from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
+from quantrace.einheiten import AUSSCHLAG, faktorkurve, klassifiziere
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
@@ -234,6 +236,73 @@ def _actions_window(prefix: str) -> tuple[date | None, date | None]:
     return (min(days), max(days)) if days else (None, None)
 
 
+#: Der zusammengefasste Feed neben den Tagespartitionen. Ein GET statt tausender.
+KONSOLIDIERT = "_konsolidiert.parquet"
+#: Welche Tage darin stecken. Ohne diese Liste ist ein Tag ohne Aktion nicht von
+#: einem Tag zu unterscheiden, den die Zusammenfassung nie gesehen hat — und
+#: „keine Dividende" als „nicht geladen" zu lesen (oder umgekehrt) ist genau die
+#: Sorte stiller Fehler, gegen die der ganze `Adjustment`-Apparat gebaut ist.
+KONSOLIDIERT_TAGE = "_konsolidiert_tage.parquet"
+
+
+def konsolidiert_pfade(prefix: str) -> tuple[str, str]:
+    """(Daten, Tagesliste) für den zusammengefassten Feed eines Prefix."""
+    return (
+        storage.cache_path(f"{prefix}/{KONSOLIDIERT}"),
+        storage.cache_path(f"{prefix}/{KONSOLIDIERT_TAGE}"),
+    )
+
+
+def schreibe_konsolidiert(prefix: str, daten: pd.DataFrame, tage: Sequence[date]) -> None:
+    """Schreibt Zusammenfassung und Tagesliste. Siehe `konsolidiere_actions`."""
+    pfad, tage_pfad = konsolidiert_pfade(prefix)
+    storage.write_parquet(daten, pfad)
+    storage.write_parquet(pd.DataFrame({"date": sorted(set(tage))}), tage_pfad)
+
+
+def _konsolidierte_tage(prefix: str) -> set[date] | None:
+    """Die abgedeckten Tage, oder ``None``, wenn es keine Zusammenfassung gibt."""
+    pfad, tage_pfad = konsolidiert_pfade(prefix)
+    if not storage.exists(pfad) or not storage.exists(tage_pfad):
+        return None
+    try:
+        df = storage.read_parquet(tage_pfad)
+    except Exception as exc:  # pragma: no cover - defekte Datei
+        # Eine kaputte Zusammenfassung darf nichts kosten ausser sich selbst.
+        log.warning("Zusammenfassung unter %s nicht lesbar: %s", prefix, exc)
+        return None
+    return {pd.Timestamp(d).date() for d in df["date"]}
+
+
+def _aus_konsolidiert(
+    prefix: str, codes: list[str], start: date, end: date, gebraucht: set[date]
+) -> pd.DataFrame | None:
+    """Aus der Zusammenfassung lesen — oder ``None``, wenn sie nicht reicht.
+
+    **Reicht** heisst: sie deckt *jeden* Tag ab, den der Partitionslauf lesen
+    würde. Eine teilweise Abdeckung stillschweigend zu benutzen hiesse,
+    Aktionen zu verlieren — und eine verlorene Dividende ist eine Rendite, die
+    im Backtest fehlt, ohne dass irgendwo etwas rot wird.
+    """
+    abgedeckt = _konsolidierte_tage(prefix)
+    if abgedeckt is None or not gebraucht <= abgedeckt:
+        return None
+    pfad, _ = konsolidiert_pfade(prefix)
+    con = storage._duckdb_conn()
+    try:
+        codes_ph = ",".join(["?"] * len(codes))
+        return con.execute(
+            f"SELECT * FROM read_parquet(?) "
+            f"WHERE code IN ({codes_ph}) AND date >= ? AND date <= ?",
+            [pfad, *codes, str(start), str(end)],
+        ).df()
+    except Exception as exc:  # pragma: no cover - defekte Datei
+        log.warning("Zusammenfassung unter %s nicht lesbar: %s", prefix, exc)
+        return None
+    finally:
+        con.close()
+
+
 def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.DataFrame:
     """Splits oder Dividenden für die Codes im Fenster. Leer, wenn nichts liegt.
 
@@ -257,6 +326,17 @@ def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.D
     im_fenster = [d for d in days if start <= d <= end]
     if not im_fenster:
         return pd.DataFrame()
+
+    # **Ein GET statt tausender, wenn die Zusammenfassung reicht.** Der Aufwand
+    # eines Actions-Reads ist reine Latenz: ein Zwanzig-Jahre-Fenster sind
+    # ~11.600 Einzel-GETs gegen R2, jeder mit 80-150 ms. Gemessen am
+    # 2026-09-06 an derselben Messung über 15 und über 1.924 Papiere — das
+    # Achtzigfache an Daten kostete nur das Zweieinhalbfache an Zeit, also
+    # dominiert der Fixkostenblock. Latenz faellt mit der Zahl der Anfragen,
+    # nicht mit der Bandbreite; mehr Mbit/s helfen hier nicht.
+    aus_zusammenfassung = _aus_konsolidiert(prefix, codes, start, end, set(im_fenster))
+    if aus_zusammenfassung is not None:
+        return aus_zusammenfassung
 
     pfade = [
         storage.cache_path(f"{prefix}/date={d.isoformat()}/data.parquet") for d in im_fenster
@@ -492,9 +572,43 @@ def _apply_actions(
 
     teile: list[pd.DataFrame] = []
     unadjustierbar: dict[str, str] = {}
+    #: Zeilen, die auf falscher Stückzahl standen: Instrument → Anzahl (#324).
+    einheiten_raus: dict[str, int] = {}
     for instrument, teil in prices.groupby("instrument", sort=True):
         teil = teil.sort_values("date").reset_index(drop=True)
         code = str(teil["code"].iloc[0])
+
+        # **Zeilen auf falscher Stückzahl fliegen raus, bevor adjustiert
+        # wird** (#324). `AAPL` fällt am 2003-01-07 um 98,2 % und steigt am
+        # 2003-01-10 um 5.453 % — beides hat nie stattgefunden. Die Zeile ist
+        # in sich plausibel (high > low, Kurse positiv, keine Nullen), falsch
+        # ist nur ihr Verhältnis zu den Nachbarn.
+        #
+        # Verworfen und nicht zurückgerechnet: dieselbe Begründung wie bei den
+        # Nullbars (#322). Der Lake stellt „kein Handel" als fehlende Zeile
+        # dar; eine Zeile in falschen Einheiten ist dieselbe Nicht-Beobachtung
+        # in schlechterer Schreibweise, und sie mit dem vermuteten Faktor
+        # zurückzurechnen hiesse, einen Handel zu behaupten, den niemand
+        # gesehen hat.
+        #
+        # Nur `ausschlag`, nicht `stufe`: eine Stufe heisst, dass im Feed eine
+        # Aktion fehlt — die Rohzeilen sind dort richtig, und sie zu verwerfen
+        # kostete halbe Historien.
+        if "adjusted_close" in teil.columns:
+            close_roh = teil["close"].astype(float)
+            kurve = faktorkurve(teil["adjusted_close"], close_roh)
+            if bool(kurve.notna().any()):
+                aktion = pd.Series(
+                    [(code, d) in split_map or (code, d) in div_map for d in teil["date"]],
+                    index=teil.index,
+                )
+                k = klassifiziere(kurve, aktion, close_roh)
+                schlecht = (k["art"] == AUSSCHLAG).to_numpy()
+                if schlecht.any():
+                    einheiten_raus[str(instrument)] = int(schlecht.sum())
+                    teil = teil.loc[~schlecht].reset_index(drop=True)
+                    if teil.empty:
+                        continue
         idx = pd.DatetimeIndex(pd.to_datetime(teil["date"]))
         # `.to_numpy()` ist hier Pflicht, nicht Stil: mit einem expliziten
         # `index` reindiziert pandas übergebene Series auf diesen Index — die
@@ -548,6 +662,14 @@ def _apply_actions(
                 neu[col] = adj[col].to_numpy()
         teile.append(neu)
 
+    if einheiten_raus:
+        log.warning(
+            "%d Instrument(e) mit Zeilen auf falscher Stückzahl — %d Zeilen "
+            "als Lücke gelesen statt als Kurs (#324): %s",
+            len(einheiten_raus),
+            sum(einheiten_raus.values()),
+            ", ".join(f"{i}: {n}" for i, n in sorted(einheiten_raus.items())[:10]),
+        )
     if unadjustierbar:
         log.warning(
             "%d Instrument(e) ohne adjustierbare Reihe: %s",

@@ -244,3 +244,178 @@ def test_old_config_json_without_cost_fields_parses():
     cfg = BacktestConfig.model_validate({"cash": 50_000.0, "fees_bps": 2.0, "slippage_bps": 5.0})
     assert cfg.cost_model == "flat"
     assert cfg.symbol_costs is None
+
+
+# --- Der Spread skaliert mit dem Kursniveau (#323) --------------------------------
+
+
+class TestSpreadUntergrenze:
+    """Die Tickgrösse ist eine Marktregel, keine Annahme.
+
+    **Der Anlass.** Gemessen am 2026-09-05 über `us_top500_liquid`: 0,5–0,7 %
+    der Kurszellen tragen 99,7 % der Rendite, und es sind durchweg insolvente
+    Papiere kurz vor dem Delisting. `buy_and_hold` kam über 2007–2012 auf
+    **CAGR +2.333 % bei 99 % Drawdown**. Beides zusammen gibt es nicht — also
+    hat keine der beiden Zahlen gemessen, was sie behauptet.
+
+    Die Kostenklassen stehen in bps pro Symbol und gelten für den ganzen
+    Backtest. Das stimmt, solange ein Papier auf normalem Niveau handelt.
+    Fällt es auf zwei Zehntelcent, ist eine Bewegung von 0,0002 auf 0,0003
+    **+50 %** und dabei genau ein Tick.
+
+    SEC Rule 612 schreibt die Mindestpreisschritte vor: ein Cent ab 1,00 $, ein
+    Hundertstelcent darunter. Wer über den Spread handelt, zahlt mindestens
+    einen halben davon. Das ist die eine Zahl in `costs.py`, die nicht
+    geschätzt ist — der Rest der Datei sagt selbst, dass er es ist.
+    """
+
+    @pytest.mark.parametrize(
+        "preis,erwartet_bps",
+        [
+            (100.0, 0.5),      # ein Tick ist hier bedeutungslos
+            (10.0, 5.0),
+            (5.0, 10.0),
+            (1.0, 50.0),       # genau an der Sub-Penny-Grenze
+            (0.02, 25.0),      # darunter gilt der kleinere Tick
+            (0.001, 500.0),
+            (0.0002, 2500.0),  # 25 % je Seite — und das ist die Untergrenze
+        ],
+    )
+    def test_die_gerechneten_stufen(self, preis, erwartet_bps):
+        from quantrace.costs import spread_untergrenze_bps
+
+        assert float(spread_untergrenze_bps(preis)) == pytest.approx(erwartet_bps)
+
+    def test_der_tickwechsel_sitzt_bei_einem_dollar(self):
+        """Ohne den Sprung wären Papiere knapp unter einem Dollar mit einem
+        Cent-Tick bepreist, den es dort nicht gibt."""
+        from quantrace.costs import spread_untergrenze_bps
+
+        assert float(spread_untergrenze_bps(0.999)) < float(spread_untergrenze_bps(1.001))
+        assert float(spread_untergrenze_bps(1.001)) == pytest.approx(49.95, rel=1e-3)
+
+    def test_sie_kann_kosten_nur_erhoehen(self):
+        """Dieselbe Konvention wie bei `dollar_volume`: was geschätzt ist, wird
+        so geschätzt, dass der Fehler gegen die Strategie läuft."""
+        import numpy as np
+
+        from quantrace.costs import spread_untergrenze_bps
+
+        assert (spread_untergrenze_bps(np.array([0.0001, 0.01, 1.0, 50.0, 5000.0])) >= 0).all()
+
+    def test_ein_nicht_positiver_kurs_ergibt_keine_unendlichkeit(self):
+        """Im Lesepfad gibt es die seit #322/#324 nicht mehr — käme doch einer
+        durch, wäre eine unendliche Kostenzahl schlimmer als keine."""
+        import numpy as np
+
+        from quantrace.costs import spread_untergrenze_bps
+
+        raus = spread_untergrenze_bps(np.array([0.0, -1.0, float("nan")]))
+        assert np.isfinite(raus).all() and (raus == 0.0).all()
+
+    def test_ein_ganzer_rahmen_geht_zellenweise_durch(self):
+        """Genau das ist der Unterschied zur Klassenzahl: die steht pro Symbol
+        fest, und ein Papier, das von 40 $ auf 2 Cent fällt, behält sie."""
+        import numpy as np
+
+        from quantrace.costs import spread_untergrenze_bps
+
+        rahmen = np.array([[40.0, 0.5], [4.0, 0.05], [0.02, 0.005]])
+        raus = spread_untergrenze_bps(rahmen)
+        assert raus.shape == rahmen.shape
+        assert raus[0, 0] < raus[2, 0], "je tiefer der Kurs, desto teurer"
+        assert raus[2, 0] == pytest.approx(25.0)
+
+
+class TestUntergrenzeImRunner:
+    """Sie muss beim Backtest ankommen, nicht nur richtig gerechnet sein."""
+
+    def _md(self, preise: list[list[float]]):
+        import pandas as pd
+
+        from quantrace.models import MarketData, Timeframe
+
+        idx = pd.date_range("2020-01-01", periods=len(preise), freq="B")
+        rahmen = pd.concat(
+            {
+                sym: pd.DataFrame(
+                    {"open": sp, "high": sp, "low": sp, "close": sp, "volume": [1e6] * len(sp)},
+                    index=idx,
+                )
+                for sym, sp in zip(("TEUER", "CENT"), zip(*preise, strict=True), strict=True)
+            },
+            axis=1,
+        )
+        rahmen.columns.names = ["symbol", "field"]
+        return MarketData(
+            universe="probe",
+            provider="eodhd",
+            symbols=["TEUER", "CENT"],
+            timeframe=Timeframe.DAILY,
+            start=idx[0].date(),
+            end=idx[-1].date(),
+            calendar="us_equity",
+            frame=rahmen,
+        )
+
+    def test_das_cent_papier_bekommt_mehr_slippage_als_das_teure(self):
+        from quantrace.backtest_runner import _cost_inputs
+
+        md = self._md([[100.0, 0.002]] * 5)
+        _fees, slippage, _cfg = _cost_inputs(
+            md.frame.xs("close", level="field", axis=1),
+            BacktestConfig(cost_model="per_asset_class"),
+            md,
+        )
+        assert slippage.shape == (5, 2), "pro Zelle, nicht pro Spalte"
+        assert slippage["CENT"].iloc[0] > slippage["TEUER"].iloc[0] * 100
+
+    def test_ein_papier_das_faellt_wird_unterwegs_teurer(self):
+        """Der eigentliche Punkt: die Klassenzahl steht fest, der Kurs nicht.
+
+        Ein Papier, das von 40 $ auf zwei Zehntelcent fällt, ist am Ende ein
+        anderes Instrument als am Anfang — und wurde bis heute so bepreist wie
+        am Anfang.
+        """
+        from quantrace.backtest_runner import _cost_inputs
+
+        md = self._md([[10.0, 40.0], [10.0, 4.0], [10.0, 0.4], [10.0, 0.0002]])
+        _f, slippage, _c = _cost_inputs(
+            md.frame.xs("close", level="field", axis=1),
+            BacktestConfig(cost_model="per_asset_class"),
+            md,
+        )
+        verlauf = slippage["CENT"].tolist()
+        assert verlauf[-1] > verlauf[0] * 1000, "am Boden ist es tausendfach teurer"
+        assert slippage["TEUER"].nunique() == 1, "ein stabiler Kurs, eine Zahl"
+
+    def test_unterhalb_eines_dollars_sinkt_die_untergrenze_wieder(self):
+        """Nicht monoton — und das ist die Regel, nicht ein Fehler.
+
+        SEC Rule 612 erlaubt unter 1,00 $ einen hundertfach kleineren Tick::
+
+            4,00 $  →  Tick 0,01 $     →  12,50 bps
+            0,40 $  →  Tick 0,0001 $   →   1,25 bps
+
+        Ein 40-Cent-Papier hat also einen *kleineren* Mindestspread als ein
+        4-Dollar-Papier. Wer hier Monotonie erwartet, hat die Marktregel durch
+        eine Intuition ersetzt — und genau das soll diese Datei verhindern.
+
+        Der Steilanstieg kommt erst darunter: bei 0,0002 $ sind es 2.500 bps.
+        """
+        from quantrace.costs import spread_untergrenze_bps
+
+        assert float(spread_untergrenze_bps(4.0)) == pytest.approx(12.5)
+        assert float(spread_untergrenze_bps(0.4)) == pytest.approx(1.25)
+        assert float(spread_untergrenze_bps(0.0002)) == pytest.approx(2500.0)
+
+    def test_flat_bleibt_flat(self):
+        """`cost_model="flat"` reproduziert weiter exakt das alte Verhalten —
+        sonst wäre jeder Altvergleich stillschweigend kaputt."""
+        from quantrace.backtest_runner import _cost_inputs
+
+        md = self._md([[100.0, 0.002]] * 3)
+        fees, slippage, _c = _cost_inputs(
+            md.frame.xs("close", level="field", axis=1), BacktestConfig(cost_model="flat"), md
+        )
+        assert isinstance(fees, float) and isinstance(slippage, float)
