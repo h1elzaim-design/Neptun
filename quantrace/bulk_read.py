@@ -48,6 +48,7 @@ import pandas as pd
 
 from quantrace import storage
 from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
+from quantrace.befunde import Befund, lade_entscheidungen
 from quantrace.einheiten import AUSSCHLAG, faktorkurve, klassifiziere
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
@@ -531,6 +532,19 @@ def read_instruments(
     return angewandt, info
 
 
+#: Die Befunde des letzten `_apply_actions`-Laufs. Bewusst ein Modulzustand
+#: und kein Rückgabewert: `read_instruments` hat einen festen Vertrag
+#: ``(frame, Adjustment)``, den ein Scan-Skript nicht ändern soll — und
+#: `Adjustment` ist frozen, damit niemand die Ehrlichkeitsauskunft
+#: nachträglich umschreibt. Wer die Befunde will, holt sie hier ab.
+_letzte_befunde: list[Befund] = []
+
+
+def letzte_befunde() -> list[Befund]:
+    """Was der letzte Lesevorgang gemeldet hat. Siehe `_letzte_befunde`."""
+    return list(_letzte_befunde)
+
+
 def _apply_actions(
     prices: pd.DataFrame, splits: pd.DataFrame, divs: pd.DataFrame
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -574,6 +588,14 @@ def _apply_actions(
     unadjustierbar: dict[str, str] = {}
     #: Zeilen, die auf falscher Stückzahl standen: Instrument → Anzahl (#324).
     einheiten_raus: dict[str, int] = {}
+    #: Alles, was auffiel — ohne Urteil darüber, was es bedeutet (#327).
+    #: Der Lesepfad **meldet**; entschieden wird in `data/corrections/`.
+    befunde: list[Befund] = []
+
+    # Die Entscheidungen werden einmal gelesen, nicht je Instrument: es sind
+    # Dutzende Einträge, und ein YAML-Read je Papier wäre bei 1.934 Papieren
+    # der teuerste Teil dieser Funktion.
+    entscheidungen = lade_entscheidungen()
     for instrument, teil in prices.groupby("instrument", sort=True):
         teil = teil.sort_values("date").reset_index(drop=True)
         code = str(teil["code"].iloc[0])
@@ -603,7 +625,52 @@ def _apply_actions(
                     index=teil.index,
                 )
                 k = klassifiziere(kurve, aktion, close_roh)
+                # **Melden, bevor gehandelt wird.** Jede Auffälligkeit geht
+                # ins Register — auch die, die der Lesepfad selbst behandelt.
+                # Wer später fragt „warum fehlt dort eine Zeile", findet die
+                # Antwort im Bericht statt im Log von damals.
+                for pos in range(len(k)):
+                    art = k["art"].iloc[pos]
+                    if not art:
+                        continue
+                    if pos and k["art"].iloc[pos - 1] == art:
+                        continue  # nur der Beginn eines Abschnitts
+                    befunde.append(
+                        Befund(
+                            instrument=str(instrument),
+                            code=code,
+                            tag=teil["date"].iloc[pos],
+                            art=f"einheiten_{art}",
+                            belege={
+                                "f_vorher": float(kurve.iloc[pos - 1]) if pos else None,
+                                "f": float(kurve.iloc[pos]),
+                                "close_vorher": float(close_roh.iloc[pos - 1])
+                                if pos
+                                else None,
+                                "close": float(close_roh.iloc[pos]),
+                                "n_zeilen": int((k["art"] == art).sum()),
+                            },
+                        )
+                    )
+
+                # **Entschiedenes hat Vorrang vor Automatik.** Ein Eintrag in
+                # `data/corrections/` ist von jemandem angesehen worden; die
+                # Klassifikation ist es nicht.
                 schlecht = (k["art"] == AUSSCHLAG).to_numpy()
+                for pos, tag in enumerate(teil["date"]):
+                    e = entscheidungen.get(f"{code}@{tag.isoformat()}")
+                    if e is None:
+                        continue
+                    if e.was == "verwerfen":
+                        schlecht[pos] = True
+                    elif e.was == "aktion" and e.faktor:
+                        split_map[(code, tag)] = (
+                            split_map.get((code, tag), 1.0) * e.faktor
+                        )
+                        schlecht[pos] = False
+                    elif e.was == "akzeptieren":
+                        schlecht[pos] = False
+
                 if schlecht.any():
                     einheiten_raus[str(instrument)] = int(schlecht.sum())
                     teil = teil.loc[~schlecht].reset_index(drop=True)
@@ -677,6 +744,8 @@ def _apply_actions(
             ", ".join(sorted(unadjustierbar)[:10]),
         )
     frame = pd.concat(teile, ignore_index=True) if teile else prices.iloc[0:0]
+    _letzte_befunde.clear()
+    _letzte_befunde.extend(befunde)
     return frame, unadjustierbar
 
 

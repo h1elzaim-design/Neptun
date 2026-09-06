@@ -104,7 +104,15 @@ def faktorkurve(adjusted_close: pd.Series, close: pd.Series) -> pd.Series:
     """
     a = adjusted_close.astype(float)
     c = close.astype(float)
-    brauchbar = (a > 0) & (c > 0) & (a != EODHD_NULL_PRICE_SENTINEL)
+    # Der Platzhalter steht in **beiden** Spalten. Am 2026-09-06 an `FTI`
+    # 2001-06-15 gesehen: dort ist `close` selbst 999999,9999, und der
+    # Befund meldete einen Kursbruch von 999.999 auf 21,85.
+    brauchbar = (
+        (a > 0)
+        & (c > 0)
+        & (a != EODHD_NULL_PRICE_SENTINEL)
+        & (c != EODHD_NULL_PRICE_SENTINEL)
+    )
     return (a / c).where(brauchbar)
 
 
