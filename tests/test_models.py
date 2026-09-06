@@ -117,6 +117,58 @@ def test_coverage_zaehlt_fehlende_symbole_mit(synthetic_md):
     assert "XLRE" in (cov.shortfall() or "")
 
 
+def test_coverage_traegt_den_ausschluss_ins_ergebnis(synthetic_md):
+    """Ein verworfenes Symbol gehört ins JSON, nicht nur in den CLI-Ausdruck.
+
+    Seit #322 wirft ein kaputter Bar ein Symbol statt des Universums heraus,
+    und seit #312 tut ein defekter Aktionseintrag dasselbe. Beides ist genau
+    die Art von Auskunft, für die `DataCoverage` gebaut wurde: gerechnet wurde
+    auf weniger als angefordert, und wer die Zahl später liest, muss das sehen
+    können — ohne das Log von damals.
+    """
+    md = synthetic_md.model_copy(
+        update={"unusable_symbols": {"PNLYY": "high_lt_low: 1 Bars mit high < low"}}
+    )
+    cov = md.coverage
+
+    assert not cov.complete
+    assert cov.unusable_symbols == {"PNLYY": "high_lt_low: 1 Bars mit high < low"}
+    fehlt = cov.shortfall() or ""
+    assert "PNLYY" in fehlt
+    assert "high_lt_low" in fehlt, "mit Grund — ein Name allein schickt in den Lake"
+
+
+def test_coverage_zaehlt_verworfene_zur_anforderung(synthetic_md):
+    """Sonst schrumpft die Anforderung still mit jedem Ausschluss.
+
+    Ein verworfenes Symbol steht weder in `symbols` noch in `missing_symbols`.
+    Ohne den dritten Summanden läse sich der Lauf als „950 von 950" — und
+    hätte über ein Papier hinweggelesen, das da war und verworfen wurde.
+    """
+    md = synthetic_md.model_copy(update={"unusable_symbols": {"PNLYY": "high_lt_low"}})
+
+    assert md.coverage.n_symbols_requested == len(synthetic_md.symbols) + 1
+    assert md.coverage.n_symbols_loaded == len(synthetic_md.symbols)
+
+
+def test_die_beiden_luecken_werden_nicht_vermischt(synthetic_md):
+    """„Nie geladen" und „geladen und verworfen" bleiben getrennte Zeilen.
+
+    In einen Topf geworfen wäre keine der beiden Auskünfte noch etwas wert:
+    die eine schickt in den Lake, die andere in den Actions-Feed.
+    """
+    md = synthetic_md.model_copy(
+        update={"missing_symbols": ["XLRE"], "unusable_symbols": {"WY": "unadjustable_action"}}
+    )
+    cov = md.coverage
+
+    assert cov.missing_symbols == ["XLRE"]
+    assert "XLRE" not in cov.unusable_symbols
+    assert cov.n_symbols_requested == len(synthetic_md.symbols) + 2
+    fehlt = cov.shortfall() or ""
+    assert "ohne Daten" in fehlt and "verworfen" in fehlt
+
+
 def test_coverage_schweigt_wenn_alles_da_ist(synthetic_md):
     """`shortfall()` ist keine Statuszeile, sondern ein Vorbehalt — ohne
     Vorbehalt gibt es nichts zu sagen."""

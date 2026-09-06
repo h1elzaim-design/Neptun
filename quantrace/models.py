@@ -66,6 +66,13 @@ class DataCoverage(BaseModel):
     ``missing_symbols`` gehört dazu, weil es dieselbe Art von Lücke ist: ein
     Universum aus 16 ETFs, von denen 15 Daten haben, ist ein anderes Universum
     — und XLRE fehlte in genau dem Lauf, der oben gemeint ist.
+
+    ``unusable_symbols`` steht daneben und **nicht** darin: „nie geladen" und
+    „geladen und verworfen" sehen in einer Symbolliste gleich aus und bedeuten
+    Verschiedenes. Das eine ist eine Lücke im Lake und normal; das andere ist
+    ein Datenfehler mit Namen und Grund, und er stellt oft mehr in Frage als
+    das eine Papier — ein defekter Aktionseintrag zeigt auf denselben Feed,
+    aus dem auch die übrigen adjustiert wurden.
     """
 
     requested_start: date
@@ -74,6 +81,11 @@ class DataCoverage(BaseModel):
     actual_end: date
     #: Symbole des Universums, für die im Fenster **keine** Daten lagen.
     missing_symbols: list[str] = Field(default_factory=list)
+    #: Symbole, die geladen und wegen eines Datenfehlers verworfen wurden:
+    #: Symbol → Befund (#312, #322). Bis zum 2026-09-06 endete diese Auskunft
+    #: im CLI-Ausdruck; im Ergebnis-JSON stand sie nicht, und damit war sie am
+    #: Tag danach weg.
+    unusable_symbols: dict[str, str] = Field(default_factory=dict)
     n_symbols_requested: int = 0
     n_symbols_loaded: int = 0
 
@@ -87,8 +99,18 @@ class DataCoverage(BaseModel):
 
     @property
     def complete(self) -> bool:
-        """Alles da: volles Fenster **und** alle Symbole."""
-        return not (self.truncated_start or self.truncated_end or self.missing_symbols)
+        """Alles da: volles Fenster **und** alle Symbole.
+
+        Ein verworfenes Symbol zählt hier wie ein fehlendes. Gerechnet wurde
+        ohne es, und das ist die Frage, die diese Eigenschaft beantwortet —
+        *warum* es fehlt, sagt ``shortfall()``.
+        """
+        return not (
+            self.truncated_start
+            or self.truncated_end
+            or self.missing_symbols
+            or self.unusable_symbols
+        )
 
     def shortfall(self) -> str | None:
         """Ein Satz für Log, CLI, Note und UI — oder ``None``, wenn nichts fehlt.
@@ -116,6 +138,16 @@ class DataCoverage(BaseModel):
             teile.append(
                 f"{len(self.missing_symbols)} von {self.n_symbols_requested} Symbolen "
                 f"ohne Daten: {', '.join(self.missing_symbols)}"
+            )
+        if self.unusable_symbols:
+            # Mit Grund, nicht bloss mit Namen: „AAA fehlt" führt zur Suche im
+            # Lake, „AAA: high < low" zur richtigen Stelle im Feed.
+            benannt = "; ".join(f"{s} ({g})" for s, g in sorted(self.unusable_symbols.items())[:5])
+            rest = len(self.unusable_symbols) - 5
+            teile.append(
+                f"{len(self.unusable_symbols)} von {self.n_symbols_requested} Symbolen "
+                f"wegen Datenfehlern verworfen: {benannt}"
+                + (f" … und {rest} weitere" if rest > 0 else "")
             )
         return "Gerechnet wurde auf weniger als angefordert — " + "; ".join(teile) + "."
 
@@ -208,7 +240,14 @@ class MarketData(BaseModel):
             actual_start=self.frame.index[0].date(),
             actual_end=self.frame.index[-1].date(),
             missing_symbols=list(self.missing_symbols),
-            n_symbols_requested=len(self.symbols) + len(self.missing_symbols),
+            unusable_symbols=dict(self.unusable_symbols),
+            # **Verworfene zählen zur Anforderung.** Sie stehen weder in
+            # `symbols` noch in `missing_symbols` — ohne den dritten Summanden
+            # schrumpfte die angeforderte Zahl still mit jedem Ausschluss, und
+            # „950 von 950" hätte über ein Papier hinweggelesen, das da war.
+            n_symbols_requested=(
+                len(self.symbols) + len(self.missing_symbols) + len(self.unusable_symbols)
+            ),
             n_symbols_loaded=len(self.symbols),
         )
 

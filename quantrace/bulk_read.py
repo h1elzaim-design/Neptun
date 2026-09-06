@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 import pandas as pd
@@ -162,6 +162,16 @@ class Adjustment:
     requested_to: date | None = None
     n_splits: int = 0
     n_dividends: int = 0
+    #: Instrumente, deren Reihe wegen eines defekten Aktionseintrags **ganz**
+    #: verworfen wurde: Code → Begründung (#312).
+    #:
+    #: Bis zum 2026-09-06 stand das nur in einer Log-Zeile. Wer das Ergebnis
+    #: später las, sah ein Symbol, das im Universum steht und keine Kurse hat —
+    #: ununterscheidbar von einem, das im Fenster nie gehandelt hat. Genau die
+    #: Unterscheidung ist der Punkt: „nie geladen" ist eine Lücke im Lake,
+    #: „geladen und verworfen" ein Datenfehler mit Namen und Grund.
+    #: Schlüssel ist das **Instrument** (``code.WY.US.s1``), nicht der Ticker.
+    unadjustable: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_total_return(self) -> bool:
@@ -418,6 +428,13 @@ def read_instruments(
     von = max([d for d in (s_von, d_von) if d is not None])
     bis = min([d for d in (s_bis, d_bis) if d is not None])
     voll = von <= start and bis >= end
+
+    # **Erst adjustieren, dann die Auskunft bauen.** `Adjustment` ist frozen,
+    # und das soll es bleiben: eine Ehrlichkeitsauskunft, die der Aufrufer
+    # nachträglich umschreiben kann, ist keine. Also muss der Ausschluss
+    # vorliegen, bevor das Objekt entsteht.
+    angewandt, unadjustierbar = _apply_actions(prices, splits, divs)
+
     info = Adjustment(
         status="full" if voll else "partial",
         covered_from=von,
@@ -426,17 +443,21 @@ def read_instruments(
         requested_to=end,
         n_splits=int(len(splits)),
         n_dividends=int(len(divs)),
+        unadjustable=unadjustierbar,
     )
     if not voll:
         log.warning("%s", info.warning())
 
-    return _apply_actions(prices, splits, divs), info
+    return angewandt, info
 
 
 def _apply_actions(
     prices: pd.DataFrame, splits: pd.DataFrame, divs: pd.DataFrame
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, str]]:
     """Baut je Instrument ``divCash``/``splitFactor`` und adjustiert **die Kurse**.
+
+    Gibt neben dem Frame die verworfenen Instrumente zurück (Code → Grund) —
+    siehe ``Adjustment.unadjustable``.
 
     Die beiden Spaltennamen sind Tiingo-Vokabular — bewusst übernommen, damit
     ``adjust.adjust_ohlcv`` unverändert weiterbenutzt wird. Eine zweite
@@ -470,8 +491,8 @@ def _apply_actions(
             div_map[(str(row.code), tag)] = float(betrag)
 
     teile: list[pd.DataFrame] = []
-    unadjustierbar: list[str] = []
-    for _instrument, teil in prices.groupby("instrument", sort=True):
+    unadjustierbar: dict[str, str] = {}
+    for instrument, teil in prices.groupby("instrument", sort=True):
         teil = teil.sort_values("date").reset_index(drop=True)
         code = str(teil["code"].iloc[0])
         idx = pd.DatetimeIndex(pd.to_datetime(teil["date"]))
@@ -514,7 +535,11 @@ def _apply_actions(
             # eine halb adjustierte Reihe wäre wieder etwas, das aussieht wie
             # ein Total Return und keiner ist.
             log.warning("%s: nicht adjustierbar, fällt heraus — %s", code, exc)
-            unadjustierbar.append(code)
+            # **Schlüssel ist das Instrument, nicht der Code.** Ein Ticker
+            # kann im Lake mehrere Segmente haben (`code.WY.US.s1`, `…s2`),
+            # und verworfen wird immer genau eines. Der Code steht in der
+            # Begründung, damit die Meldung trotzdem lesbar bleibt.
+            unadjustierbar[str(instrument)] = f"unadjustable_action [{code}]: {exc}"
             continue
         adj = adj.reset_index(drop=True)
         neu = teil.copy()
@@ -529,7 +554,8 @@ def _apply_actions(
             len(unadjustierbar),
             ", ".join(sorted(unadjustierbar)[:10]),
         )
-    return pd.concat(teile, ignore_index=True) if teile else prices.iloc[0:0]
+    frame = pd.concat(teile, ignore_index=True) if teile else prices.iloc[0:0]
+    return frame, unadjustierbar
 
 
 __all__ = ["Adjustment", "read_instruments"]

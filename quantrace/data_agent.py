@@ -337,6 +337,15 @@ def _load_via_bulk(
     )
     report.log()
     unbrauchbar = _unbrauchbare_symbole(report)
+    # **Der Adjustierungs-Ausschluss gehört in dieselbe Liste** (#312). Ein
+    # Instrument, dessen Aktionseintrag keinen positiven Preisfaktor ergibt,
+    # fällt in `bulk_read._apply_actions` heraus — bis hierher kam davon nur
+    # eine Log-Zeile an, und im Ergebnis sah das Symbol aus wie eines, das im
+    # Fenster nie gehandelt hat. Es ist das Gegenteil: es hat gehandelt, und
+    # die Reihe ist unbrauchbar. Zurückübersetzt auf den Universumsnamen,
+    # weil `unadjustable` auf Instrumente schlüsselt.
+    for instrument, grund in info.unadjustable.items():
+        unbrauchbar.setdefault(rueckwaerts.get(str(instrument), str(instrument)), grund)
     if unbrauchbar:
         for sym in unbrauchbar:
             per_out.pop(sym, None)
