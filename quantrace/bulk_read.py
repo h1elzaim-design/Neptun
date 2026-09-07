@@ -55,9 +55,15 @@ from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
 log = logging.getLogger(__name__)
 
-#: Ab hier ist ein Actions-Read (ein GET je Tagespartition, zwei Feeds) auf
-#: Herokus 30s-Router-Timeout nicht mehr verlässlich verlassbar — gemessen,
-#: nicht geraten (siehe `read_instruments`). ~8 Jahre lassen komfortabel Luft.
+#: Ab hier ist ein Actions-Read **über die Tagespartitionen** (ein GET je Tag,
+#: zwei Feeds) auf Herokus 30s-Router-Timeout nicht mehr verlässlich —
+#: gemessen, nicht geraten. ~8 Jahre lassen komfortabel Luft.
+#:
+#: **Gilt nur noch für den Partitionsweg.** Liegt eine Zusammenfassung, die das
+#: Fenster abdeckt, kostet derselbe Read einen GET: nachgemessen am 2026-09-06
+#: für `us_top500_liquid` über 2000–2023 — Splits 353 s → 5,8 s, Dividenden
+#: 852 s → 13,0 s, und 20 Symbole über 23 Jahre voll adjustiert in 6,1 s. Dann
+#: schützt die Grenze nichts mehr und kostet die Adjustierung.
 _DEFAULT_MAX_ADJUST_WINDOW_DAYS = 3000
 
 
@@ -304,6 +310,28 @@ def _aus_konsolidiert(
         con.close()
 
 
+def _zusammenfassung_deckt(start: date, end: date) -> bool:
+    """Decken **beide** Actions-Zusammenfassungen dieses Fenster ab?
+
+    Beide, nicht eine: fehlt die Splitseite, läuft der Read wieder über die
+    Tagespartitionen und dauert Minuten. Eine halbe Beschleunigung reicht
+    nicht, um die Grenze aufzuheben, die genau davor schützt.
+
+    Gefragt wird nach denselben Tagen, die `_read_actions` lesen würde — nicht
+    nach dem Kalenderfenster. Ein Feed, der an einem Tag keine Partition hat,
+    kann sie auch nicht in der Zusammenfassung haben.
+    """
+    for prefix in (US_SPLITS_PREFIX, US_DIVIDENDS_PREFIX):
+        tage = storage.list_day_partitions(prefix)
+        gebraucht = {d for d in tage if start <= d <= end}
+        if not gebraucht:
+            continue  # nichts zu lesen — kein Grund für die Bremse
+        abgedeckt = _konsolidierte_tage(prefix)
+        if abgedeckt is None or not gebraucht <= abgedeckt:
+            return False
+    return True
+
+
 def _read_actions(prefix: str, codes: list[str], start: date, end: date) -> pd.DataFrame:
     """Splits oder Dividenden für die Codes im Fenster. Leer, wenn nichts liegt.
 
@@ -464,7 +492,13 @@ def read_instruments(
     if not adjust:
         return prices, Adjustment(status="none")
 
-    grenze = _max_adjust_window_days()
+    # **Die Grenze gilt nur, wo sie noch etwas schützt.** Sie war gegen den
+    # Partitionsweg gebaut (~11.600 GETs für zwanzig Jahre); mit einer
+    # Zusammenfassung, die das Fenster abdeckt, ist derselbe Read ein GET.
+    # Sie stehen zu lassen hiesse, für einen Timeout zu bezahlen, den es nicht
+    # mehr gibt — und der Preis sind **rohe** Kurse, auf denen kein Backtest
+    # laufen darf.
+    grenze = 0 if _zusammenfassung_deckt(start, end) else _max_adjust_window_days()
     if grenze and (end - start).days > grenze:
         # Ein Actions-Read ist ein GET je Tagespartition (~80-150ms, R2 kennt
         # keine größere Einheit). Gemessen: 3.452 Tage (17 Jahre AAPL) brauchen
