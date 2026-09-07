@@ -51,6 +51,7 @@ from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
 from quantrace.befunde import Befund, lade_entscheidungen
 from quantrace.einheiten import AUSSCHLAG, faktorkurve, klassifiziere
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
+from quantrace.invarianten import pruefe as invarianten_pruefen
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
 log = logging.getLogger(__name__)
@@ -659,6 +660,13 @@ def _apply_actions(
                     index=teil.index,
                 )
                 k = klassifiziere(kurve, aktion, close_roh)
+                # Die Invariantenliste — Felder gegeneinander statt jede
+                # Zeile für sich (#333). Sie läuft **vor** der Klassifikation
+                # und unabhängig davon: `DIC` trägt denselben Fehler in beiden
+                # Kursspalten, also bewegt sich die Faktorkurve nie und der
+                # Einheiten-Detektor ist dort blind.
+                befunde.extend(invarianten_pruefen(teil, str(instrument), code))
+
                 # **Melden, bevor gehandelt wird.** Jede Auffälligkeit geht
                 # ins Register — auch die, die der Lesepfad selbst behandelt.
                 # Wer später fragt „warum fehlt dort eine Zeile", findet die
