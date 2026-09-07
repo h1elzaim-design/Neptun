@@ -1449,6 +1449,19 @@ def _epochen_name(code: str, n: int) -> str:
     return f"{code}__S{n}"
 
 
+class EmptyManifestError(RuntimeError):
+    """Die Instrumentenkarte ist leer — das ist keine Aussage über das Universum.
+
+    Ohne Karte löst kein Kürzel auf, jede Mitgliedschaftsperiode wird leer, und
+    ``Membership`` meldet „Periode ab … enthält kein Symbol — eher ist die
+    Regel zu eng oder der Lake zu dünn". Das schickt in die Daten, obwohl die
+    Ursache in der Konfiguration liegt.
+
+    Eigener Typ und keine ``ValueError``: Aufrufer, die ein zu enges Universum
+    abfangen wollen, sollen diesen Fall **nicht** mitfangen.
+    """
+
+
 def resolve_membership(
     perioden: Sequence[tuple[date, date, Sequence[str]]],
     *,
@@ -1478,6 +1491,32 @@ def resolve_membership(
     Von 1.934 Tickern traf das am 2026-09-01 sechs.
     """
     man = read_manifest() if manifest is None else manifest
+
+    # **Eine leere Karte ist kein leeres Universum.** Ohne diesen Guard
+    # löst nichts auf, jede Periode wird leer, und `Membership` meldet
+    # „Periode ab 2000-01-03 enthält kein Symbol — eher ist die Regel zu eng
+    # oder der Lake zu dünn". Beides stimmt dann nicht: es fehlt die Karte.
+    #
+    # Am 2026-09-07 hat genau das eine Viertelstunde gekostet: die CLI lud
+    # `.env` nicht (anders als jedes Skript unter `scripts/`), also war kein
+    # R2-Zugang gesetzt, `read_manifest()` gab einen leeren Frame zurück — und
+    # die Meldung schickte in die Daten statt in die Konfiguration. Die CLI
+    # lädt `.env` seitdem; ein Netzaussetzer sieht hier aber weiterhin genauso
+    # aus wie eine fehlende Karte, und deshalb bleibt der Guard.
+    #
+    # Derselbe Fehlertyp wie überall sonst in diesem Projekt: **unbekannt als
+    # leer gemeldet.** `DataCoverage` unterscheidet es (#307), das
+    # Befund-Register unterscheidet es (#327), hier fehlte es.
+    if man.empty:
+        raise EmptyManifestError(
+            "Die Instrumentenkarte (Schicht 2) ist leer — das ist etwas "
+            "anderes als ein leeres Universum. Entweder wurde sie nie gebaut "
+            "(`python scripts/build_resolved.py`), oder der Lake ist nicht "
+            f"erreichbar: QUANTRACE_DATA_LAKE={storage.lake_description()[0]}. "
+            "Prüf die Zugangsdaten (`.env`: R2_ENDPOINT_URL, AWS_ACCESS_KEY_ID, "
+            "AWS_SECRET_ACCESS_KEY) — ein Netzaussetzer sieht hier genauso aus "
+            "wie eine fehlende Karte."
+        )
 
     # **Einmal auf die Kürzel des Universums eindampfen.** `resolve_symbols`
     # filtert je Aufruf das ganze Manifest; bei 42 Stichtagen gegen 87.249

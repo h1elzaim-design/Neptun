@@ -27,6 +27,35 @@ from quantrace.sweep import SweepResult
 from quantrace.sweep import sweep as run_sweep
 from quantrace.walk_forward import walk_forward as run_walk_forward
 
+#: Wo `.env` liegt — neben dem Repo, nicht neben dem Arbeitsverzeichnis.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env_laden() -> None:
+    """``.env`` einlesen, ohne bestehende Variablen zu überschreiben.
+
+    **Warum das hier fehlte und was es gekostet hat.** Jedes Skript unter
+    ``scripts/`` lädt ``.env`` selbst; die CLI tat es nicht. Ohne R2-Zugang gibt
+    ``resolve.read_manifest()`` einen leeren Frame zurück, keine
+    Mitgliedschaftsperiode löst auf, und die Meldung lautet „Periode ab
+    2000-01-03 enthält kein Symbol — eher ist die Regel zu eng oder der Lake zu
+    dünn". Am 2026-09-07 hat mich genau das eine Viertelstunde in die falsche
+    Richtung geschickt: die Regel war richtig, der Lake war voll, es fehlten
+    Zugangsdaten.
+
+    ``override=False`` ist wichtig: eine bereits gesetzte Variable gewinnt.
+    Sonst überschriebe eine Datei im Repo, was jemand bewusst für **einen**
+    Aufruf gesetzt hat — etwa ``QUANTRACE_DATA_LAKE`` auf ein Testverzeichnis.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - dotenv ist optional
+        return
+    load_dotenv(_REPO_ROOT / ".env", override=False)
+
+
+_env_laden()
+
 app = typer.Typer(help="QuantRace — Trading Research CLI")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
