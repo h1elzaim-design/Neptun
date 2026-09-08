@@ -224,24 +224,44 @@ def all_findings(
 ) -> list[CurrencyFinding]:
     """Automatisch aufgeloeste und von Hand belegte Befunde, zusammengefuehrt.
 
-    **Das Automatische gewinnt.** Es steht auf EODHDs eigener Symbolliste einer
-    Boerse, an der das Papier wirklich notiert; ein Handeintrag ist eine
-    Ableitung aus dem Firmennamen. Wo beide etwas sagen, ist die Quelle die
-    bessere Auskunft — und ein Widerspruch gehoert ins Log, weil dann einer
-    von beiden falsch ist.
+    **Bei Widerspruch gewinnt der belegte Handeintrag.**
+
+    Die frühere Regel war umgekehrt, mit der Begründung, die Börsenliste sei
+    „EODHDs eigene Symbolliste einer Börse, an der das Papier wirklich
+    notiert". Am 2026-09-08 an ``HVN`` widerlegt::
+
+        Boersenliste          AUD   Harvey Norman Holdings, ASX
+        foreign_listings.yaml VND   Vietnam Airlines, HOSE
+        Kurse im Lake               17.800 … 45.000, Median 27.000
+
+    Harvey Norman notiert bei 2 bis 6 AUD. Was im US-Bulk unter ``HVN`` steht,
+    ist Vietnam Airlines — die Handliste hatte recht.
+
+    **Der Denkfehler steckte im Wort „wirklich".** Die Börsenliste sagt, dass
+    *ein* Papier dieses Kürzel an einer Fremdbörse trägt. Sie sagt **nicht**,
+    dass das Papier im US-Bulk dasselbe ist: die Zuordnung läuft über Kürzel
+    plus Namensähnlichkeit, und bei einem Kürzel mit zwei Kandidaten an zwei
+    Börsen trifft sie eine Münzwurf-Entscheidung. Ein Handeintrag ist dagegen
+    eine Aussage über *dieses* Papier, und er kommt ohne Beleg gar nicht erst
+    ins File (``manual_listings``).
+
+    Damit gilt hier dieselbe Regel wie im Korrektur-Register: **Entschiedenes
+    hat Vorrang vor Automatik.** Ein Widerspruch bleibt im Log, denn einer der
+    beiden ist falsch — und wer den Handeintrag anzweifelt, sieht in den
+    Kursen nach, so wie es bei ``HVN`` geschehen ist.
     """
     hand = dict(manual_listings() if manual is None else manual)
     zusammen = {t.code: t for t in resolved}
     for code, befund in hand.items():
         vorhanden = zusammen.get(code)
-        if vorhanden is None:
-            zusammen[code] = befund
-        elif vorhanden.currency.upper() != befund.currency.upper():
+        if vorhanden is not None and vorhanden.currency.upper() != befund.currency.upper():
             log.warning(
                 "%s: Boersenliste sagt %s, foreign_listings.yaml sagt %s — "
-                "die Boersenliste gilt. Einer der beiden ist falsch.",
+                "der belegte Handeintrag gilt. Einer der beiden ist falsch; "
+                "die Kurse im Lake entscheiden es.",
                 code,
                 vorhanden.currency,
                 befund.currency,
             )
+        zusammen[code] = befund
     return sorted(zusammen.values(), key=lambda t: t.code)

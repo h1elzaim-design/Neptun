@@ -48,9 +48,10 @@ import pandas as pd
 
 from quantrace import storage
 from quantrace.adjust import UnadjustableActionError, adjust_ohlcv
-from quantrace.befunde import Befund, lade_entscheidungen
+from quantrace.befunde import Befund, entscheidung_fuer, lade_entscheidungen
 from quantrace.einheiten import AUSSCHLAG, faktorkurve, klassifiziere
 from quantrace.instruments import US_DIVIDENDS_PREFIX, US_SPLITS_PREFIX
+from quantrace.invarianten import MAX_JE_INVARIANTE
 from quantrace.invarianten import pruefe as invarianten_pruefen
 from quantrace.resolve import RESOLVED_PREFIX, materialised_keys
 
@@ -580,6 +581,26 @@ def letzte_befunde() -> list[Befund]:
     return list(_letzte_befunde)
 
 
+def _fuer_den_bericht(befunde: list[Befund]) -> list[Befund]:
+    """Je Art hoechstens `MAX_JE_INVARIANTE` Befunde — der Deckel fuers Melden.
+
+    Er sass frueher in der Invariante selbst. Seit dem 2026-09-08 findet die
+    Invariante alles, weil eine Entscheidung ueber einen Abschnitt *jede*
+    betroffene Zeile treffen muss; gekuerzt wird erst hier, wo es um
+    Lesbarkeit geht. `DIC` hat 1.666 kaputte Tage, und die Gesamtzahl steht
+    in `n_zeilen`.
+    """
+    gezaehlt: dict[str, int] = {}
+    aus: list[Befund] = []
+    for b in befunde:
+        n = gezaehlt.get(b.art, 0)
+        if n >= MAX_JE_INVARIANTE:
+            continue
+        gezaehlt[b.art] = n + 1
+        aus.append(b)
+    return aus
+
+
 def _apply_actions(
     prices: pd.DataFrame, splits: pd.DataFrame, divs: pd.DataFrame
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -622,7 +643,14 @@ def _apply_actions(
     teile: list[pd.DataFrame] = []
     unadjustierbar: dict[str, str] = {}
     #: Zeilen, die auf falscher Stückzahl standen: Instrument → Anzahl (#324).
+    #: **Nur die Automatik** — was ein Mensch im Register entschieden hat,
+    #: steht daneben. Eine Meldung, die beides zusammenwirft, schickt die
+    #: Suche zum falschen Detektor.
     einheiten_raus: dict[str, int] = {}
+    #: Zeilen, die eine Entscheidung aus `data/corrections/` verworfen hat:
+    #: Instrument → Anzahl (#333). Kein Fehler, sondern ein Urteil — deshalb
+    #: eine eigene Meldung mit eigenem Ton.
+    entschieden_raus: dict[str, int] = {}
     #: Alles, was auffiel — ohne Urteil darüber, was es bedeutet (#327).
     #: Der Lesepfad **meldet**; entschieden wird in `data/corrections/`.
     befunde: list[Befund] = []
@@ -665,7 +693,17 @@ def _apply_actions(
                 # und unabhängig davon: `DIC` trägt denselben Fehler in beiden
                 # Kursspalten, also bewegt sich die Faktorkurve nie und der
                 # Einheiten-Detektor ist dort blind.
-                befunde.extend(invarianten_pruefen(teil, str(instrument), code))
+                # **Ungekürzt nur, wo das Register etwas sagt.** Eine
+                # Entscheidung über einen Abschnitt muss *jede* betroffene
+                # Zeile treffen — `DIC` hat 1.666, gemeldet werden fünf. Wo
+                # nichts entschieden ist, bleibt es bei den fünf: alles
+                # andere wären Objekte für einen Bericht, der sie kürzt.
+                entschieden_hier = any(e.code == code for e in entscheidungen.values())
+                inv_befunde = invarianten_pruefen(
+                    teil, str(instrument), code,
+                    je_invariante=None if entschieden_hier else MAX_JE_INVARIANTE,
+                )
+                befunde.extend(_fuer_den_bericht(inv_befunde))
 
                 # **Melden, bevor gehandelt wird.** Jede Auffälligkeit geht
                 # ins Register — auch die, die der Lesepfad selbst behandelt.
@@ -699,12 +737,19 @@ def _apply_actions(
                 # `data/corrections/` ist von jemandem angesehen worden; die
                 # Klassifikation ist es nicht.
                 schlecht = (k["art"] == AUSSCHLAG).to_numpy()
+                # **Woher eine verworfene Zeile kommt, gehört in die Meldung.**
+                # Sonst steht dort „auf falscher Stückzahl (#324)" über Zeilen,
+                # die ein Mensch im Register entschieden hat — und die Suche
+                # beginnt beim falschen Detektor. Dieselbe Falle wie beim
+                # `DENIED: denied` des Loaders (PLAN.md §9.4).
+                aus_register: set[int] = set()
                 for pos, tag in enumerate(teil["date"]):
                     e = entscheidungen.get(f"{code}@{tag.isoformat()}")
                     if e is None:
                         continue
                     if e.was == "verwerfen":
                         schlecht[pos] = True
+                        aus_register.add(pos)
                     elif e.was == "aktion" and e.faktor:
                         split_map[(code, tag)] = (
                             split_map.get((code, tag), 1.0) * e.faktor
@@ -713,8 +758,35 @@ def _apply_actions(
                     elif e.was == "akzeptieren":
                         schlecht[pos] = False
 
+                # **Was ein Abschnitt im Register über Invariantenbefunde
+                # sagt** (#333). Der Weg darüber trifft nur, was der
+                # Einheiten-Detektor findet; `kursniveau` ist dort blind, weil
+                # `DIC` denselben Fehler in beiden Kursspalten trägt.
+                #
+                # Nur `verwerfen` wirkt hier. `akzeptieren` heisst
+                # ausdrücklich „stehenlassen", und `aktion` ergibt bei einer
+                # Reihe mit zwei Niveaus keinen Sinn — dort fehlt kein Split,
+                # dort stehen zwei Papiere in einer Spalte. Wer das einträgt,
+                # bekommt keine stille Sonderbehandlung, sondern nichts.
+                if entschieden_hier:
+                    pos_von_tag = {t: i for i, t in enumerate(teil["date"])}
+                    for b in inv_befunde:
+                        e = entscheidung_fuer(b, entscheidungen)
+                        if e is None or e.was != "verwerfen":
+                            continue
+                        pos = pos_von_tag.get(b.tag)
+                        if pos is not None:
+                            schlecht[pos] = True
+                            aus_register.add(pos)
+
                 if schlecht.any():
-                    einheiten_raus[str(instrument)] = int(schlecht.sum())
+                    entschieden = sum(1 for p in aus_register if schlecht[p])
+                    if entschieden:
+                        entschieden_raus[str(instrument)] = entschieden
+                    if int(schlecht.sum()) - entschieden:
+                        einheiten_raus[str(instrument)] = (
+                            int(schlecht.sum()) - entschieden
+                        )
                     teil = teil.loc[~schlecht].reset_index(drop=True)
                     if teil.empty:
                         continue
@@ -778,6 +850,16 @@ def _apply_actions(
             len(einheiten_raus),
             sum(einheiten_raus.values()),
             ", ".join(f"{i}: {n}" for i, n in sorted(einheiten_raus.items())[:10]),
+        )
+    if entschieden_raus:
+        # `info`, nicht `warning`: hier ist nichts schiefgegangen. Jemand hat
+        # hingesehen und entschieden, und das Ergebnis ist die gewollte Lücke.
+        log.info(
+            "%d Instrument(e) mit entschiedenen Zeilen — %d Zeilen nach "
+            "`data/corrections/` als Lücke gelesen (#333): %s",
+            len(entschieden_raus),
+            sum(entschieden_raus.values()),
+            ", ".join(f"{i}: {n}" for i, n in sorted(entschieden_raus.items())[:10]),
         )
     if unadjustierbar:
         log.warning(

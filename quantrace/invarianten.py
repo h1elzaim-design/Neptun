@@ -150,6 +150,28 @@ def _kursniveau(teil: pd.DataFrame, instrument: str, code: str) -> list[Befund]:
     darunter hunderte Tage mit 76 gehandelten Stück. Das ist kein Widerspruch,
     sondern ein illiquider Tag. Das Volumen steht deshalb nur noch **als Beleg**
     daneben, nicht als Kriterium.
+
+    **Was der erste volle Lauf ergab (2026-09-08, `us_top500_liquid`,
+    2000–2023, 2.008 Instrumente).** Nicht zwei Papiere, sondern **240** — und
+    sie zerfallen in zwei Fälle mit verschiedener Behandlung:
+
+    =====================  ========  =====================================
+    ein Abschnitt             87     zwei Instrumente **hintereinander**
+    zwei bis fünf             80     Mischform
+    mehr als fünf             73     Zeilen wechseln sich ab
+    =====================  ========  =====================================
+
+    Von den 87 liegt der Abschnitt bei **63** am Rand der Reihe: ``PGD`` ist
+    bis 2012 ein Papier und danach ein anderes, ``MABANEE`` (Kuwait) bis 2009
+    eines und danach eines — beide unter *einem* Segmentschlüssel
+    ``code.*.US.s1``. Das ist kein Zeilenfehler; das ist die Frage nach der
+    Identität, und die Segmentierung hat dort nicht gegriffen.
+
+    **Deshalb ``bloecke`` und ``am_rand`` in den Belegen.** Ohne sie sähen im
+    Bericht ``DIC`` (160 Abschnitte, täglich alternierend, kaputte Zeilen) und
+    ``MABANEE`` (ein Abschnitt am Rand, ein anderes Papier) gleich aus — und
+    ``verwerfen`` wäre im zweiten Fall die falsche Antwort: es löschte die
+    halbe Historie eines Papiers, das nichts falsch macht.
     """
     if "close" not in teil.columns or len(teil) < 20:
         return []
@@ -166,6 +188,28 @@ def _kursniveau(teil: pd.DataFrame, instrument: str, code: str) -> list[Befund]:
     if not bool(schlecht.any()):
         return []
 
+    # **Wie die fernen Zeilen liegen, sagt was sie sind.** Ein einzelner
+    # zusammenhängender Abschnitt heisst: bis hier das eine Papier, danach ein
+    # anderes — die Spalte trägt zwei Instrumente **hintereinander**. Viele
+    # Abschnitte heissen: die Zeilen wechseln sich ab, und dann ist die eine
+    # Hälfte kaputt. Die Behandlung ist verschieden, und ohne diese Zahl steht
+    # sie nicht im Bericht.
+    marke = schlecht.to_numpy()
+    bloecke = int((np.diff(np.concatenate(([0], marke.astype(int)))) == 1).sum())
+    # Liegt der Abschnitt am Rand der Reihe, ist der Bruch ein Wechsel der
+    # Identität und keine Lücke in der Mitte — genau der Fall, für den es die
+    # Segmentierung gibt (`resolve.py`, ADR-013) und in dem sie nicht griff.
+    am_rand = bool(marke[0] or marke[-1])
+
+    # **Die Grenzen des betroffenen Bereichs**, damit ein Abschnitt im
+    # Register (`befunde.Entscheidung.von`/`bis`) sich abschreiben lässt. Ohne
+    # sie müsste jemand die Reihe aufmachen, um das Fenster zu bestimmen — und
+    # dann schaut niemand hin, dieselbe Begründung wie für die übrigen Belege.
+    treffer = np.flatnonzero(marke)
+    tage = pd.to_datetime(teil["date"])
+    fern_von = tage.iloc[int(treffer[0])].date()
+    fern_bis = tage.iloc[int(treffer[-1])].date()
+
     hat_volumen = "volume" in teil.columns
     volume = teil["volume"].astype(float) if hat_volumen else None
     return [
@@ -176,14 +220,25 @@ def _kursniveau(teil: pd.DataFrame, instrument: str, code: str) -> list[Befund]:
             dekaden=float(dekaden.iloc[i]),
             volume=float(volume.iloc[i]) if hat_volumen else None,
             n_zeilen=int(schlecht.sum()),
+            bloecke=bloecke,
+            am_rand=am_rand,
+            fern_von=fern_von.isoformat(),
+            fern_bis=fern_bis.isoformat(),
         )
-        for i in np.flatnonzero(schlecht.to_numpy())[:_MAX_JE_INVARIANTE]
+        for i in treffer
     ]
 
-#: Wieviele Befunde eine Invariante je Reihe höchstens meldet. `DIC` hat 149
-#: kaputte Tage; sie alle einzeln zu melden macht den Bericht unlesbar, und die
-#: Gesamtzahl steht in `n_zeilen`.
-_MAX_JE_INVARIANTE = 5
+#: Wieviele Befunde eine Invariante je Reihe höchstens **meldet**. `DIC` hat
+#: 1.666 kaputte Tage; sie alle einzeln in den Bericht zu schreiben macht ihn
+#: unlesbar, und die Gesamtzahl steht in `n_zeilen`.
+#:
+#: **Der Deckel sitzt in `pruefe`, nicht in der Invariante** — seit dem
+#: 2026-09-08, und der Grund ist die Anwendung: eine Entscheidung über einen
+#: Abschnitt (`befunde.Entscheidung.von`/`bis`) muss *jede* betroffene Zeile
+#: treffen, nicht die ersten fünf. Eine Invariante findet also alles; wieviel
+#: davon in einen Bericht geht, ist eine Frage der Darstellung und gehört
+#: nicht in die Regel.
+MAX_JE_INVARIANTE = 5
 
 
 ALLE: tuple[Invariante, ...] = (
@@ -192,7 +247,10 @@ ALLE: tuple[Invariante, ...] = (
         beschreibung=(
             "Der Kurs weicht um mehr als zwei Zehnerpotenzen vom Median der "
             "eigenen Reihe ab — die Spalte enthält zwei Niveaus. Welches das "
-            "richtige ist, entscheidet die Regel nicht."
+            "richtige ist, entscheidet die Regel nicht. `bloecke` sagt, ob die "
+            "Niveaus aufeinanderfolgen (ein Abschnitt: zwei Instrumente in "
+            "einer Spalte) oder sich abwechseln (viele: kaputte Zeilen); "
+            "`am_rand`, ob der Abschnitt an einem Ende der Reihe liegt."
         ),
         pruefen=_kursniveau,
         anlass=(
@@ -210,20 +268,35 @@ def pruefe(
     code: str,
     *,
     invarianten: Sequence[Invariante] = ALLE,
+    je_invariante: int | None = MAX_JE_INVARIANTE,
 ) -> list[Befund]:
     """Alle Invarianten auf die Reihe **eines** Papiers.
 
     Eine Invariante, die wirft, darf die übrigen nicht mitnehmen: der Sinn der
     Liste ist, dass sie wächst, und eine neue Regel mit einem Randfall soll
     nicht den Load kippen. Sie wird geloggt und übersprungen.
+
+    ``je_invariante`` deckelt, **wieviel gemeldet wird** — die Vorgabe ist der
+    Bericht, ``None`` ist alles. Wer eine Entscheidung anwendet, braucht
+    alles: ein Abschnitt im Register (`befunde.Entscheidung`) trifft jede
+    betroffene Zeile, nicht die ersten fünf.
     """
     aus: list[Befund] = []
     for inv in invarianten:
         try:
-            aus.extend(inv.pruefen(teil, instrument, code))
+            gefunden = inv.pruefen(teil, instrument, code)
         except Exception as exc:  # pragma: no cover - defekte Regel
             log.warning("Invariante %s scheiterte an %s: %s", inv.name, code, exc)
+            continue
+        aus.extend(gefunden if je_invariante is None else gefunden[:je_invariante])
     return aus
 
 
-__all__ = ["ALLE", "KURSNIVEAU_DEKADEN", "Invariante", "Pruefung", "pruefe"]
+__all__ = [
+    "ALLE",
+    "KURSNIVEAU_DEKADEN",
+    "MAX_JE_INVARIANTE",
+    "Invariante",
+    "Pruefung",
+    "pruefe",
+]

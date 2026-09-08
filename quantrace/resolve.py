@@ -16,7 +16,7 @@ Overstock kaufte die Marke aus der Insolvenzmasse. Wer `code == "BBBY"` über
 die ganze Historie verkettet, ersetzt einen Totalverlust durch den Kursverlauf
 einer fremden Firma — und zwar lückenlos, ohne Fehlermeldung.
 
-## Die zwei Regeln, die dieses Modul durchsetzt
+## Die drei Regeln, die dieses Modul durchsetzt
 
 **1 · Ein Code wird an langen Lücken zerschnitten.** Verschwindet ein Code für
 länger als ``gap_days`` und taucht wieder auf, sind das zwei Segmente und damit
@@ -25,7 +25,28 @@ Papier ist eine fragmentierte Reihe, die man sieht — ein fälschlich
 *verschmolzenes* ist eine falsche Historie, die man nicht sieht. Nur einer der
 beiden Fehler ist teuer, also fällt die Voreinstellung auf die sichere Seite.
 
-**2 · Eine heute erhobene ISIN gilt nur für ein heute noch lebendes Segment.**
+**2 · Ein Code wird auch ohne Lücke zerschnitten, wenn das Kursniveau
+bricht.** Regel 1 fängt nur, was verschwindet und wiederkommt — und genau das
+tun die interessanten Fälle nicht::
+
+    PGD      2012-06-18      25,50 →  17.640,30    kein Tag Pause
+    MABANEE  2009-11-16       0,69 →     710,00    kein Tag Pause
+    KFH-CL   2009-11-16       1,14 →   1.140,00    kein Tag Pause
+
+Für Regel 1 ist das **ein** Papier, und ein Backtest liest eine Reihe, in der
+zwei Firmen stecken: derselbe Fehler wie BBBY, nur ohne die Lücke, an der man
+ihn sähe. Am 2026-09-08 über ``us_top500_liquid`` gezählt — 63 Papiere tragen
+zwei Instrumente hintereinander unter *einem* Segmentschlüssel.
+
+**Was echte Splits davor schützt, ist nicht die Schwelle, sondern der
+Aktionsfaktor.** ``adjusted_close`` ist zum Abrufzeitpunkt split-adjustiert:
+bei einem Split springt ``close``, ``adjusted_close`` läuft stetig weiter, und
+das Verhältnis der beiden springt zwangsläufig gegenläufig mit. Bei einem
+Instrumentwechsel steht es still, weil beide Spalten denselben neuen Kurs
+tragen. Das folgt aus der Definition der Spalten, nicht aus einer Stichprobe —
+nachgemessen ist es trotzdem (siehe ``DEFAULT_FAKTOR_TOLERANZ``).
+
+**3 · Eine heute erhobene ISIN gilt nur für ein heute noch lebendes Segment.**
 Die Karte in ``data/instruments.yaml`` ordnet ``BBBY`` der ISIN von *Overstock*
 zu — das ist korrekt für heute und grundfalsch für 2019. Deshalb bekommt ein
 Segment die ISIN nur, wenn es bis ans Ende des geladenen Fensters reicht. Jedes
@@ -63,6 +84,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from quantrace import storage
@@ -165,6 +187,50 @@ DEFAULT_ACTIVE_TOLERANCE_DAYS = 45
 #: `materialise` je Instrument auf `date BETWEEN first AND last` joint.
 #: Weglassen statt erfinden — dieselbe Richtung wie überall sonst hier.
 DEFAULT_MIN_SEGMENT_BARS = 20
+
+#: Um wieviele Zehnerpotenzen der Kurs von einem Handelstag zum nächsten
+#: springen muss, damit das als **Wechsel des Instruments** gilt und nicht als
+#: Kursbewegung.
+#:
+#: **Warum es diese zweite Regel braucht.** Die Lückenregel oben fängt nur den
+#: Fall, in dem ein Code verschwindet und wiederkommt. ``PGD`` verschwindet
+#: nicht: am 2012-06-18 läuft der Ticker von 25,50 auf 17.640,30 weiter, ohne
+#: einen Tag Pause. ``MABANEE`` ebenso (0,69 → 710,00 am 2009-11-16),
+#: ``KFH-CL``, ``PVD``, ``HUMANSOFT``, ``MGROS``. Für die Lückenregel ist das
+#: **ein** Papier, und der Backtest liest eine Reihe, in der zwei Firmen
+#: stecken — derselbe Fehler wie BBBY, nur ohne Lücke.
+#:
+#: Zwei Dekaden sind Faktor 100 und liegen weit jenseits eines Handelstages.
+#: Die gemessenen Fälle liegen bei 2,5 bis 3,3.
+DEFAULT_NIVEAU_DEKADEN = 2.0
+
+#: Wann der Aktionsfaktor ``adjusted_close / close`` als **unbewegt** gilt.
+#:
+#: **Das ist die Regel, die echte Splits verschont**, und sie folgt aus der
+#: Definition der Spalten, nicht aus einer Stichprobe: ``adjusted_close`` ist
+#: zum Abrufzeitpunkt split-adjustiert. Bei einem echten Split springt ``close``
+#: und ``adjusted_close`` läuft stetig weiter — das Verhältnis springt
+#: **zwangsläufig gegenläufig**, exakt um den Split-Faktor. Bei einem
+#: Instrumentwechsel tragen beide Spalten denselben neuen Kurs, und das
+#: Verhältnis steht.
+#:
+#: Am 2026-09-08 über 34 Kurssprünge nachgemessen. Bei den Splits bewegt sich
+#: der Faktor exakt gegenläufig::
+#:
+#:     AAPL 2020-08-31   close -0,588 Dekaden   Faktor +0,602
+#:     NVDA 2024-06-10   close -0,997 Dekaden   Faktor +1,000
+#:     CMG  2024-06-26   close -1,698 Dekaden   Faktor +1,699
+#:
+#: Bei den Instrumentwechseln steht er auf null::
+#:
+#:     MABANEE 2009-11-16   close +3,012 Dekaden   Faktor 0,0000
+#:     PGD     2012-06-18   close +2,840 Dekaden   Faktor 0,0000
+#:     PVD     2012-06-18   close +2,460 Dekaden   Faktor 0,0000
+#:
+#: Ohne diese zweite Bedingung zerschnitte die Regel jeden Reverse-Split über
+#: 1:100 — und ein fälschlich getrenntes Papier ist zwar der billigere Fehler
+#: (siehe ``DEFAULT_GAP_TRADING_DAYS``), aber kein guter.
+DEFAULT_FAKTOR_TOLERANZ = 0.02
 
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -330,7 +396,7 @@ def code_calendar(*, limit_days: int | None = None) -> pd.DataFrame:
     nicht einer pro Tag) und macht die Absicht wieder wahr.
     """
     if not storage.list_day_partitions(US_EQUITY_PREFIX):
-        return pd.DataFrame(columns=["code", "exchange", "date"])
+        return pd.DataFrame(columns=["code", "exchange", "date", "close", "adjusted_close"])
 
     glob = _prices_glob()
     con = storage._duckdb_conn()
@@ -346,16 +412,21 @@ def code_calendar(*, limit_days: int | None = None) -> pd.DataFrame:
                 [int(limit_days)],
             ).df()
             if tage.empty:
-                return pd.DataFrame(columns=["code", "exchange", "date"])
+                return pd.DataFrame(columns=["code", "exchange", "date", "close", "adjusted_close"])
             bis = pd.to_datetime(tage["date"]).max().date()
             bedingungen.append(f"date <= DATE '{bis.isoformat()}'")
 
+        # `close` und `adjusted_close` kommen mit, weil `segment_codes` sie
+        # für den Niveaubruch braucht (Regel 3). Zwei float-Spalten sind der
+        # Preis dafür, dass die pure Fassung dieselben Segmente liefert wie
+        # `segments_from_lake` — ohne sie wären es zwei Wahrheiten.
         sql = (
             "SELECT code, "
             "COALESCE(NULLIF(TRIM(exchange_short_name), ''), 'US') AS exchange, "
-            "date "
+            "date, max(close) AS close, max(adjusted_close) AS adjusted_close "
             f"FROM read_parquet('{glob}', hive_partitioning=true) "
             f"WHERE {' AND '.join(bedingungen)} "
+            "GROUP BY 1, 2, 3 "
             "ORDER BY code, exchange, date"
         )
         df = con.execute(sql).df()
@@ -365,11 +436,11 @@ def code_calendar(*, limit_days: int | None = None) -> pd.DataFrame:
         # Query verschwinden — oder wenn eine Datei kaputt ist. Beides ist
         # „keine Karte baubar", nicht „Absturz".
         log.warning("Schicht 1 nicht lesbar: %s", exc)
-        return pd.DataFrame(columns=["code", "exchange", "date"])
+        return pd.DataFrame(columns=["code", "exchange", "date", "close", "adjusted_close"])
     finally:
         con.close()
     if df.empty:
-        return pd.DataFrame(columns=["code", "exchange", "date"])
+        return pd.DataFrame(columns=["code", "exchange", "date", "close", "adjusted_close"])
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
 
@@ -437,15 +508,67 @@ def find_codes(codes: list[str], *, sample_days: int = 24) -> pd.DataFrame:
     return zusammen[["code", "n_tage", "first", "last"]]
 
 
-def segment_codes(
-    calendar: pd.DataFrame, gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS
-) -> list[Segment]:
-    """Zerschneidet jeden Code an Lücken > ``gap_trading_days`` **Handelstagen**.
+def _niveaubruch(
+    teil: pd.DataFrame,
+    niveau_dekaden: float = DEFAULT_NIVEAU_DEKADEN,
+    faktor_toleranz: float = DEFAULT_FAKTOR_TOLERANZ,
+) -> set[int]:
+    """Positionen, an denen die Reihe das **Instrument** wechselt, nicht den Kurs.
 
-    Gezählt werden die Tage, an denen der Lake *überhaupt* einen Querschnitt
-    hat — nicht Kalendertage. Wo keine Partition liegt, hat auch niemand
-    gehandelt, und die Abwesenheit eines Codes sagt dort nichts über ihn aus
-    (siehe ``DEFAULT_GAP_TRADING_DAYS``).
+    Zwei Bedingungen, und die zweite ist die wichtigere:
+
+    1. ``close`` springt gegenüber dem Vortag um mehr als ``niveau_dekaden``.
+    2. Der Aktionsfaktor ``adjusted_close / close`` bewegt sich dabei **nicht**.
+
+    Warum das echte Splits verschont, steht bei ``DEFAULT_FAKTOR_TOLERANZ``:
+    ein Split springt in ``close`` und lässt ``adjusted_close`` stetig, also
+    springt das Verhältnis gegenläufig mit. Ein Instrumentwechsel schreibt in
+    beide Spalten denselben neuen Kurs.
+
+    Fehlt eine der Kursspalten, gibt es kein Urteil — leere Menge, und die
+    Lückenregel allein entscheidet. **Nicht** „dann eben kein Bruch": dieselbe
+    Unterscheidung wie überall hier, fehlend ist nicht null.
+    """
+    if not {"close", "adjusted_close"} <= set(teil.columns) or len(teil) < 2:
+        return set()
+
+    close = pd.to_numeric(teil["close"], errors="coerce").to_numpy(dtype=float)
+    adj = pd.to_numeric(teil["adjusted_close"], errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        faktor = np.where((close > 0) & (adj > 0), adj / close, np.nan)
+        d_close = np.log10(close[1:] / close[:-1])
+        d_faktor = np.log10(faktor[1:] / faktor[:-1])
+
+    brueche = (
+        np.isfinite(d_close)
+        & np.isfinite(d_faktor)
+        & (np.abs(d_close) >= float(niveau_dekaden))
+        & (np.abs(d_faktor) < float(faktor_toleranz))
+    )
+    # `+1`, weil `d_close[i]` den Schritt von Position i nach i+1 beschreibt:
+    # der Bruch liegt auf der **neuen** Zeile, dort beginnt das nächste Segment.
+    return {int(i) + 1 for i in np.flatnonzero(brueche)}
+
+
+def segment_codes(
+    calendar: pd.DataFrame,
+    gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS,
+    *,
+    niveau_dekaden: float = DEFAULT_NIVEAU_DEKADEN,
+) -> list[Segment]:
+    """Zerschneidet jeden Code an Lücken und an Niveaubrüchen.
+
+    **Lücken** > ``gap_trading_days`` **Handelstagen**: gezählt werden die
+    Tage, an denen der Lake *überhaupt* einen Querschnitt hat — nicht
+    Kalendertage. Wo keine Partition liegt, hat auch niemand gehandelt, und die
+    Abwesenheit eines Codes sagt dort nichts über ihn aus (siehe
+    ``DEFAULT_GAP_TRADING_DAYS``).
+
+    **Niveaubrüche**: ein Kurssprung um Grössenordnungen, bei dem der
+    Aktionsfaktor stehenbleibt — siehe ``_niveaubruch``. Die Lückenregel
+    allein sah ``PGD`` als ein Papier, obwohl der Ticker am 2012-06-18 von
+    25,50 auf 17.640,30 wechselt, ohne einen Tag Pause. Diese Regel greift nur,
+    wenn der Frame ``close`` und ``adjusted_close`` trägt.
 
     Die Tagesliste kommt aus dem Kalender selbst: er enthält jede (Code, Tag)-
     Kombination, seine eindeutigen Daten **sind** die Handelstage des Lakes.
@@ -463,13 +586,15 @@ def segment_codes(
     out: list[Segment] = []
 
     for (code, exchange), teil in df.groupby(["code", "exchange"], sort=True):
+        teil = teil.reset_index(drop=True)
+        niveau = _niveaubruch(teil, niveau_dekaden)
         dates = list(teil["date"])
         start = dates[0]
         prev = dates[0]
         n = 1
         index = 1
-        for d in dates[1:]:
-            if rang[d] - rang[prev] > grenze:
+        for pos, d in enumerate(dates[1:], start=1):
+            if rang[d] - rang[prev] > grenze or pos in niveau:
                 out.append(Segment(str(code), str(exchange), index, start, prev, n))
                 index += 1
                 start = d
@@ -481,7 +606,10 @@ def segment_codes(
 
 
 def segments_from_lake(
-    *, gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS, limit_days: int | None = None
+    *,
+    gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS,
+    limit_days: int | None = None,
+    niveau_dekaden: float = DEFAULT_NIVEAU_DEKADEN,
 ) -> list[Segment]:
     """Dieselben Segmente wie ``segment_codes``, aber ohne den Kalender im RAM.
 
@@ -530,7 +658,13 @@ def segments_from_lake(
             WITH quelle AS (
                 SELECT code,
                        COALESCE(NULLIF(TRIM(exchange_short_name), ''), 'US') AS exchange,
-                       date
+                       date,
+                       -- `max`, weil dieselbe (Code, Tag)-Kombination zweimal
+                       -- im Feed stehen kann — dieselbe Aggregation wie oben,
+                       -- damit die Kurse zur Zeile passen, die `GROUP BY`
+                       -- übrig lässt.
+                       max(close) AS close,
+                       max(adjusted_close) AS adj
                 FROM read_parquet('{glob}', hive_partitioning=true)
                 WHERE code IS NOT NULL {bis_klausel}
                 GROUP BY 1, 2, 3
@@ -540,18 +674,37 @@ def segments_from_lake(
                 FROM (SELECT DISTINCT date FROM quelle)
             ),
             tage AS (
-                SELECT q.code, q.exchange, q.date, l.tag_nr
+                SELECT q.code, q.exchange, q.date, q.close, q.adj, l.tag_nr
                 FROM quelle q JOIN lake_tage l ON q.date = l.date
             ),
             brueche AS (
                 SELECT code, exchange, date,
                        CASE
-                           WHEN tag_nr - lag(tag_nr) OVER (
-                                    PARTITION BY code, exchange ORDER BY date
-                                ) > {int(gap_trading_days)}
-                           THEN 1 ELSE 0
+                           -- Regel 1: eine lange Lücke.
+                           WHEN tag_nr - lag(tag_nr) OVER w
+                                > {int(gap_trading_days)}
+                           THEN 1
+                           -- Regel 3: ein Niveaubruch. Der Kurs springt um
+                           -- Grössenordnungen, und der Aktionsfaktor
+                           -- `adjusted_close / close` steht dabei still — also
+                           -- ist es kein Split, sondern ein anderes Papier
+                           -- unter demselben Kürzel. `_niveaubruch` rechnet
+                           -- dieselbe Regel in pandas; dass beide Fassungen
+                           -- dasselbe liefern, prüft `test_resolve_roundtrip`.
+                           WHEN close > 0 AND adj > 0
+                                AND lag(close) OVER w > 0
+                                AND lag(adj) OVER w > 0
+                                AND abs(log10(close / lag(close) OVER w))
+                                    >= {float(niveau_dekaden)}
+                                AND abs(log10(
+                                        (adj / close)
+                                        / (lag(adj) OVER w / lag(close) OVER w)
+                                    )) < {float(DEFAULT_FAKTOR_TOLERANZ)}
+                           THEN 1
+                           ELSE 0
                        END AS bruch
                 FROM tage
+                WINDOW w AS (PARTITION BY code, exchange ORDER BY date)
             ),
             nummeriert AS (
                 SELECT code, exchange, date,

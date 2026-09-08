@@ -97,11 +97,41 @@ class Befund:
 
 @dataclass(frozen=True)
 class Entscheidung:
-    """Was mit einem Befund geschehen soll. Von Hand gesetzt, nicht geraten."""
+    """Was mit einem Befund geschehen soll. Von Hand gesetzt, nicht geraten.
+
+    **Eine Zelle oder ein Abschnitt.** Entweder steht ``tag`` — dann gilt der
+    Eintrag für genau diese Zelle, wie bei ``CTAS@2005-05-25`` — oder ``von``
+    und ``bis`` plus ``art``: dann gilt er für alle Befunde *dieser Art* in
+    diesem Fenster.
+
+    **Warum es die zweite Form braucht.** Der erste volle Lauf am 2026-09-08
+    fand 240 Papiere mit zwei Kursniveaus, im Median 145 betroffene Zeilen je
+    Papier. Zelle für Zelle wären das Zehntausende Einträge — und niemand
+    trägt sie ein, also bliebe alles unentschieden.
+
+    **Warum nicht einfach ein Datumsbereich ohne ``art``.** Bei ``DIC``
+    wechseln kaputte und gesunde Zeilen täglich ab (160 Abschnitte). Ein
+    blosses ``von``/``bis`` mit ``verwerfen`` nähme die gesunde Hälfte mit.
+    Was zutrifft, ist der Satz *„in diesem Fenster bedeutet ein
+    `kursniveau`-Befund: verwerfen"* — der Mensch entscheidet Papier, Fenster
+    und Bedeutung, die Invariante nur noch, welche Zeile es trifft.
+
+    Damit bleibt die Trennlinie, für die es dieses Modul gibt: **die
+    Automatik erkennt, ein Mensch entscheidet.** Ein Abschnitt ist eine
+    grössere Aussage als eine Zelle, keine andere Art von Aussage.
+    """
 
     code: str
-    tag: date
     was: str
+    #: Die Zelle, wenn es eine einzelne ist. Schliesst ``von``/``bis`` aus.
+    tag: date | None = None
+    #: Der Abschnitt, wenn es einer ist — beide Grenzen einschliesslich.
+    von: date | None = None
+    bis: date | None = None
+    #: **Pflicht beim Abschnitt.** Die ``Befund.art``, für die er gilt. Ohne
+    #: sie wäre der Eintrag eine Aussage über *alle* Auffälligkeiten im
+    #: Fenster — auch über die, die es beim Eintragen noch nicht gab.
+    art: str = ""
     #: Bei ``aktion``: der Split-Faktor im Tiingo-Sinn (2,0 für einen 2:1-Split).
     faktor: float | None = None
     #: **Pflicht bei ``aktion``.** Woher die Gewissheit kommt — ein Prospekt,
@@ -111,8 +141,30 @@ class Entscheidung:
     quelle: str = ""
     grund: str = ""
 
+    @property
+    def ist_abschnitt(self) -> bool:
+        return self.tag is None
+
     def schluessel(self) -> str:
-        return f"{self.code}@{self.tag.isoformat()}"
+        """Die Adresse im Register — eindeutig für beide Formen."""
+        if self.tag is not None:
+            return f"{self.code}@{self.tag.isoformat()}"
+        return f"{self.code}@{self.von}..{self.bis}#{self.art}"
+
+    def deckt(self, befund: Befund) -> bool:
+        """Gilt diese Entscheidung für diesen Befund?"""
+        if befund.code != self.code:
+            return False
+        if self.tag is not None:
+            return befund.tag == self.tag
+        # Beide Grenzen einschliesslich: wer ein Fenster aufschreibt, meint
+        # die Tage, die er hingeschrieben hat.
+        return (
+            befund.art == self.art
+            and self.von is not None
+            and self.bis is not None
+            and self.von <= befund.tag <= self.bis
+        )
 
 
 def _als_datum(wert: Any) -> date:
@@ -147,9 +199,45 @@ def lade_entscheidungen(pfad: Path | None = None) -> dict[str, Entscheidung]:
 
 
 def _entscheidung_aus(eintrag: dict[str, Any], datei: Path) -> Entscheidung:
-    fehlend = [k for k in ("code", "tag", "was") if k not in eintrag]
+    fehlend = [k for k in ("code", "was") if k not in eintrag]
     if fehlend:
         raise ValueError(f"{datei.name}: Eintrag ohne {fehlend}: {eintrag}")
+
+    # **Zelle oder Abschnitt — nicht beides und nicht keines.** Ein Eintrag mit
+    # `tag` *und* `von` liesse offen, welches gilt, und die stille Antwort
+    # wäre eine Heuristik an genau der Stelle, an der dieses Modul keine will.
+    hat_tag = "tag" in eintrag
+    hat_bereich = "von" in eintrag or "bis" in eintrag
+    if hat_tag and hat_bereich:
+        raise ValueError(
+            f"{datei.name}: {eintrag['code']} traegt 'tag' und 'von'/'bis'. "
+            "Eine Entscheidung gilt fuer eine Zelle oder fuer einen Abschnitt."
+        )
+    if not hat_tag and not hat_bereich:
+        raise ValueError(
+            f"{datei.name}: {eintrag['code']} traegt weder 'tag' noch "
+            "'von'/'bis' — es fehlt, worauf sich die Entscheidung bezieht."
+        )
+    if hat_bereich:
+        if "von" not in eintrag or "bis" not in eintrag:
+            raise ValueError(
+                f"{datei.name}: {eintrag['code']} braucht 'von' **und** 'bis'. "
+                "Ein halboffener Abschnitt waechst mit dem Lake weiter, und "
+                "was er morgen deckt, hat heute niemand angesehen."
+            )
+        if not str(eintrag.get("art") or "").strip():
+            # Siehe `Entscheidung.art`: ohne sie gilt der Eintrag auch fuer
+            # Auffaelligkeiten, die es beim Eintragen noch nicht gab.
+            raise ValueError(
+                f"{datei.name}: der Abschnitt fuer {eintrag['code']} braucht "
+                "eine 'art' (z. B. 'kursniveau'). Ohne sie entscheidet er "
+                "ueber Befunde, die niemand gesehen hat."
+            )
+        if _als_datum(eintrag["von"]) > _als_datum(eintrag["bis"]):
+            raise ValueError(
+                f"{datei.name}: {eintrag['code']} hat 'von' nach 'bis'."
+            )
+
     was = str(eintrag["was"])
     if was not in ENTSCHEIDUNGEN:
         raise ValueError(
@@ -174,12 +262,34 @@ def _entscheidung_aus(eintrag: dict[str, Any], datei: Path) -> Entscheidung:
             )
     return Entscheidung(
         code=str(eintrag["code"]),
-        tag=_als_datum(eintrag["tag"]),
         was=was,
+        tag=_als_datum(eintrag["tag"]) if hat_tag else None,
+        von=_als_datum(eintrag["von"]) if hat_bereich else None,
+        bis=_als_datum(eintrag["bis"]) if hat_bereich else None,
+        art=str(eintrag.get("art") or ""),
         faktor=float(faktor) if faktor is not None else None,
         quelle=quelle,
         grund=str(eintrag.get("grund") or ""),
     )
+
+
+def entscheidung_fuer(
+    befund: Befund, entscheidungen: dict[str, Entscheidung]
+) -> Entscheidung | None:
+    """Was zu diesem Befund entschieden ist — Zelle vor Abschnitt.
+
+    **Die Zelle gewinnt.** Wer einen einzelnen Tag ausdrücklich anders
+    entscheidet als den Abschnitt, um den er herum liegt, meint genau das: die
+    Ausnahme ist die spätere, genauere Aussage. Andersherum wäre der
+    Einzeleintrag wirkungslos, und niemand sähe warum.
+    """
+    genau = entscheidungen.get(befund.schluessel())
+    if genau is not None:
+        return genau
+    for e in entscheidungen.values():
+        if e.ist_abschnitt and e.deckt(befund):
+            return e
+    return None
 
 
 def offene(befunde: list[Befund], entscheidungen: dict[str, Entscheidung]) -> list[Befund]:
@@ -189,7 +299,7 @@ def offene(befunde: list[Befund], entscheidungen: dict[str, Entscheidung]) -> li
     und ``akzeptieren`` heisst *auch* erledigt, sonst wüchse die Liste ewig und
     niemand sähe den nächsten echten Befund darin.
     """
-    return [b for b in befunde if b.schluessel() not in entscheidungen]
+    return [b for b in befunde if entscheidung_fuer(b, entscheidungen) is None]
 
 
 def schreibe_bericht(
@@ -251,6 +361,7 @@ __all__ = [
     "ENTSCHEIDUNGEN",
     "Befund",
     "Entscheidung",
+    "entscheidung_fuer",
     "lade_entscheidungen",
     "lies_bericht",
     "offene",
