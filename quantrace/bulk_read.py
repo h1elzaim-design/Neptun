@@ -446,6 +446,92 @@ def _nullbars_als_luecke(prices: pd.DataFrame) -> pd.DataFrame:
     return prices.loc[~leer].reset_index(drop=True)
 
 
+def _fortgeschriebene_als_luecke(prices: pd.DataFrame) -> pd.DataFrame:
+    """Ein Tag ohne Umsatz hat keinen Kurs — der Feed schreibt den letzten fort.
+
+    **Der Fall.** ``LDG`` steht nach dem Delisting von Longs Drug Stores im
+    Oktober 2008 **sieben Jahre** auf 71,51::
+
+        2008-10-29    71.51   Volumen 0      letzter echter Handelstag
+        2008-10-30    71.51   Volumen 0   <- ab hier 1.700 Tage identisch
+           …          71.51   Volumen 0
+        2015-08-12  8043.67              <- hier erst kommt ein anderes Papier
+
+    Jede Zeile ist für sich plausibel, die Nachbarn widersprechen sich nicht,
+    der Aktionsfaktor steht still — **alle bestehenden Prüfungen sind dort
+    blind.** Für einen Backtest sind das sieben Jahre mit Rendite null und
+    Volatilität null, und das verzerrt jede Kennzahl: ein Sharpe braucht eine
+    Streuung im Nenner, ein Drawdown eine Bewegung.
+
+    Es ist dieselbe Familie wie die Nullbars (#322), nur mit einer plausiblen
+    Zahl statt einer Null — und dieselbe Antwort: **der Lake stellt „kein
+    Handel" als fehlende Zeile dar; hier wird die schlechtere Schreibweise in
+    die richtige übersetzt.**
+
+    **Die Bedingung ist nicht die Länge, sondern das Volumen.** Über
+    `us_top500_liquid` am 2026-09-08 gemessen, Strecken mit identischem Kurs::
+
+        5-19 Tage    40,7 % der Tage mit Umsatz   -> echter Handel
+        20-99        13,7 %
+        100+          3,9 %                        -> praktisch keiner
+
+    Eine Regel über die Streckenlänge hätte keine Schwelle: die Verteilung
+    läuft stetig durch, jede Grenze wäre gesetzt statt gemessen. Der Umsatz
+    dagegen trennt sauber — ``PTT`` steht 2.467 Tage auf 5,12 mit **null**
+    Umsatz, ``UDS`` 263 Tage mit 30 % Handelstagen und ist echt.
+
+    **Aber `volume = 0` heisst nicht überall „kein Handel".** Bei 25,8 % aller
+    Nulltage bewegt sich der Kurs — dort fehlt schlicht die Angabe::
+
+        AYE   3.945 Nulltage von 4.276 Zeilen (92 %), davon 3.224 MIT Bewegung
+        UPR   2.934 von 3.132 (94 %),  590 mit Bewegung
+
+    Deshalb entscheidet die Reihe über sich selbst: **das Volumen eines
+    Papiers zählt nur, wenn es kein einziges Mal einer Kursbewegung
+    widerspricht.** Ein Feld, das auch nur einmal lügt, taugt nicht als
+    Nachweis — dann weiss man nicht, ob es ausgerechnet an *diesem* Tag lügt.
+    Das trifft 290 der 459 Papiere mit Nulltagen; die übrigen bleiben
+    unangetastet und werden von der `eingefroren`-Invariante gemeldet, statt
+    still behandelt zu werden.
+
+    Kein Schwellenwert, keine Toleranz, keine gesetzte Zahl.
+    """
+    noetig = {"instrument", "close", "volume"}
+    if prices.empty or not noetig <= set(prices.columns):
+        return prices
+
+    raus = pd.Series(False, index=prices.index)
+    je_instrument: dict[str, int] = {}
+    for instrument, teil in prices.groupby("instrument", sort=False):
+        teil = teil.sort_values("date")
+        close = pd.to_numeric(teil["close"], errors="coerce")
+        vol = pd.to_numeric(teil["volume"], errors="coerce")
+        vorher = close.shift(1)
+        # `vol == 0` und nicht `<= 0`: ein fehlender Wert (NaN) ist keine
+        # Aussage über Handel, und `NaN <= 0` wäre ohnehin False.
+        ohne_umsatz = (vol == 0) & vorher.notna() & close.notna()
+        if bool((ohne_umsatz & (close != vorher)).any()):
+            continue  # Das Volumen dieser Reihe trägt nichts — Finger weg.
+        tot = ohne_umsatz & (close == vorher)
+        if bool(tot.any()):
+            raus.loc[teil.index[tot]] = True
+            je_instrument[str(instrument)] = int(tot.sum())
+
+    if not je_instrument:
+        return prices
+
+    log.warning(
+        "%d Instrument(e) mit fortgeschriebenen Kursen — %d Zeilen ohne Umsatz "
+        "und ohne Kursänderung als Lücke gelesen statt als Kurs (#333): %s. "
+        "Wo nicht gehandelt wurde, gibt es keinen Kurs; der Feed wiederholt "
+        "den letzten.",
+        len(je_instrument),
+        sum(je_instrument.values()),
+        ", ".join(f"{i}: {n}" for i, n in sorted(je_instrument.items())[:10]),
+    )
+    return prices.loc[~raus].reset_index(drop=True)
+
+
 def read_instruments(
     instruments: list[str],
     start: date,
@@ -490,6 +576,10 @@ def read_instruments(
 
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
     prices = _nullbars_als_luecke(prices)
+    # **Nach den Nullbars.** Eine Nullzeile ist keine Kursänderung, sondern
+    # gar kein Kurs — stünde sie noch drin, sähe sie hier wie ein
+    # Widerspruch aus und schaltete die Regel für die ganze Reihe ab.
+    prices = _fortgeschriebene_als_luecke(prices)
 
     if not adjust:
         return prices, Adjustment(status="none")

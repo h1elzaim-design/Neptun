@@ -241,6 +241,88 @@ def _kursniveau(teil: pd.DataFrame, instrument: str, code: str) -> list[Befund]:
 MAX_JE_INVARIANTE = 5
 
 
+#: Ab wieviel Tagen mit identischem Kurs eine Strecke gemeldet wird.
+#:
+#: **Gemessen, nicht gesetzt** (2026-09-08, `us_top500_liquid`): Strecken von
+#: 5 bis 19 Tagen tragen an 40,7 % der Tage Umsatz — das ist Handel. Ab 20
+#: Tagen sind es 13,7 %, ab 100 nur noch 3,9 %. Die Zwanzig ist der Punkt, ab
+#: dem die Mehrheit der Strecken tot ist; darunter wäre die Meldung Rauschen.
+#:
+#: Sie ist **kein** Kriterium für Verwerfen — das entscheidet der Umsatz
+#: (`bulk_read._fortgeschriebene_als_luecke`). Hier geht es nur darum, dass
+#: auch die Fälle sichtbar werden, in denen das Volumen als Nachweis nicht
+#: taugt: `PTT` steht 2.467 Tage auf 5,12, und drei widersprüchliche Nulltage
+#: reichen, damit der Lesepfad die Finger davon lässt.
+EINGEFROREN_TAGE = 20
+
+
+def _eingefroren(teil: pd.DataFrame, instrument: str, code: str) -> list[Befund]:
+    """Ein Kurs, der wochenlang steht, ist meist keine Beobachtung (#333).
+
+    **Der Fall.** ``LDG`` steht nach dem Delisting von Longs Drug Stores sieben
+    Jahre auf 71,51, ``PTT`` 2.467 Tage auf 5,12. Jede Zeile ist für sich
+    plausibel, die Nachbarn widersprechen sich nicht, der Aktionsfaktor steht
+    still — alle anderen Prüfungen sind dort blind. Für einen Backtest sind es
+    Jahre mit Rendite null und Volatilität null.
+
+    **Warum das trotzdem nur eine Meldung ist.** Ein illiquides Papier hält
+    seinen Kurs legitim über Wochen: ``UDS`` steht 263 Tage auf 6,02 und
+    handelt an 30 % davon. Verworfen wird deshalb nur, wo der Umsatz es belegt
+    — und das entscheidet der Lesepfad, nicht diese Regel. Was hier gemeldet
+    wird, ist der Rest: Strecken, bei denen das Volumen als Nachweis nicht
+    taugt, weil es anderswo in der Reihe einer Kursbewegung widerspricht.
+
+    ``tage_mit_umsatz`` steht in den Belegen: null heisst „nie gehandelt",
+    ein nennenswerter Anteil heisst „echt und bloss illiquide".
+    """
+    if "close" not in teil.columns or len(teil) < EINGEFROREN_TAGE:
+        return []
+    close = pd.to_numeric(teil["close"], errors="coerce")
+    if not bool(close.notna().any()):
+        return []
+
+    # Zusammenhängende Abschnitte mit identischem Kurs.
+    gruppe = (close != close.shift(1)).cumsum()
+    laenge = gruppe.map(gruppe.value_counts())
+    lang = (laenge >= EINGEFROREN_TAGE) & close.notna()
+    if not bool(lang.any()):
+        return []
+
+    hat_volumen = "volume" in teil.columns
+    volume = pd.to_numeric(teil["volume"], errors="coerce") if hat_volumen else None
+
+    aus: list[Befund] = []
+    for g in gruppe[lang].unique():
+        maske = (gruppe == g) & close.notna()
+        pos = int(np.flatnonzero(maske.to_numpy())[0])
+        tage = int(maske.sum())
+        mit_umsatz = int((volume[maske] > 0).sum()) if hat_volumen else None
+        # **Nur die toten Strecken.** Wo auch nur an einem Tag gehandelt
+        # wurde, ist der stehende Kurs eine Beobachtung — `UDS` hält seinen
+        # Kurs 263 Tage und handelt an 80 davon. Das zu melden wäre Rauschen,
+        # und der nächste echte Befund ginge darin unter (siehe
+        # `data/corrections/README.md`).
+        #
+        # Ohne Volumenspalte gibt es keine Auskunft, also auch keine Meldung:
+        # „unbekannt" ist kein Befund.
+        if mit_umsatz is None or mit_umsatz > 0:
+            continue
+        aus.append(
+            _befund(
+                teil, instrument, code, pos, "eingefroren",
+                close=float(close.iloc[pos]),
+                tage=tage,
+                tage_mit_umsatz=mit_umsatz,
+                fern_von=pd.Timestamp(teil["date"].iloc[pos]).date().isoformat(),
+                fern_bis=pd.Timestamp(
+                    teil["date"].iloc[int(np.flatnonzero(maske.to_numpy())[-1])]
+                ).date().isoformat(),
+                n_zeilen=tage,
+            )
+        )
+    return aus
+
+
 ALLE: tuple[Invariante, ...] = (
     Invariante(
         name="kursniveau",
@@ -257,6 +339,20 @@ ALLE: tuple[Invariante, ...] = (
             "#333 — `DIC` springt im Juli 2010 täglich zwischen 0,67 und 30.000. "
             "Beide Kursspalten tragen denselben Fehler, deshalb ist der "
             "Einheiten-Detektor aus #324 dort blind."
+        ),
+    ),
+    Invariante(
+        name="eingefroren",
+        beschreibung=(
+            "Der Kurs steht über 20 Handelstage oder länger still. Meist ein "
+            "fortgeschriebener Wert nach dem Delisting, manchmal ein echtes "
+            "illiquides Papier — `tage_mit_umsatz` sagt welches."
+        ),
+        pruefen=_eingefroren,
+        anlass=(
+            "#333 — `LDG` steht nach dem Delisting 2008 sieben Jahre auf 71,51, "
+            "`PTT` 2.467 Tage auf 5,12. Der Lesepfad verwirft solche Zeilen nur, "
+            "wo der Umsatz es belegt; gemeldet gehören auch die übrigen."
         ),
     ),
 )
