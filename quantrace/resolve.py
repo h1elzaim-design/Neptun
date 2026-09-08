@@ -232,6 +232,24 @@ DEFAULT_NIVEAU_DEKADEN = 2.0
 #: (siehe ``DEFAULT_GAP_TRADING_DAYS``), aber kein guter.
 DEFAULT_FAKTOR_TOLERANZ = 0.02
 
+#: Wieviele Bars nach einem Kurssprung das neue Niveau halten muss, damit er
+#: als **Instrumentwechsel** zählt und nicht als kaputte Zeile.
+#:
+#: **Warum es diese zweite Bedingung braucht.** Ohne sie zerlegte die Regel am
+#: 2026-09-08 ``DIC`` in 160 Segmente: dort wechselt der Kurs *täglich*
+#: zwischen 0,67 und 30.000, und jeder Wechsel sah aus wie ein Bruch. Über den
+#: ganzen Lake waren es 178 Codes mit mehr als zwanzig Segmenten, ``AAK`` mit
+#: 1.218 — jedes davon eine eigene Partition für ein paar Bars.
+#:
+#: Ein Instrumentwechsel passiert **einmal**. Springt der Kurs zurück, war es
+#: eine kaputte Zeile, und die gehört ins Korrektur-Register, nicht in die
+#: Identität. Das ist dieselbe Unterscheidung, die #324 „Ausschlag gegen
+#: Stufe" nennt — sie fehlte hier zunächst.
+#:
+#: Zwanzig, weil ``DEFAULT_MIN_SEGMENT_BARS`` dieselbe Zahl benutzt: ein
+#: Segment, das kürzer ist, löst ohnehin nichts ab.
+MIN_NIVEAU_BARS = 20
+
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -539,15 +557,71 @@ def _niveaubruch(
         d_close = np.log10(close[1:] / close[:-1])
         d_faktor = np.log10(faktor[1:] / faktor[:-1])
 
-    brueche = (
+    kandidaten = (
         np.isfinite(d_close)
         & np.isfinite(d_faktor)
         & (np.abs(d_close) >= float(niveau_dekaden))
         & (np.abs(d_faktor) < float(faktor_toleranz))
     )
-    # `+1`, weil `d_close[i]` den Schritt von Position i nach i+1 beschreibt:
-    # der Bruch liegt auf der **neuen** Zeile, dort beginnt das nächste Segment.
-    return {int(i) + 1 for i in np.flatnonzero(brueche)}
+    if not kandidaten.any():
+        return set()
+
+    # **Ein Sprung ist erst ein Wechsel, wenn das neue Niveau hält.**
+    #
+    # Das ist die Unterscheidung, die #324 „Ausschlag gegen Stufe" nennt, und
+    # sie fehlte hier zunächst — mit teurer Folge: ``DIC`` wechselt *täglich*
+    # zwischen 0,67 und 30.000, also fand die Regel 160 Brüche und zerlegte
+    # die Reihe in 160 Segmente. Über den ganzen Lake waren es 178 Codes mit
+    # mehr als zwanzig Segmenten, ``AAK`` mit 1.218 (2026-09-08 gemessen).
+    #
+    # Ein Instrumentwechsel passiert **einmal**: davor das eine Papier, danach
+    # das andere. Springt der Kurs am nächsten Tag zurück, war es kein Wechsel,
+    # sondern eine kaputte Zeile — und die gehört ins Korrektur-Register
+    # (`quantrace.befunde`), nicht in die Identität.
+    #
+    # Geprüft wird gegen den Median der folgenden ``MIN_NIVEAU_BARS`` Bars und
+    # nicht gegen den nächsten einzelnen: bei einer Reihe, die alterniert, ist
+    # schon der Nachbar wieder auf der anderen Seite, aber auch eine echte
+    # Neunotierung hat einen zweiten Tag mit Ausreisser.
+    close_ok = np.isfinite(close) & (close > 0)
+    aus: set[int] = set()
+    for i in np.flatnonzero(kandidaten):
+        pos = int(i) + 1  # `d_close[i]` beschreibt den Schritt i → i+1
+        alt_niveau, neu_niveau = close[pos - 1], close[pos]
+        fenster = close[pos + 1 : pos + 1 + MIN_NIVEAU_BARS]
+        maske = close_ok[pos + 1 : pos + 1 + MIN_NIVEAU_BARS]
+        if maske.sum() < 2:
+            # Zu kurz für ein Urteil — dann lieber nicht schneiden. Weglassen
+            # statt erfinden, dieselbe Richtung wie überall hier.
+            continue
+        werte = fenster[maske]
+        # **Springt der Kurs auf das alte Niveau zurück?** Gemessen wird je Bar,
+        # welchem der beiden Niveaus er näher liegt — das ist symmetrisch und
+        # kippt nicht mit der Sprungrichtung. Ein Vergleich gegen den Median des
+        # Fensters wäre es nicht: bei einer alternierenden Reihe liegt der
+        # zwischen den Niveaus, und der Sprung nach oben käme durch.
+        zum_alten = np.abs(np.log10(werte / alt_niveau))
+        zum_neuen = np.abs(np.log10(werte / neu_niveau))
+        if int((zum_alten < zum_neuen).sum()) > 0:
+            continue  # springt zurück — eine kaputte Zeile, kein Wechsel
+
+        # **Und der Blick zurück.** Ohne ihn liest die Regel den *Rücksprung*
+        # nach einem Ausschlag als Wechsel: bei `50 … 50, 0,02, 50 … 50` ist
+        # der Schritt von 0,02 auf 50 vorwärts stabil, und die Reihe zerfiele
+        # an der falschen Stelle. Ein Instrumentwechsel bringt ein Niveau, das
+        # vorher **nicht** da war.
+        davor = close[max(0, pos - 1 - MIN_NIVEAU_BARS) : pos - 1]
+        davor_ok = close_ok[max(0, pos - 1 - MIN_NIVEAU_BARS) : pos - 1]
+        if davor_ok.any():
+            frueher = davor[davor_ok]
+            schon_dagewesen = np.abs(np.log10(frueher / neu_niveau)) < float(
+                niveau_dekaden
+            ) / 2.0
+            if bool(schon_dagewesen.any()):
+                continue
+
+        aus.add(pos)
+    return aus
 
 
 def segment_codes(
