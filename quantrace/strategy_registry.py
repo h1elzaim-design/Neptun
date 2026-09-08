@@ -71,7 +71,16 @@ DEFAULT_GRIDS: dict[str, dict[str, list[Any]]] = {
 # im Ergebnis, damit „geraten" nicht aussieht wie „belegt".
 LOOKBACK_KEYS: dict[str, tuple[str, ...]] = {
     "sma_crossover": ("fast", "slow"),
+    # **EMA-basiert, der Wert ist eine Untergrenze.** `ewm(adjust=False)` ist
+    # ein rekursives Filter ohne endliches Fenster; der Beitrag klingt
+    # exponentiell ab und ist nach ~3 Spans vernachlässigbar, aber nie null.
+    # Der Span ist damit die kleinste vertretbare Zahl, nicht die richtige —
+    # anders als bei `kalman_trend`, wo es überhaupt keinen Span gibt, an dem
+    # man sich festhalten könnte.
     "ema_crossover": ("fast", "slow"),
+    # Dasselbe, und zusätzlich setzt die Signal-EMA auf der langsamen EMA auf:
+    # der effektive Rückgriff ist eher `slow + signal` (≈ 35) als `slow` (26).
+    # Auch hier: Untergrenze, bewusst.
     "macd": ("fast", "slow", "signal"),
     "donchian_breakout": ("entry_period", "exit_period"),
     "atr_breakout": ("lookback",),
@@ -84,7 +93,13 @@ LOOKBACK_KEYS: dict[str, tuple[str, ...]] = {
     # `lookback`, `skip` liegt darin. `top_quantile` ist ein Anteil.
     "momentum_12_1": ("lookback", "skip"),
     "dual_momentum": ("lookback",),
-    "regime_filter": ("trend_lookback", "feature_window"),
+    # **`regime_train_window` gehört dazu, auch wenn es nicht im Grid steht.**
+    # Es ist mit 756 Bars der mit Abstand weiteste Rückgriff (drei Jahre
+    # HMM-Burn-in); ohne es stand hier 200 — eine zu kleine Zahl mit dem
+    # Stempel „deklariert", also schlimmer als ein ehrliches Raten.
+    "regime_filter": ("trend_lookback", "feature_window", "regime_train_window"),
+    # Ausdrücklich leer: kauft und hält, blickt nirgends zurück. Das ist eine
+    # Antwort — deshalb `()` und nicht „kein Eintrag".
     "buy_and_hold": (),
     # **`kalman_trend` fehlt hier mit Absicht.** `_kalman_trend_slope` läuft
     # rekursiv über die ganze Reihe: der Zustand trägt die volle Historie, es
@@ -146,8 +161,10 @@ def build_spec(
         universe=universe,
         timeframe=timeframe,
         params=merged,
-        # Ohne Eintrag bleibt es leer — dann raet `_infer_embargo` und sagt es.
-        lookback_keys=LOOKBACK_KEYS.get(strategy_id, ()),
+        # **`None` bei fehlendem Eintrag, nicht `()`.** Ein leeres Tupel hiesse
+        # „blickt nachweislich nicht zurück" (`buy_and_hold`); wer gar nicht
+        # eingetragen ist, soll den Rateweg samt Warnung bekommen.
+        lookback_keys=LOOKBACK_KEYS.get(strategy_id),
     )
     return sid, spec
 

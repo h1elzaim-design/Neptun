@@ -317,10 +317,12 @@ class StrategySpec(BaseModel):
     #: * Ein Lookback als Float (``halflife: 20.5``) wird verworfen, und der
     #:   OOS-Rand ist undicht — genau der Leak, gegen den das Embargo steht.
     #:
-    #: Leer heisst „nicht deklariert", nicht „kein Lookback": dann greift der
-    #: Rückfall, und das Ergebnis sagt, dass geraten wurde
-    #: (``WalkForwardResult.embargo_source``).
-    lookback_keys: tuple[str, ...] = ()
+    #: **``None`` heisst „nicht deklariert", ein leeres Tupel heisst
+    #: „blickt nachweislich nicht zurück".** Die beiden auseinanderzuhalten ist
+    #: der Punkt: ``buy_and_hold`` braucht kein Embargo und soll dafür keine
+    #: Warnung bekommen, während eine vergessene Deklaration genau eine
+    #: braucht. Ein blosses ``()`` als Vorgabe machte beides ununterscheidbar.
+    lookback_keys: tuple[str, ...] | None = None
     description: str = ""
     risks: list[str] = Field(default_factory=list)
     status: StrategyStatus = StrategyStatus.DRAFT
@@ -558,17 +560,25 @@ class WalkForwardResult(BaseModel):
     #: — zu kurzes Train — werden übersprungen, sonst validierte man gegen ein
     #: Ein-Bar-Fenster.
     n_folds: int
-    #: **Angeforderte** Folds. Steht neben ``n_folds``, statt es zu ersetzen:
-    #: die Webapp und die Tests lesen dort die gerechnete Zahl, und eine still
-    #: geänderte Bedeutung wäre schlimmer als eine fehlende Angabe.
+    #: **Erwartbare** Folds — nicht die angeforderten. Steht neben
+    #: ``n_folds``, statt es zu ersetzen: Webapp und Tests lesen dort die
+    #: gerechnete Zahl, und eine still geänderte Bedeutung wäre schlimmer als
+    #: eine fehlende Angabe.
     #:
-    #: **Warum es die Angabe überhaupt braucht** (#320): dass Folds
-    #: verschwinden dürfen, ist richtig. Dass es niemandem auffällt, ist es
-    #: nicht — eine Validierung über zwei statt sechs Folds ist eine andere
+    #: **Warum „erwartbar" und nicht „angefordert".** ``split_walk_forward``
+    #: beginnt den ersten Fold bei Index 0 — davor liegt kein Train, also
+    #: entfällt er **immer**, unabhängig vom Embargo. Wer ``n_folds=4``
+    #: anfordert, kann höchstens 3 bekommen. Die angeforderte Zahl hier
+    #: abzulegen hiesse, bei jedem Lauf eine Differenz zu melden, die keine
+    #: ist — und ein Signal, das immer angeht, ist keins.
+    #:
+    #: **Warum es die Angabe überhaupt braucht** (#320): dass darüber hinaus
+    #: Folds verschwinden dürfen, ist richtig. Dass es niemandem auffällt, ist
+    #: es nicht — eine Validierung über zwei statt sechs Folds ist eine andere
     #: Aussage, nicht dieselbe mit weniger Zeilen. Gehen die Zahlen
     #: auseinander, war meist das Embargo zu gross.
     #: ``None`` auf Alt-Ergebnissen.
-    n_folds_requested: int | None = None
+    n_folds_expected: int | None = None
     rank_by: str = "sharpe"
     folds: list[FoldResult] = Field(default_factory=list)
 
@@ -580,14 +590,28 @@ class WalkForwardResult(BaseModel):
     #: Wer später fragt „warum sind es zwei Folds statt sechs", findet die
     #: Antwort hier statt im Log von damals. ``None`` auf Alt-Ergebnissen.
     embargo: int | None = None
-    #: Woher das Embargo kam: ``"deklariert"`` (aus
-    #: ``StrategySpec.lookback_keys``), ``"geraten"`` (grösste ganze Zahl im
-    #: ``param_space`` — der Rückfall) oder ``"vorgegeben"`` (Aufrufer).
+    #: Woher das Embargo kam:
+    #:
+    #: ``deklariert``
+    #:     Aus ``StrategySpec.lookback_keys``, und es wurde auch ein Wert
+    #:     gefunden. Nur dann.
+    #: ``kein_lookback``
+    #:     Ausdrücklich als „blickt nicht zurück" deklariert (leeres Tupel) —
+    #:     ``buy_and_hold``. Embargo 0 ist hier die Antwort, nicht ihr Fehlen.
+    #: ``geraten``
+    #:     Der Rückfall: grösste ganze Zahl im ``param_space``. **Auch dann,
+    #:     wenn eine Deklaration existiert, aber nichts hergab** — ein
+    #:     Tippfehler im Schlüssel darf nicht als „belegt" durchgehen.
+    #: ``vorgegeben``
+    #:     Der Aufrufer hat die Zahl gesetzt.
     #:
     #: Der Unterschied ist der Punkt der Angabe: ein geratenes Embargo kann
     #: um Grössenordnungen danebenliegen, und das darf nicht so aussehen wie
-    #: eine belegte Zahl.
-    embargo_source: str | None = None
+    #: eine belegte Zahl. ``Literal`` und nicht ``str``, damit ein Tippfehler
+    #: hier auffällt statt still jede Gleichheitsprüfung scheitern zu lassen.
+    embargo_source: (
+        Literal["deklariert", "kein_lookback", "geraten", "vorgegeben"] | None
+    ) = None
 
     #: Die Annahmen, unter denen ALLE Folds gerechnet wurden — allen voran die
     #: Kosten. Sweeps persistieren sie längst (``runs[].result.config``); hier

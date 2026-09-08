@@ -74,70 +74,107 @@ def _bars(werte: Any) -> list[int]:
     ``use_log: [True, False]`` ein Embargo von einem Bar.
     """
     aus: list[int] = []
-    for x in werte if isinstance(werte, (list, tuple)) else [werte]:
-        if isinstance(x, bool):
+    for x in werte if isinstance(werte, (list, tuple, np.ndarray)) else [werte]:
+        # `bool` ist ein `int`, `np.bool_` ist es nicht — beide raus.
+        if isinstance(x, (bool, np.bool_)):
             continue
-        if isinstance(x, int):
-            aus.append(x)
-        elif isinstance(x, float) and math.isfinite(x):
-            aus.append(math.ceil(x))
+        # **Nicht auf `isinstance(x, int)` prüfen.** `np.int64` ist kein
+        # Python-`int`, `np.float64` dagegen erbt von `float`: eine
+        # Typprüfung liesse ein numpy-Grid stillschweigend durchfallen und
+        # ein numpy-Float durch. Ein Grid aus `np.arange(...)` ergab so
+        # Embargo 0 — mit dem Stempel „deklariert".
+        try:
+            wert = float(x)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(wert):
+            aus.append(math.ceil(wert))
     return aus
 
 
-def _infer_embargo(spec: StrategySpec) -> tuple[int, str]:
+def _raten(raum: dict[str, Any]) -> int:
+    """Der alte Weg: die grösste **ganze** Zahl im Grid.
+
+    Unverändert, damit bestehende Ergebnisse reproduzierbar bleiben. Das
+    Aufrunden von Floats gilt nur dort, wo jemand den Parameter ausdrücklich
+    als Lookback benannt hat — hier wäre es geraten auf geraten.
+    """
+    vals: list[int] = []
+    for v in raum.values():
+        for x in v if isinstance(v, (list, tuple, np.ndarray)) else [v]:
+            if isinstance(x, (bool, np.bool_)):
+                continue
+            try:
+                wert = float(x)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(wert) and wert.is_integer():
+                vals.append(int(wert))
+    return max(vals) if vals else 0
+
+
+def _infer_embargo(spec: StrategySpec) -> tuple[int | None, str]:
     """Wieviele Bars zwischen Train-Ende und OOS-Start — und woher die Zahl kommt.
 
     Ein OOS-Fenster darf einem Indikator mit Lookback ``L`` nicht erlauben,
     Preise aus dem Train-Fenster zu lesen. Das Embargo ist deshalb der längste
     Lookback, den irgendeine gesweepte Konfiguration benutzt.
 
-    **Deklariert, wo möglich** (``spec.lookback_keys``): dann zählen genau die
-    Parameter, die wirklich zurückblicken — auch die festen aus ``params``,
-    denn ein nicht gesweepter Lookback blickt genauso weit zurück.
+    Drei Fälle, und die Unterscheidung ist der ganze Punkt:
 
-    **Geraten als Rückfall**, wie bisher: die grösste ganze Zahl im
-    ``param_space``. Das ist die Heuristik, die #320 aufgedeckt hat. Sie bleibt
-    nur, weil ein fehlendes Embargo schlimmer wäre als ein zu grosses — aber
-    der Aufrufer erfährt die Herkunft und schreibt sie ins Ergebnis. **Geraten
-    darf nicht aussehen wie belegt.**
+    ``lookback_keys is None``
+        Nicht deklariert → geraten, mit Warnung.
+    ``lookback_keys == ()``
+        Ausdrücklich „blickt nicht zurück" (``buy_and_hold``) → Embargo 0,
+        **ohne** Warnung. Das ist eine Antwort, kein Fehlen.
+    ``lookback_keys == (…)``
+        Deklariert. Gefunden wird über ``param_space`` **und** ``params``:
+        ein fester Lookback blickt genauso weit zurück wie ein gesweepter,
+        und ein leerer Grid-Eintrag darf den festen Wert nicht überschatten.
 
-    Gibt ``(bars, quelle)`` zurück.
+    **Und wenn eine Deklaration nichts hergibt, wird geraten — nicht null
+    behauptet.** Ein vertippter Schlüssel, ein leeres Grid, ein Grid aus
+    numpy-Typen: all das ergab in der ersten Fassung ``(0, "deklariert")``,
+    also *auf nichts geraten und als belegt ausgewiesen*. Das war strikt
+    schlechter als der alte Rateweg, der wenigstens sagte, dass er rät.
+
+    Gibt ``(bars, quelle)`` zurück. ``bars`` ist ``None``, wenn sich keine
+    Zahl bestimmen liess — **nicht** 0: „unbekannt" und „braucht keins" sind
+    verschiedene Aussagen, und die Verwechslung der beiden ist in diesem
+    Projekt schon einmal als ``realism 0.00`` aufgeschlagen.
     """
     raum = spec.param_space or {}
     fest = spec.params or {}
 
+    if spec.lookback_keys == ():
+        return 0, "kein_lookback"
+
     if spec.lookback_keys:
         vals: list[int] = []
-        unbekannt = [k for k in spec.lookback_keys if k not in raum and k not in fest]
-        if unbekannt:
-            # Ein Tippfehler in der Deklaration wäre sonst ein stilles Embargo
-            # von 0 — dieselbe Undichtigkeit wie vorher, nur mit Zeremonie.
-            log.warning(
-                "%s: lookback_keys nennt %s, aber weder param_space noch params "
-                "führen das — Tippfehler? Diese Schlüssel tragen nichts bei.",
-                spec.strategy_id,
-                ", ".join(sorted(unbekannt)),
-            )
         for schluessel in spec.lookback_keys:
+            # **Beide Quellen, kein `elif`.** Ein Schlüssel kann im Grid
+            # stehen und dort leer sein (`{"w": []}`), während `params` den
+            # echten Wert trägt.
             if schluessel in raum:
                 vals += _bars(raum[schluessel])
-            elif schluessel in fest:
+            if schluessel in fest:
                 vals += _bars(fest[schluessel])
-        return (max(vals) if vals else 0), "deklariert"
+        if vals:
+            return max(vals), "deklariert"
 
-    geraten_vals: list[int] = []
-    for v in raum.values():
-        # Nur ganze Zahlen — der Rückfall bleibt exakt die alte Regel, damit
-        # bestehende Ergebnisse reproduzierbar sind. Aufrunden gilt nur, wo
-        # jemand den Parameter als Lookback deklariert hat.
-        for x in v if isinstance(v, (list, tuple)) else [v]:
-            if isinstance(x, bool):
-                continue
-            if isinstance(x, int):
-                geraten_vals.append(x)
-            elif isinstance(x, float) and x.is_integer():
-                geraten_vals.append(int(x))
-    geraten = max(geraten_vals) if geraten_vals else 0
+        geraten = _raten(raum)
+        log.warning(
+            "%s: `lookback_keys=%s` ergab keinen einzigen Wert — Tippfehler, "
+            "leeres Grid oder ein Typ, den `_bars` nicht liest? Es wird "
+            "geraten (%d Bars) statt 0 zu behaupten; die Deklaration greift "
+            "hier nicht (#320).",
+            spec.strategy_id,
+            tuple(spec.lookback_keys),
+            geraten,
+        )
+        return (geraten or None), "geraten"
+
+    geraten = _raten(raum)
     if geraten:
         log.warning(
             "%s: Embargo %d Bars **geraten** (grösste Zahl im param_space) — "
@@ -147,19 +184,19 @@ def _infer_embargo(spec: StrategySpec) -> tuple[int, str]:
             spec.strategy_id,
             geraten,
         )
-    else:
-        # **Null ist hier keine Antwort, sondern eine fehlende.** Ohne
-        # Deklaration und ohne ganze Zahl im Grid steht der OOS-Rand ohne
-        # jeden Schutz — `kalman_trend` (`delta: 1e-4`) ist genau dieser Fall.
-        # Ein stilles 0 sähe aus wie „braucht keins".
-        log.warning(
-            "%s: Embargo **0** — die Spec deklariert keine `lookback_keys`, "
-            "und im param_space steht keine ganze Zahl, aus der sich eine "
-            "ableiten liesse. Der OOS-Rand ist damit ungeschützt: rechnet die "
-            "Strategie über ein Fenster, liest sie dort Train-Preise (#320).",
-            spec.strategy_id,
-        )
-    return geraten, "geraten"
+        return geraten, "geraten"
+
+    # **Keine Zahl bestimmbar.** `kalman_trend` (`delta: 1e-4`) ist der Fall.
+    # `None` und nicht 0: der OOS-Rand ist ungeschützt, und das ist etwas
+    # anderes als „braucht keinen Schutz".
+    log.warning(
+        "%s: Embargo **unbestimmbar** — die Spec deklariert keine "
+        "`lookback_keys`, und im param_space steht keine ganze Zahl, aus der "
+        "sich eine ableiten liesse. Gerechnet wird ohne Embargo, der OOS-Rand "
+        "ist damit ungeschützt (#320).",
+        spec.strategy_id,
+    )
+    return None, "geraten"
 
 
 def walk_forward(
@@ -181,10 +218,13 @@ def walk_forward(
         n_folds: Anzahl der Walk-Forward-Epochen.
         train_ratio: Anteil der In-Sample-Daten pro Fold.
         rank_by: Kriterium zur Auswahl der besten In-Sample-Parameter.
-        embargo: Bars zwischen Train-Ende und OOS-Start. ``None`` → aus dem
-            param_space abgeleitet (längster Lookback), damit der OOS-Rand
-            leak-frei ist. Degenerierte Folds (zu kurzes Train) werden
-            übersprungen, ``len(result.folds)`` kann also < ``n_folds`` sein.
+        embargo: Bars zwischen Train-Ende und OOS-Start. ``None`` → abgeleitet
+            aus ``spec.lookback_keys``, ersatzweise geraten (`_infer_embargo`);
+            das Ergebnis trägt Zahl und Herkunft in ``embargo`` /
+            ``embargo_source``, damit Geratenes nicht wie Belegtes aussieht.
+            Der **erste** Fold entfällt immer (kein Train davor), darüber
+            hinaus werden degenerierte Folds übersprungen —
+            ``len(result.folds)`` kann also < ``n_folds - 1`` sein.
         max_workers: Wird an den **inneren** Sweep pro Fold durchgereicht
             (#210). Die Folds selbst laufen weiter nacheinander — sie sind
             wenige (typisch 4–6), das Grid ist die große Zahl, und geschachtelte
@@ -195,13 +235,24 @@ def walk_forward(
     """
     config = config or BacktestConfig()
     if embargo is None:
-        embargo, embargo_quelle = _infer_embargo(spec)
+        embargo_bars, embargo_quelle = _infer_embargo(spec)
     else:
-        embargo_quelle = "vorgegeben"
+        embargo_bars, embargo_quelle = embargo, "vorgegeben"
+    # `None` heisst „unbestimmbar" und wird hier zu 0 **gerechnet**, aber nicht
+    # zu 0 **gespeichert**: der Splitter braucht eine Zahl, das Ergebnis soll
+    # den Unterschied zwischen „kein Embargo nötig" und „keins bestimmbar"
+    # behalten.
+    embargo = 0 if embargo_bars is None else embargo_bars
     splits = split_walk_forward(
         data.frame.index, n_folds=n_folds, train_ratio=train_ratio, embargo=embargo
     )
-    if len(splits) < n_folds:
+    # **Die Basislinie ist `n_folds - 1`, nicht `n_folds`.**
+    # `split_walk_forward` beginnt bei `k=0` mit `test_start_i = 0` — davor
+    # liegt kein Train, also entfällt der erste Fold **immer**, unabhängig vom
+    # Embargo (gemessen: 4 angefordert → 3 Splits, auch bei Embargo 0). Gegen
+    # `n_folds` verglichen feuerte diese Warnung bei jedem einzelnen Lauf und
+    # schob es aufs Embargo; ein Signal, das immer angeht, ist keins.
+    if len(splits) < n_folds - 1:
         # **Nicht nur ins Log.** Dass degenerierte Folds übersprungen werden,
         # ist richtig (der alte Bug war ein Ein-Bar-Train). Dass es niemandem
         # auffällt, ist es nicht: eine Validierung über zwei statt sechs Folds
@@ -401,8 +452,11 @@ def walk_forward(
         strategy_id=spec.strategy_id,
         periods_per_year=float(data.periods_per_year),
         n_folds=len(folds),  # tatsächlich evaluierte Folds (degenerierte übersprungen)
-        n_folds_requested=n_folds,
-        embargo=embargo,
+        # Was der Splitter überhaupt liefern kann — der erste Fold hat per
+        # Konstruktion kein Train davor. `n_folds` roh zu speichern hiesse,
+        # eine Differenz zu behaupten, die es immer gibt.
+        n_folds_expected=max(n_folds - 1, 0),
+        embargo=embargo_bars,
         embargo_source=embargo_quelle,
         rank_by=rank_by,
         folds=folds,

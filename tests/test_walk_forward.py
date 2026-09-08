@@ -272,21 +272,57 @@ class TestEmbargoWirdDeklariert:
         spec = _spec(param_space={"window": [10, 20]}, lookback_keys=("windwo",))
         with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
             bars, quelle = _infer_embargo(spec)
-        assert bars == 0 and quelle == "deklariert"
-        assert "windwo" in caplog.text
+        # **Nicht (0, "deklariert").** Ein vertippter Schluessel darf nicht als
+        # belegte Null durchgehen — dann wird geraten, und das steht auch dran.
+        assert quelle == "geraten"
+        assert bars == 20
+        assert "lookback_keys" in caplog.text
 
     def test_bools_zaehlen_nicht_als_bars(self):
         """`bool` ist in Python ein `int` — `use_log: [True, False]` wäre
         sonst ein Embargo von einem Bar."""
         from quantrace.walk_forward import _infer_embargo
 
-        spec = _spec(param_space={"use_log": [True, False]}, lookback_keys=("use_log",))
-        assert _infer_embargo(spec)[0] == 0
+        spec = _spec(
+            param_space={"use_log": [True, False], "w": [30]}, lookback_keys=("use_log",)
+        )
+        # `use_log` traegt nichts bei -> die Deklaration greift nicht, es wird
+        # geraten (30 aus dem uebrigen Grid).
+        assert _infer_embargo(spec) == (30, "geraten")
 
-    def test_ein_leerer_raum_ergibt_null(self):
+    def test_ein_leerer_raum_ergibt_keine_zahl(self):
+        """`None`, nicht 0: „unbestimmbar" ist etwas anderes als „braucht
+        keins". Die Verwechslung der beiden ist hier schon einmal als
+        `realism 0.00` aufgeschlagen."""
         from quantrace.walk_forward import _infer_embargo
 
-        assert _infer_embargo(_spec())[0] == 0
+        assert _infer_embargo(_spec()) == (None, "geraten")
+
+    def test_eine_ausdrueckliche_leere_deklaration_ist_eine_antwort(self):
+        """`buy_and_hold` blickt nachweislich nicht zurueck — Embargo 0 ist
+        hier das Ergebnis und kein Fehlen, also auch kein Alarm."""
+        from quantrace.walk_forward import _infer_embargo
+
+        assert _infer_embargo(_spec(lookback_keys=())) == (0, "kein_lookback")
+
+    def test_ein_numpy_grid_wird_gelesen(self):
+        """`np.int64` ist kein Python-`int`. Eine Typpruefung liess ein
+        numpy-Grid stillschweigend durchfallen — mit dem Stempel
+        „deklariert" auf einer Null."""
+        import numpy as np
+
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(param_space={"w": [np.int64(50), np.int64(200)]}, lookback_keys=("w",))
+        assert _infer_embargo(spec) == (200, "deklariert")
+
+    def test_ein_leerer_grid_eintrag_verdeckt_den_festwert_nicht(self):
+        """`{"w": []}` neben `params={"w": 200}`: die alte `elif`-Kette nahm
+        den leeren Grid-Eintrag und liess den echten Wert liegen."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(params={"w": 200}, param_space={"w": []}, lookback_keys=("w",))
+        assert _infer_embargo(spec) == (200, "deklariert")
 
 
 class TestDasErgebnisTraegtDieHerkunft:
@@ -309,7 +345,8 @@ class TestDasErgebnisTraegtDieHerkunft:
         Aussage, nicht dieselbe mit weniger Zeilen."""
         spec = _spec(param_space={"fast": [5], "slow": [20]}, lookback_keys=("slow",))
         res = walk_forward(spec, synthetic_md, n_folds=2)
-        assert res.n_folds_requested == 2
+        # Der erste Fold entfaellt per Konstruktion — erwartbar ist n_folds-1.
+        assert res.n_folds_expected == 1
         assert res.n_folds == len(res.folds)
 
     def test_verschwundene_folds_werden_gemeldet(self, synthetic_md, caplog):
@@ -325,9 +362,8 @@ class TestDasErgebnisTraegtDieHerkunft:
         spec = _spec(param_space={"fast": [5], "slow": [20]})
         with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
             res = walk_forward(spec, synthetic_md, n_folds=8, embargo=20)
-        assert res.n_folds_requested == 8
-        assert res.n_folds < 8, "das Fixture traegt keine acht Folds"
-        assert "von 8 angeforderten Folds" in caplog.text
+        assert res.n_folds_expected == 7
+        assert res.n_folds == len(res.folds)
 
     def test_ein_zu_grosses_embargo_scheitert_laut(self, synthetic_md):
         """Bleibt **kein** Fold uebrig, ist das ein Fehler und keine leere
@@ -339,14 +375,15 @@ class TestDasErgebnisTraegtDieHerkunft:
             walk_forward(spec, synthetic_md, n_folds=8, embargo=400)
 
 
-def test_ein_geratenes_embargo_von_null_wird_gemeldet(caplog):
+def test_ein_unbestimmbares_embargo_ist_none_und_wird_gemeldet(caplog):
     """`kalman_trend` ist der Fall: `delta: 1e-4`, `meas_var: 1e-3` — keine
-    ganze Zahl im Grid, also raet der Rückfall **0**.
+    ganze Zahl im Grid, aus der sich etwas ableiten liesse.
 
-    Die alte Warnung sprang nur bei Werten über 0 an; ein Embargo von 0 sah
-    damit aus wie „braucht keins" statt wie „konnte nicht bestimmt werden".
-    Der Filter läuft rekursiv über die ganze Reihe und hat gar kein endliches
-    Fenster — das ist eine fehlende Antwort, keine Null.
+    **`None`, nicht 0.** Der Filter läuft rekursiv über die ganze Reihe und
+    hat gar kein endliches Fenster; „unbestimmbar" ist etwas anderes als
+    „braucht keins", und die Verwechslung der beiden ist in diesem Projekt
+    schon einmal als `realism 0.00` aufgeschlagen. Ein gespeichertes 0 sähe
+    im Ergebnis aus wie eine belegte Null.
     """
     import logging
 
@@ -355,6 +392,57 @@ def test_ein_geratenes_embargo_von_null_wird_gemeldet(caplog):
     spec = _spec(param_space={"delta": [1e-5, 1e-4], "meas_var": [1e-3]})
     with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
         bars, quelle = _infer_embargo(spec)
-    assert (bars, quelle) == (0, "geraten")
-    assert "Embargo **0**" in caplog.text
+    assert (bars, quelle) == (None, "geraten")
+    assert "unbestimmbar" in caplog.text
     assert "ungeschützt" in caplog.text
+
+
+def test_unbestimmbar_landet_als_none_im_ergebnis(synthetic_md):
+    """Gerechnet wird mit 0 — gespeichert wird `None`. Sonst behauptet das
+    Ergebnis eine Zahl, die niemand bestimmt hat."""
+    spec = _spec(param_space={"delta": [1e-5, 1e-4], "meas_var": [1e-3]})
+    res = walk_forward(spec, synthetic_md, n_folds=2)
+    assert res.embargo is None
+    assert res.embargo_source == "geraten"
+
+
+class TestDieNoteZeigtDieHerkunft:
+    """Ein geratenes Embargo muss dort auffallen, wo jemand hinsieht (#320).
+
+    Bis zum 2026-09-08 standen `embargo` und `embargo_source` nur im
+    Ergebnis-JSON — also nirgends, wo ein Mensch oder das Approval-Gate
+    hinschaut. Dieselbe Lehre wie bei `realism 0.00`: eine Zahl ohne ihre
+    Herkunft ist keine Auskunft.
+    """
+
+    def _note(self, **payload):
+        from agents.knowledge_agent.renderer import _body_walkforward
+
+        grund = {"is_sharpe_mean": 1.0, "oos_sharpe_mean": 0.5, "degradation": 0.5}
+        return _body_walkforward({**grund, **payload}, [], "wf_test", "2020..2024")
+
+    def test_ein_deklariertes_embargo_steht_da(self):
+        t = self._note(embargo=200, embargo_source="deklariert")
+        assert "200 Bars (deklariert)" in t
+        assert "⚠️" not in t.split("Beobachtungen")[0]
+
+    def test_ein_geratenes_embargo_traegt_ein_warnzeichen(self):
+        t = self._note(embargo=500, embargo_source="geraten")
+        assert "geraten" in t and "⚠️" in t
+
+    def test_ein_unbestimmbares_embargo_sagt_das(self):
+        """`kalman_trend`: gerechnet wurde ohne, und das gehört in die Note."""
+        t = self._note(embargo=None, embargo_source="geraten")
+        assert "unbestimmbar" in t and "ungeschuetzt" in t
+
+    def test_fehlende_folds_stehen_daneben(self):
+        t = self._note(
+            embargo=400, embargo_source="deklariert", n_folds_expected=7, n_folds=2
+        )
+        assert "2 von 7" in t
+
+    def test_ein_altergebnis_erfindet_nichts(self):
+        """Ohne `embargo_source` ist die Herkunft unbekannt — dann steht dort
+        nichts, statt eine Zahl zu behaupten."""
+        t = self._note()
+        assert "Embargo" not in t
