@@ -184,3 +184,177 @@ def test_walk_forward_not_enough_data(synthetic_md):
 
     with pytest.raises(ValueError, match="Zu wenig Daten"):
         walk_forward(spec, small_md, n_folds=3)
+
+
+# ---------------------------------------------------------------------------
+# Das Embargo: deklariert statt geraten (#320)
+# ---------------------------------------------------------------------------
+
+
+def _spec(**kw) -> StrategySpec:
+    grund = dict(
+        strategy_id="embargo_test",
+        name="Embargo",
+        class_path="strategies.templates.sma_crossover:SmaCrossover",
+        strategy_class="trend_following",
+        universe="us_core_etfs",
+        timeframe=Timeframe.DAILY,
+    )
+    return StrategySpec(**{**grund, **kw})
+
+
+class TestEmbargoWirdDeklariert:
+    """Der Lookback wird deklariert, nicht aus dem Grid geraten (#320).
+
+    **Der Fehler.** `_infer_embargo` nahm die grösste ganze Zahl im
+    `param_space`. Das trifft, solange dort nur Lookbacks stehen, und geht in
+    beide Richtungen schief, sobald etwas anderes dazukommt — und beide
+    Richtungen sind teuer:
+
+    * Zu gross: `n_positions: [10, 50, 500]` ergibt 500 Bars Embargo, zwei
+      Jahre fallen aus jedem Fold, und weil `min_train` mitwächst und
+      degenerierte Folds übersprungen werden, verschwindet die Validierung
+      **still**.
+    * Zu klein: ein Float-Lookback wurde verworfen, das Embargo war 0, und der
+      OOS-Rand las Train-Preise — genau der Leak, gegen den es gebaut ist.
+    """
+
+    def test_ein_grosser_nicht_lookback_erzeugt_kein_embargo(self):
+        """Der Fall aus dem Ticket: `n_positions: 500` ist kein Rückblick."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(
+            param_space={"window": [10, 20], "n_positions": [10, 50, 500]},
+            lookback_keys=("window",),
+        )
+        bars, quelle = _infer_embargo(spec)
+        assert bars == 20, "nur `window` blickt zurück"
+        assert quelle == "deklariert"
+
+    def test_ohne_deklaration_wird_weiter_geraten(self):
+        """Der Rückfall bleibt — ein fehlendes Embargo wäre schlimmer als ein
+        zu grosses. Aber er sagt, dass er geraten hat."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(param_space={"window": [10, 20], "n_positions": [10, 50, 500]})
+        bars, quelle = _infer_embargo(spec)
+        assert bars == 500
+        assert quelle == "geraten"
+
+    def test_ein_float_lookback_ergibt_kein_null_embargo(self):
+        """`halflife: 20.5` kam vorher als *nichts* an. Aufgerundet, weil ein
+        Rückblick von 20,5 Bars bis in den 21. reicht."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(param_space={"halflife": [12.5, 20.5]}, lookback_keys=("halflife",))
+        bars, quelle = _infer_embargo(spec)
+        assert bars == 21
+        assert quelle == "deklariert"
+
+    def test_ein_fester_lookback_zaehlt_auch(self):
+        """Nicht gesweept heisst nicht „blickt nicht zurück"."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(
+            params={"window": 200},
+            param_space={"entry_z": [1.0, 2.0]},
+            lookback_keys=("window",),
+        )
+        assert _infer_embargo(spec)[0] == 200
+
+    def test_ein_tippfehler_in_der_deklaration_wird_gemeldet(self, caplog):
+        """Sonst wäre er ein stilles Embargo von 0 — dieselbe Undichtigkeit
+        wie vorher, nur mit Zeremonie."""
+        import logging
+
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(param_space={"window": [10, 20]}, lookback_keys=("windwo",))
+        with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
+            bars, quelle = _infer_embargo(spec)
+        assert bars == 0 and quelle == "deklariert"
+        assert "windwo" in caplog.text
+
+    def test_bools_zaehlen_nicht_als_bars(self):
+        """`bool` ist in Python ein `int` — `use_log: [True, False]` wäre
+        sonst ein Embargo von einem Bar."""
+        from quantrace.walk_forward import _infer_embargo
+
+        spec = _spec(param_space={"use_log": [True, False]}, lookback_keys=("use_log",))
+        assert _infer_embargo(spec)[0] == 0
+
+    def test_ein_leerer_raum_ergibt_null(self):
+        from quantrace.walk_forward import _infer_embargo
+
+        assert _infer_embargo(_spec())[0] == 0
+
+
+class TestDasErgebnisTraegtDieHerkunft:
+    """Geraten darf nicht aussehen wie belegt (#320)."""
+
+    def test_die_herkunft_steht_im_ergebnis(self, synthetic_md):
+        spec = _spec(param_space={"fast": [5], "slow": [20]}, lookback_keys=("slow",))
+        res = walk_forward(spec, synthetic_md, n_folds=2)
+        assert res.embargo == 20
+        assert res.embargo_source == "deklariert"
+
+    def test_ein_vorgegebenes_embargo_ist_als_solches_kenntlich(self, synthetic_md):
+        spec = _spec(param_space={"fast": [5], "slow": [20]})
+        res = walk_forward(spec, synthetic_md, n_folds=2, embargo=7)
+        assert res.embargo == 7
+        assert res.embargo_source == "vorgegeben"
+
+    def test_angeforderte_und_gerechnete_folds_stehen_beide_da(self, synthetic_md):
+        """Eine Validierung über zwei statt sechs Folds ist eine andere
+        Aussage, nicht dieselbe mit weniger Zeilen."""
+        spec = _spec(param_space={"fast": [5], "slow": [20]}, lookback_keys=("slow",))
+        res = walk_forward(spec, synthetic_md, n_folds=2)
+        assert res.n_folds_requested == 2
+        assert res.n_folds == len(res.folds)
+
+    def test_verschwundene_folds_werden_gemeldet(self, synthetic_md, caplog):
+        """Folds fallen aus, und das stand bisher nirgends.
+
+        Gemessen am Fixture (523 Bars): bei acht angeforderten Folds bleiben
+        sieben — schon bei kleinem Embargo, weil `min_train` mitwächst. Genau
+        diese Sorte Reduktion ist die stille: sie wirft keinen Fehler, sie
+        liefert einfach weniger Validierung.
+        """
+        import logging
+
+        spec = _spec(param_space={"fast": [5], "slow": [20]})
+        with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
+            res = walk_forward(spec, synthetic_md, n_folds=8, embargo=20)
+        assert res.n_folds_requested == 8
+        assert res.n_folds < 8, "das Fixture traegt keine acht Folds"
+        assert "von 8 angeforderten Folds" in caplog.text
+
+    def test_ein_zu_grosses_embargo_scheitert_laut(self, synthetic_md):
+        """Bleibt **kein** Fold uebrig, ist das ein Fehler und keine leere
+        Antwort — sonst saehe „nichts validiert" aus wie „nichts gefunden"."""
+        import pytest as _pytest
+
+        spec = _spec(param_space={"fast": [5], "slow": [20]})
+        with _pytest.raises(ValueError, match="Kein gültiger Walk-Forward-Fold"):
+            walk_forward(spec, synthetic_md, n_folds=8, embargo=400)
+
+
+def test_ein_geratenes_embargo_von_null_wird_gemeldet(caplog):
+    """`kalman_trend` ist der Fall: `delta: 1e-4`, `meas_var: 1e-3` — keine
+    ganze Zahl im Grid, also raet der Rückfall **0**.
+
+    Die alte Warnung sprang nur bei Werten über 0 an; ein Embargo von 0 sah
+    damit aus wie „braucht keins" statt wie „konnte nicht bestimmt werden".
+    Der Filter läuft rekursiv über die ganze Reihe und hat gar kein endliches
+    Fenster — das ist eine fehlende Antwort, keine Null.
+    """
+    import logging
+
+    from quantrace.walk_forward import _infer_embargo
+
+    spec = _spec(param_space={"delta": [1e-5, 1e-4], "meas_var": [1e-3]})
+    with caplog.at_level(logging.WARNING, logger="quantrace.walk_forward"):
+        bars, quelle = _infer_embargo(spec)
+    assert (bars, quelle) == (0, "geraten")
+    assert "Embargo **0**" in caplog.text
+    assert "ungeschützt" in caplog.text

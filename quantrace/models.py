@@ -302,6 +302,25 @@ class StrategySpec(BaseModel):
     timeframe: Timeframe
     params: dict[str, Any] = Field(default_factory=dict)
     param_space: dict[str, list[Any]] = Field(default_factory=dict, description="Für Sweeps")
+    #: Welche Parameter **Bars zurückblicken** — die Angabe, aus der das
+    #: Walk-Forward-Embargo entsteht (#320).
+    #:
+    #: **Warum das deklariert gehört statt geraten.** Ohne die Angabe nimmt
+    #: ``walk_forward._infer_embargo`` die grösste ganze Zahl im
+    #: ``param_space``. Das trifft, solange dort nur Lookbacks stehen, und geht
+    #: in beide Richtungen schief, sobald etwas anderes dazukommt:
+    #:
+    #: * ``n_positions: [10, 50, 500]`` erzeugt ein Embargo von 500 Bars — zwei
+    #:   Jahre, die aus jedem Fold fallen. Weil ``min_train`` mitwächst und
+    #:   degenerierte Folds übersprungen werden, verschwindet ein Teil der
+    #:   Validierung **still**.
+    #: * Ein Lookback als Float (``halflife: 20.5``) wird verworfen, und der
+    #:   OOS-Rand ist undicht — genau der Leak, gegen den das Embargo steht.
+    #:
+    #: Leer heisst „nicht deklariert", nicht „kein Lookback": dann greift der
+    #: Rückfall, und das Ergebnis sagt, dass geraten wurde
+    #: (``WalkForwardResult.embargo_source``).
+    lookback_keys: tuple[str, ...] = ()
     description: str = ""
     risks: list[str] = Field(default_factory=list)
     status: StrategyStatus = StrategyStatus.DRAFT
@@ -535,9 +554,40 @@ class WalkForwardResult(BaseModel):
     strategy_id: str
     #: Siehe BacktestResult.periods_per_year (#184).
     periods_per_year: float = 252.0
+    #: **Tatsächlich gerechnete** Folds (== ``len(folds)``). Degenerierte Folds
+    #: — zu kurzes Train — werden übersprungen, sonst validierte man gegen ein
+    #: Ein-Bar-Fenster.
     n_folds: int
+    #: **Angeforderte** Folds. Steht neben ``n_folds``, statt es zu ersetzen:
+    #: die Webapp und die Tests lesen dort die gerechnete Zahl, und eine still
+    #: geänderte Bedeutung wäre schlimmer als eine fehlende Angabe.
+    #:
+    #: **Warum es die Angabe überhaupt braucht** (#320): dass Folds
+    #: verschwinden dürfen, ist richtig. Dass es niemandem auffällt, ist es
+    #: nicht — eine Validierung über zwei statt sechs Folds ist eine andere
+    #: Aussage, nicht dieselbe mit weniger Zeilen. Gehen die Zahlen
+    #: auseinander, war meist das Embargo zu gross.
+    #: ``None`` auf Alt-Ergebnissen.
+    n_folds_requested: int | None = None
     rank_by: str = "sharpe"
     folds: list[FoldResult] = Field(default_factory=list)
+
+    #: Bars zwischen Train-Ende und OOS-Start.
+    #:
+    #: **Warum die Zahl ins Ergebnis gehört** (#320): sie bestimmt, wieviel
+    #: von jedem Fold überhaupt übrig bleibt, und ein zu grosses Embargo
+    #: lässt Folds verschwinden — leise, weil das Überspringen erlaubt ist.
+    #: Wer später fragt „warum sind es zwei Folds statt sechs", findet die
+    #: Antwort hier statt im Log von damals. ``None`` auf Alt-Ergebnissen.
+    embargo: int | None = None
+    #: Woher das Embargo kam: ``"deklariert"`` (aus
+    #: ``StrategySpec.lookback_keys``), ``"geraten"`` (grösste ganze Zahl im
+    #: ``param_space`` — der Rückfall) oder ``"vorgegeben"`` (Aufrufer).
+    #:
+    #: Der Unterschied ist der Punkt der Angabe: ein geratenes Embargo kann
+    #: um Grössenordnungen danebenliegen, und das darf nicht so aussehen wie
+    #: eine belegte Zahl.
+    embargo_source: str | None = None
 
     #: Die Annahmen, unter denen ALLE Folds gerechnet wurden — allen voran die
     #: Kosten. Sweeps persistieren sie längst (``runs[].result.config``); hier

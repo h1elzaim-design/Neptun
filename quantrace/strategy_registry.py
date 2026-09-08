@@ -53,6 +53,46 @@ DEFAULT_GRIDS: dict[str, dict[str, list[Any]]] = {
     "regime_filter": {"trend_lookback": [50, 100, 200], "feature_window": [21, 63]},
 }
 
+# strategy_id → welche Parameter **Bars zurückblicken** (#320).
+#
+# **Wozu.** Das Walk-Forward-Embargo muss so lang sein wie der längste
+# Lookback, sonst liest ein Indikator am OOS-Rand Train-Preise. Abgeleitet
+# wurde es bisher als *grösste ganze Zahl im Grid* — was trifft, solange dort
+# nur Lookbacks stehen, und in beide Richtungen schiefgeht, sobald etwas
+# anderes dazukommt (`n_positions: 500` → zwei Jahre Embargo; `halflife: 20.5`
+# → gar keins). Hier steht stattdessen, was gemeint ist.
+#
+# **Hinein gehört alles, was in die Vergangenheit greift** — auch der kleinere
+# von zwei Werten. `_infer_embargo` nimmt das Maximum, ein vergessener
+# Schlüssel fällt also nicht auf, solange ein grösserer danebensteht.
+#
+# Wer eine Strategie hinzufügt, trägt sie hier ein. Fehlt der Eintrag, greift
+# der alte Rückfall — mit einer Warnung im Log und `embargo_source="geraten"`
+# im Ergebnis, damit „geraten" nicht aussieht wie „belegt".
+LOOKBACK_KEYS: dict[str, tuple[str, ...]] = {
+    "sma_crossover": ("fast", "slow"),
+    "ema_crossover": ("fast", "slow"),
+    "macd": ("fast", "slow", "signal"),
+    "donchian_breakout": ("entry_period", "exit_period"),
+    "atr_breakout": ("lookback",),
+    "mean_reversion": ("lookback",),
+    "bollinger_bands": ("lookback",),
+    # `entry_rsi`/`exit_rsi` sind Schwellen, keine Fenster. Der Rückfall hätte
+    # hier 200 genommen (`trend_sma`) und damit zufällig richtig gelegen.
+    "rsi_2": ("period", "trend_sma"),
+    # `close.shift(skip) / close.shift(lookback)` — der weiteste Blick ist
+    # `lookback`, `skip` liegt darin. `top_quantile` ist ein Anteil.
+    "momentum_12_1": ("lookback", "skip"),
+    "dual_momentum": ("lookback",),
+    "regime_filter": ("trend_lookback", "feature_window"),
+    "buy_and_hold": (),
+    # **`kalman_trend` fehlt hier mit Absicht.** `_kalman_trend_slope` läuft
+    # rekursiv über die ganze Reihe: der Zustand trägt die volle Historie, es
+    # gibt kein endliches Fenster, das ein Embargo abdecken könnte. Eine
+    # erfundene Zahl wäre schlechter als keine — der Rückfall greift und meldet
+    # das Embargo 0 als das, was es ist: eine fehlende Antwort, keine Null.
+}
+
 # strategy_id → Funktion die einen menschenlesbaren, eindeutigen Slug aus den
 # Params baut. Erhält die historischen Slugs für die zwei Alt-Strategien, damit
 # bestehende Vault-Notes / Result-Files nicht forken.
@@ -106,6 +146,8 @@ def build_spec(
         universe=universe,
         timeframe=timeframe,
         params=merged,
+        # Ohne Eintrag bleibt es leer — dann raet `_infer_embargo` und sagt es.
+        lookback_keys=LOOKBACK_KEYS.get(strategy_id, ()),
     )
     return sid, spec
 
