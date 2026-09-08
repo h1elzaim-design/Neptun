@@ -19,6 +19,7 @@ wird. Lokale Pfade und CI brauchen kein s3fs.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Sequence
@@ -26,6 +27,8 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 DEFAULT_LOCAL_DIR = Path("data/processed")
 
@@ -500,6 +503,57 @@ def duckdb_memory_limit() -> str:
     return gesetzt or DEFAULT_DUCKDB_MEMORY_LIMIT
 
 
+#: Wieviele Threads DuckDB für Lake-Reads nimmt.
+#:
+#: **Warum 32 und nicht die Kernzahl.** Der Default (= CPU-Kerne, auf Heroku
+#: Basic eine Hand voll) bremst hier nichts CPU-Gebundenes — es sind lauter
+#: kleine R2-GETs, einer je Tagespartition. Gemessen über 17 Jahre AAPL:
+#: 3.452 Dateien brauchten ~60 s mit dem Default und ~23 s mit 64 Threads;
+#: 128 hat gehangen (zu viele gleichzeitige Verbindungen). 32 ist die sichere
+#: Seite von diesem Knick.
+DEFAULT_DUCKDB_THREADS = 32
+
+
+def duckdb_threads() -> int:
+    """Threadzahl für Lake-Reads, überschreibbar mit ``QUANTRACE_DUCKDB_THREADS``.
+
+    **Warum das verstellbar sein muss.** Auf einem Server ist die Maschine für
+    den Lauf da; auf einem Arbeitsplatz nicht. Der Rebuild auf „Daddy" läuft
+    Stunden, und in dieser Zeit soll der Rechner benutzbar bleiben — 32
+    Threads plus externer Sort machen ihn zäh, obwohl der Lauf selbst
+    grösstenteils auf das Netz wartet.
+
+    Niedriger heisst langsamer, nicht schlechter: das Ergebnis ist dasselbe,
+    es dauert länger. Genau wie beim Speicherdeckel ist das die richtige
+    Richtung — ein Lauf, der die Maschine unbenutzbar macht, wird abgebrochen,
+    und ein abgebrochener Lauf ist langsamer als jeder gedrosselte.
+
+    Unbrauchbare Werte (keine Zahl, kleiner als 1) fallen auf die Vorgabe
+    zurück, mit einer Zeile im Log — ein Tippfehler in einer Umgebungsvariable
+    soll den Lauf nicht kippen.
+    """
+    roh = os.environ.get("QUANTRACE_DUCKDB_THREADS", "").strip()
+    if not roh:
+        return DEFAULT_DUCKDB_THREADS
+    try:
+        n = int(roh)
+    except ValueError:
+        log.warning(
+            "QUANTRACE_DUCKDB_THREADS=%r ist keine Zahl — Vorgabe %d gilt.",
+            roh,
+            DEFAULT_DUCKDB_THREADS,
+        )
+        return DEFAULT_DUCKDB_THREADS
+    if n < 1:
+        log.warning(
+            "QUANTRACE_DUCKDB_THREADS=%d ist kleiner als 1 — Vorgabe %d gilt.",
+            n,
+            DEFAULT_DUCKDB_THREADS,
+        )
+        return DEFAULT_DUCKDB_THREADS
+    return n
+
+
 def _duckdb_conn():  # pragma: no cover - dünner Adapter
     import duckdb
 
@@ -537,13 +591,7 @@ def _duckdb_conn():  # pragma: no cover - dünner Adapter
             con.execute(f"SET s3_access_key_id={_sql_literal(ak)};")
         if sk:
             con.execute(f"SET s3_secret_access_key={_sql_literal(sk)};")
-        # Der Default (= CPU-Kerne, auf Heroku Basic nur eine Hand voll) bremst
-        # nichts CPU-Gebundenes hier — es sind lauter kleine R2-GETs, eins je
-        # Tagespartition. Gemessen (#Actions-Read über 17 Jahre AAPL):
-        # 3.452 Dateien brauchten ~60s mit dem Default und ~23s mit 64 Threads;
-        # 128 hat gehangen (zu viele gleichzeitige Verbindungen). 32 ist die
-        # sichere Seite von diesem Knick.
-        con.execute("SET threads=32;")
+        con.execute(f"SET threads={duckdb_threads()};")
     return con
 
 
