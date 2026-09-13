@@ -656,27 +656,45 @@ def segment_codes(
 
     df = calendar.sort_values(["code", "exchange", "date"]).reset_index(drop=True)
     rang = {d: i for i, d in enumerate(sorted(set(df["date"])))}
-    grenze = int(gap_trading_days)
     out: list[Segment] = []
 
+    grenze = int(gap_trading_days)
     for (code, exchange), teil in df.groupby(["code", "exchange"], sort=True):
         teil = teil.reset_index(drop=True)
-        niveau = _niveaubruch(teil, niveau_dekaden)
         dates = list(teil["date"])
-        start = dates[0]
-        prev = dates[0]
-        n = 1
-        index = 1
-        for pos, d in enumerate(dates[1:], start=1):
-            if rang[d] - rang[prev] > grenze or pos in niveau:
-                out.append(Segment(str(code), str(exchange), index, start, prev, n))
-                index += 1
-                start = d
-                n = 0
-            prev = d
-            n += 1
-        out.append(Segment(str(code), str(exchange), index, start, prev, n))
+        nr = [rang[d] for d in dates]
+        luecken = {p for p in range(1, len(dates)) if nr[p] - nr[p - 1] > grenze}
+        out.extend(
+            _zerschneide(
+                str(code), str(exchange), dates, luecken | _niveaubruch(teil, niveau_dekaden)
+            )
+        )
     return out
+
+
+def _zerschneide(
+    code: str, exchange: str, dates: Sequence[date], schnitte: Iterable[int]
+) -> list[Segment]:
+    """Die Segmente **eines** Codes aus seinen Schnittpositionen.
+
+    Geschnitten wird *vor* jeder Position in ``schnitte`` — dort beginnt das
+    nächste Segment. Greifen Lückenregel und Niveaubruch an derselben Stelle,
+    ist es **ein** Schnitt.
+
+    Gemeinsam für ``segment_codes`` und ``segments_from_lake`` (#340): bis dahin
+    rechnete der Vollscan die Schnitte in SQL nach — mit einer Regel, die hinter
+    der pandas-Fassung zurückblieb.
+    """
+    grenzen = [0, *sorted({p for p in schnitte if 0 < p < len(dates)}), len(dates)]
+    return [
+        Segment(code, exchange, i + 1, _als_datum(dates[a]), _als_datum(dates[b - 1]), b - a)
+        for i, (a, b) in enumerate(zip(grenzen, grenzen[1:], strict=False))
+    ]
+
+
+def _als_datum(wert) -> date:
+    """``datetime64`` aus dem Vollscan oder ``date`` aus dem Kalender — als ``date``."""
+    return wert if type(wert) is date else pd.Timestamp(wert).date()
 
 
 def segments_from_lake(
@@ -684,6 +702,7 @@ def segments_from_lake(
     gap_trading_days: int = DEFAULT_GAP_TRADING_DAYS,
     limit_days: int | None = None,
     niveau_dekaden: float = DEFAULT_NIVEAU_DEKADEN,
+    melde: Callable[[str], None] | None = None,
 ) -> list[Segment]:
     """Dieselben Segmente wie ``segment_codes``, aber ohne den Kalender im RAM.
 
@@ -698,9 +717,33 @@ def segments_from_lake(
 
     ``segment_codes`` bleibt: es ist die pure Fassung über einen Frame, an der
     die Regeln testbar sind (der BBBY-Fall als Fixture). Dass beide dasselbe
-    liefern, prüft ``test_resolve_roundtrip`` gegen einen echten kleinen Lake —
-    zwei Implementierungen ohne Gleichheitsbeweis wären zwei Wahrheiten.
+    liefern, prüft ``tests/test_resolve_zwei_fassungen.py`` gegen einen echten
+    kleinen Lake — zwei Implementierungen ohne Gleichheitsbeweis wären zwei
+    Wahrheiten.
+
+    **Genau das ist passiert (#340).** Bis 2026-09-13 stand die
+    Niveaubruch-Regel hier als eigene SQL-Fassung, und der Fix aus `132823c`
+    („das neue Niveau muss halten") landete nur in ``_niveaubruch``. Der
+    angebliche Gleichheitstest enthielt keine alternierende Reihe. Seitdem
+    markiert SQL nur **Kandidaten**, und entschieden wird in ``_niveaubruch`` —
+    eine Regel, eine Stelle.
+
+    **Zwei Abfragen, nicht eine.** Die erste Fassung des Fixes gab die
+    Kursreihen der Kandidaten-Codes gleich in derselben Abfrage mit
+    (`list(close ORDER BY date)`). Dafür mussten Kurs, Faktor und Tagesnummer
+    für *alle* ~100 Mio. Zeilen durch beide Fensteroperatoren, dazu kam ein
+    drittes Fenster. Am 2026-09-13 gegen den echten Lake: nach 3 h 9 min und
+    161 GB Auslagerung abgebrochen, wo der alte Aufbau eine Stunde brauchte.
+    Jetzt bleibt die erste Abfrage so schmal wie vorher, und die zweite liest
+    nur die Zeilen der Kandidaten-Codes.
+
+    ``melde`` bekommt je Phase eine Zeile (Dauer, Mengen) — der Vollscan läuft
+    sonst stundenlang ohne jedes Lebenszeichen.
     """
+    def _sag(text: str) -> None:
+        if melde is not None:
+            melde(text)
+
     if not storage.list_day_partitions(US_EQUITY_PREFIX):
         return []
 
@@ -751,72 +794,202 @@ def segments_from_lake(
                 SELECT q.code, q.exchange, q.date, q.close, q.adj, l.tag_nr
                 FROM quelle q JOIN lake_tage l ON q.date = l.date
             ),
-            brueche AS (
+            markiert AS (
                 SELECT code, exchange, date,
-                       CASE
-                           -- Regel 1: eine lange Lücke.
-                           WHEN tag_nr - lag(tag_nr) OVER w
-                                > {int(gap_trading_days)}
-                           THEN 1
-                           -- Regel 3: ein Niveaubruch. Der Kurs springt um
-                           -- Grössenordnungen, und der Aktionsfaktor
-                           -- `adjusted_close / close` steht dabei still — also
-                           -- ist es kein Split, sondern ein anderes Papier
-                           -- unter demselben Kürzel. `_niveaubruch` rechnet
-                           -- dieselbe Regel in pandas; dass beide Fassungen
-                           -- dasselbe liefern, prüft `test_resolve_roundtrip`.
-                           WHEN close > 0 AND adj > 0
-                                AND lag(close) OVER w > 0
-                                AND lag(adj) OVER w > 0
-                                AND abs(log10(close / lag(close) OVER w))
-                                    >= {float(niveau_dekaden)}
-                                AND abs(log10(
-                                        (adj / close)
-                                        / (lag(adj) OVER w / lag(close) OVER w)
-                                    )) < {float(DEFAULT_FAKTOR_TOLERANZ)}
-                           THEN 1
-                           ELSE 0
-                       END AS bruch
+                       -- Regel 1: eine lange Lücke.
+                       CASE WHEN tag_nr - lag(tag_nr) OVER w > {int(gap_trading_days)}
+                            THEN 1 ELSE 0 END AS luecke,
+                       -- Regel 3, **nur als Kandidat**: der Kurs springt um
+                       -- Grössenordnungen, und der Aktionsfaktor
+                       -- `adjusted_close / close` steht dabei still. Ob daraus
+                       -- ein Schnitt wird, entscheidet `_niveaubruch` — dort
+                       -- stehen die Bedingungen, die sich in SQL nicht
+                       -- vernünftig schreiben lassen (hält das neue Niveau?
+                       -- war es schon da?). Bis #340 schnitt dieser Ausdruck
+                       -- selbst, und `AAK` zerfiel in 1.218 Segmente.
+                       CASE WHEN close > 0 AND adj > 0
+                                 AND lag(close) OVER w > 0
+                                 AND lag(adj) OVER w > 0
+                                 AND abs(log10(close / lag(close) OVER w))
+                                     >= {float(niveau_dekaden)}
+                                 AND abs(log10(
+                                         (adj / close)
+                                         / (lag(adj) OVER w / lag(close) OVER w)
+                                     )) < {float(DEFAULT_FAKTOR_TOLERANZ)}
+                            THEN 1 ELSE 0 END AS kandidat
                 FROM tage
                 WINDOW w AS (PARTITION BY code, exchange ORDER BY date)
             ),
             nummeriert AS (
-                SELECT code, exchange, date,
-                       SUM(bruch) OVER (
+                SELECT code, exchange, date, kandidat,
+                       SUM(luecke) OVER (
                            PARTITION BY code, exchange ORDER BY date
                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                        ) AS segment
-                FROM brueche
+                FROM markiert
             )
             SELECT code, exchange, segment,
-                   min(date) AS first, max(date) AS last, count(*) AS n_bars
+                   min(date) AS first, max(date) AS last, count(*) AS n_bars,
+                   max(kandidat) AS kandidat
             FROM nummeriert
             GROUP BY code, exchange, segment
             ORDER BY code, exchange, segment
         """
+        t0 = time.monotonic()
         df = con.execute(sql).df()
+        _sag(
+            f"  Segmentgrenzen: {len(df):,} Lückensegmente in "
+            f"{(time.monotonic() - t0) / 60:.1f} min".replace(",", ".")
+        )
+        if df.empty:
+            return []
+
+        # **Zweite Abfrage: nur die Codes mit Niveau-Kandidaten.** Registriert
+        # als Tabelle und gejoint statt als `IN (…)`-Liste — es können einige
+        # tausend sein.
+        kandidaten = df.loc[df["kandidat"] == 1, ["code", "exchange"]].drop_duplicates()
+        reihen = pd.DataFrame(columns=["code", "exchange", "date", "close", "adjusted_close"])
+        if not kandidaten.empty:
+            t0 = time.monotonic()
+            con.register("kandidaten", kandidaten)
+            reihen = con.execute(
+                f"""
+                SELECT p.code,
+                       COALESCE(NULLIF(TRIM(p.exchange_short_name), ''), 'US') AS exchange,
+                       p.date,
+                       max(p.close) AS close,
+                       max(p.adjusted_close) AS adjusted_close
+                FROM read_parquet('{glob}', hive_partitioning=true) p
+                JOIN kandidaten k
+                  ON p.code = k.code
+                 AND COALESCE(NULLIF(TRIM(p.exchange_short_name), ''), 'US') = k.exchange
+                WHERE p.code IS NOT NULL {bis_klausel}
+                GROUP BY 1, 2, 3
+                ORDER BY 1, 2, 3
+                """
+            ).df()
+            # **Schmal halten.** Am 2026-09-13 aus der alten Karte geschätzt:
+            # ~4.900 Codes mit ~11,6 Mio. Zeilen. Als Python-Strings und
+            # `date`-Objekte wären das mehrere GB; als Kategorie und
+            # `datetime64` ein Bruchteil.
+            reihen["code"] = reihen["code"].astype("category")
+            reihen["exchange"] = reihen["exchange"].astype("category")
+            reihen["date"] = pd.to_datetime(reihen["date"])
+            _sag(
+                f"  Niveau-Kandidaten: {len(kandidaten):,} Codes, {len(reihen):,} Zeilen "
+                f"nachgelesen in {(time.monotonic() - t0) / 60:.1f} min".replace(",", ".")
+            )
     finally:
         con.close()
 
-    if df.empty:
-        return []
+    t0 = time.monotonic()
+    out, n_niveau = _segmente_zusammensetzen(df, reihen, niveau_dekaden)
+    if not reihen.empty:
+        _sag(
+            f"  Niveaubruch entschieden: {n_niveau:,} Schnitte bestätigt in "
+            f"{time.monotonic() - t0:.0f} s".replace(",", ".")
+        )
+    return out
 
+
+def _segmente_zusammensetzen(
+    grenzen_df: pd.DataFrame, reihen: pd.DataFrame, niveau_dekaden: float
+) -> tuple[list[Segment], int]:
+    """Aus beiden Abfragen des Vollscans die Segmente — ohne Lake testbar.
+
+    ``grenzen_df`` ist die erste Abfrage (je Lückensegment ``first``, ``last``,
+    ``n_bars``, ``kandidat``), ``reihen`` die zweite (Kurse der Codes mit
+    Kandidaten). Gibt die Segmente und die Zahl der bestätigten Niveauschnitte
+    zurück.
+
+    Eigene Funktion, weil sie auf dem echten Lake ~11,6 Mio. Zeilen verarbeitet
+    und das messbar sein soll, ohne eine Stunde zu scannen.
+    """
+    df = grenzen_df.copy()
     df["first"] = pd.to_datetime(df["first"]).dt.date
     df["last"] = pd.to_datetime(df["last"]).dt.date
-    return [
-        Segment(
-            code=str(r.code),
-            exchange=str(r.exchange),
-            # `segment` zählt ab 0, `Segment.index` ab 1 — dieselbe Konvention
-            # wie `segment_codes`, sonst hießen dieselben Segmente in beiden
-            # Fassungen anders (`code.BBBY.US.s1` vs. `…s0`).
-            index=int(r.segment) + 1,
-            first=r.first,
-            last=r.last,
-            n_bars=int(r.n_bars),
+    kandidaten = df.loc[df["kandidat"] == 1, ["code", "exchange"]].drop_duplicates()
+    mit_kandidat = set(zip(kandidaten["code"], kandidaten["exchange"], strict=True))
+
+    out: list[Segment] = []
+    for r in df.itertuples(index=False):
+        if (r.code, r.exchange) in mit_kandidat:
+            continue
+        out.append(
+            Segment(
+                code=str(r.code),
+                exchange=str(r.exchange),
+                # `segment` zählt ab 0, `Segment.index` ab 1 — dieselbe
+                # Konvention wie `segment_codes`, sonst hießen dieselben
+                # Segmente in beiden Fassungen anders (`…s1` vs. `…s0`).
+                index=int(r.segment) + 1,
+                first=r.first,
+                last=r.last,
+                n_bars=int(r.n_bars),
+            )
         )
-        for r in df.itertuples(index=False)
+    if not mit_kandidat:
+        return out, 0
+
+    # **Codes mit Niveau-Kandidaten: dieselbe Entscheidung wie `segment_codes`.**
+    # Die ganze Reihe geht an `_niveaubruch`, weil die Regel über Lücken hinweg
+    # vor- und zurückblickt — genau wie in der pandas-Fassung. Die Lückenschnitte
+    # kommen aus der ersten Abfrage; dass beide Abfragen dieselben Zeilen sahen,
+    # wird geprüft statt angenommen.
+    ist_kandidat = [
+        (c, e) in mit_kandidat for c, e in zip(df["code"], df["exchange"], strict=True)
     ]
+    grenzen_je_code = {
+        (str(c), str(e)): teil.sort_values("segment")
+        for (c, e), teil in df[ist_kandidat].groupby(["code", "exchange"], sort=False)
+    }
+    gesehen: set[tuple[str, str]] = set()
+    n_niveau = 0
+    for (code, exchange), teil in reihen.groupby(
+        ["code", "exchange"], sort=False, observed=True
+    ):
+        schluessel = (str(code), str(exchange))
+        gesehen.add(schluessel)
+        teil = teil.reset_index(drop=True)
+        dates = teil["date"].to_numpy()
+        grenzen = grenzen_je_code[schluessel]
+
+        luecken: set[int] = set()
+        pos = 0
+        for g in grenzen.itertuples(index=False):
+            ende = pos + int(g.n_bars)
+            if (
+                ende > len(dates)
+                or _als_datum(dates[pos]) != g.first
+                or _als_datum(dates[ende - 1]) != g.last
+            ):
+                raise RuntimeError(
+                    f"Schicht 1 hat sich zwischen den beiden Abfragen verändert: {code} "
+                    f"Segment {int(g.segment) + 1} erwartet {int(g.n_bars)} Bars "
+                    f"{g.first} … {g.last}. Läuft ein Ladelauf? Karte nicht geschrieben."
+                )
+            if pos:
+                luecken.add(pos)
+            pos = ende
+        if pos != len(dates):
+            raise RuntimeError(
+                f"Schicht 1 hat sich zwischen den beiden Abfragen verändert: {code} "
+                f"trägt {len(dates)} Zeilen, die Segmentgrenzen {pos}. Karte nicht geschrieben."
+            )
+
+        niveau = _niveaubruch(teil, niveau_dekaden)
+        n_niveau += len(niveau - luecken)
+        out.extend(_zerschneide(schluessel[0], schluessel[1], dates, luecken | niveau))
+
+    fehlend = mit_kandidat - gesehen
+    if fehlend:
+        raise RuntimeError(
+            f"{len(fehlend)} Kandidaten-Codes ohne Zeilen in der zweiten Abfrage "
+            f"(z. B. {sorted(fehlend)[:3]}). Karte nicht geschrieben."
+        )
+
+    out.sort(key=lambda s: (s.code, s.exchange, s.index))
+    return out, n_niveau
 
 
 def _isin_candidate(code: str) -> str | None:
@@ -854,6 +1027,15 @@ def segments_incremental(
     Beide sitzen aber in ``build_identity_map``, und die läuft über die
     **vollständige** Segmentliste, also auch inkrementell über alles. Sie
     bewertet jedes Mal neu. Fortgeschrieben wird nur die Segmentierung.
+
+    **Niveaubrüche kennt die Fortschreibung nicht** (#340) — und das ist eine
+    Grenze der Form, keine Nachlässigkeit. Ob ein Sprung ein Wechsel ist,
+    entscheidet ``_niveaubruch`` erst mit ``MIN_NIVEAU_BARS`` Bars *danach*: ein
+    Sprung kurz vor dem alten Stand war damals „zu kurz für ein Urteil" und
+    wäre es heute nicht mehr. Die Fortschreibung müsste also schon geschriebene
+    Segmente nachträglich schneiden. Wer Instrumentwechsel ohne Lücke erkennen
+    will, braucht den Vollscan; ``test_resolve_inkrementell`` hält die
+    Abweichung als ``xfail`` fest.
 
     **Die Bezugsgröße der Lücken sind Lake-Handelstage**, nicht Kalendertage und
     nicht Partitionen: ein leeres Parquet ist eine Partition ohne Handelstag.
@@ -1448,19 +1630,49 @@ def codes_mit_eindeutiger_identitaet(*, manifest: pd.DataFrame | None = None) ->
 #: Instrument-Partitionen schreiben.
 MATERIALISE_LOCK_PATH = f"{RESOLVED_PREFIX}/_materialise.lock.json"
 
-#: Ab wann eine Sperre als verwaist gilt. Der laengste gemessene Lauf brauchte
-#: 2.192 Sekunden (2.027 Instrumente, 2026-09-02); zwei Stunden lassen Raum
-#: fuer einen `--all`-Lauf, ohne dass eine Sperre nach einem Absturz ewig
-#: stehen bleibt.
-MATERIALISE_LOCK_STALE_S = 7200
+#: Ab wann eine Sperre als verwaist gilt — gemessen am **letzten
+#: Lebenszeichen**, nicht am Start (#339).
+#:
+#: Bis 2026-09-13 stand hier „zwei Stunden ab `seit`", begründet mit dem
+#: längsten Lauf von 2.192 Sekunden. Ein `--all` über 151.828 Instrumente
+#: dauert aber 13 Stunden und mehr. Am 2026-09-09 um 01:12 UTC hielt die
+#: Nightly Manos zehn Stunden alte Sperre deshalb für verwaist, obwohl der
+#: Lauf schrieb, räumte 5.730 Partitionen und scheiterte dann selbst.
+#:
+#: Mit Lebenszeichen alle ``MATERIALISE_LOCK_HEARTBEAT_S`` sind 30 Minuten
+#: sechs verpasste Pulse — ein toter Lauf blockiert nicht lange, ein
+#: lebender nie.
+MATERIALISE_LOCK_STALE_S = 1800
+
+#: Wie oft ein laufender Lauf seine Sperre erneuert. DuckDB gibt den GIL
+#: während einer Abfrage frei (2026-09-13 gemessen: 133 Pulse in 13 s
+#: Abfrage, grösste Lücke 0,1 s) — der Puls läuft also auch mitten im `COPY`.
+MATERIALISE_LOCK_HEARTBEAT_S = 300
 
 
 class MaterialiseLockedError(RuntimeError):
     """Ein anderer Lauf schreibt gerade Kursdateien."""
 
 
+def _sperre_lesen(pfad: str) -> dict | None:
+    """Die Sperre als dict, ``None`` wenn keine da ist, ``{}`` wenn unlesbar."""
+    import json
+
+    if not storage.exists(pfad):
+        return None
+    try:
+        halter = json.loads(storage._read_text(pfad))
+    except Exception:  # noqa: BLE001 - eine kaputte Sperre ist keine Sperre
+        return {}
+    return halter if isinstance(halter, dict) else {}
+
+
 @contextmanager
-def materialise_lock(*, stale_after_s: int = MATERIALISE_LOCK_STALE_S):
+def materialise_lock(
+    *,
+    stale_after_s: float = MATERIALISE_LOCK_STALE_S,
+    heartbeat_s: float = MATERIALISE_LOCK_HEARTBEAT_S,
+):
     """Sperre gegen zwei gleichzeitige Materialisierungslaeufe.
 
     **Warum es sie gibt.** `materialise` raeumt die Zielpartitionen vor dem
@@ -1480,50 +1692,114 @@ def materialise_lock(*, stale_after_s: int = MATERIALISE_LOCK_STALE_S):
     der real vorkommt — ein zweiter Lauf, waehrend der erste noch arbeitet —
     und sagt dann, **wer** sperrt und seit wann. Das ist der Unterschied
     zwischen einem stillen Datenschaden und einer Fehlermeldung.
+
+    **Zwei Regeln seit #339**, beide aus der Nacht auf den 2026-09-09:
+
+    * **Verwaist ist, wer schweigt, nicht wer lange läuft.** Ein Puls erneuert
+      ``lebt`` alle ``heartbeat_s``; gealtert wird ab dort. Eine Sperre ohne
+      ``lebt`` (ältere Fassung) altert weiter ab ``seit``.
+    * **Weg ist nicht übernommen.** Die Nightly hatte Manos Sperre
+      überschrieben und die Datei am Ende gelöscht — ab da lief sein Lauf ohne
+      jede Sperre weiter. Findet der Puls die Sperre nicht mehr, setzt er sie
+      neu. Trägt sie ein fremdes ``token``, kämpft er nicht darum, sondern
+      meldet es; und aufgeräumt wird nur die eigene.
     """
     import json
     import os
     import socket
+    import threading
+    import uuid
     from datetime import datetime, timezone
 
     pfad = storage.cache_path(MATERIALISE_LOCK_PATH)
-    if storage.exists(pfad):
+    halter = _sperre_lesen(pfad)
+    if halter is not None:
         try:
-            halter = json.loads(storage._read_text(pfad))
-            seit = datetime.fromisoformat(halter["seit"])
-            alter = (datetime.now(timezone.utc) - seit).total_seconds()
+            bezug = datetime.fromisoformat(halter.get("lebt") or halter["seit"])
+            alter = (datetime.now(timezone.utc) - bezug).total_seconds()
         except Exception:  # noqa: BLE001 - eine kaputte Sperre ist keine Sperre
-            halter, alter = {}, stale_after_s + 1
+            alter = stale_after_s + 1
         if alter <= stale_after_s:
             raise MaterialiseLockedError(
                 f"Ein anderer Lauf materialisiert seit {halter.get('seit', '?')} "
-                f"({halter.get('host', '?')}, PID {halter.get('pid', '?')}). "
+                f"({halter.get('host', '?')}, PID {halter.get('pid', '?')}, "
+                f"letztes Lebenszeichen vor {alter:.0f} s). "
                 f"Zwei gleichzeitige Laeufe erzeugen doppelte Zeitstempel — siehe "
                 f"#311. Warten, oder die Sperre loeschen, wenn der Lauf tot ist: "
                 f"{MATERIALISE_LOCK_PATH}"
             )
         log.warning(
-            "Verwaiste Materialisierungs-Sperre (%.0f s alt) wird uebergangen.", alter
+            "Verwaiste Materialisierungs-Sperre (%s, PID %s, %.0f s ohne Lebenszeichen) "
+            "wird uebergangen.",
+            halter.get("host", "?"),
+            halter.get("pid", "?"),
+            alter,
         )
 
-    storage._write_text(
-        pfad,
-        json.dumps(
-            {
-                "host": socket.gethostname(),
-                "pid": os.getpid(),
-                "seit": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-        ),
-    )
+    jetzt = datetime.now(timezone.utc)
+    eigene = {
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "seit": jetzt.isoformat(timespec="seconds"),
+        "lebt": jetzt.isoformat(),
+        "token": uuid.uuid4().hex,
+    }
+    storage._write_text(pfad, json.dumps(eigene))
+
+    stopp = threading.Event()
+    # Hält den Puls an, solange er schreibt — sonst könnte er die Sperre nach
+    # dem Aufräumen neu anlegen.
+    schreibt = threading.Lock()
+
+    def _puls() -> None:
+        while not stopp.wait(heartbeat_s):
+            with schreibt:
+                if stopp.is_set():
+                    return
+                try:
+                    aktuell = _sperre_lesen(pfad)
+                    if aktuell is None:
+                        log.warning(
+                            "Materialisierungs-Sperre war verschwunden, obwohl dieser Lauf "
+                            "noch schreibt — neu gesetzt."
+                        )
+                    elif aktuell.get("token") != eigene["token"]:
+                        # Übernommen — nicht zurückerobern. Wer die Sperre
+                        # übergangen hat, schreibt jetzt; ein Kampf um die
+                        # Datei machte es nur schlimmer.
+                        log.error(
+                            "Materialisierungs-Sperre gehoert nicht mehr diesem Lauf "
+                            "(jetzt: %s, PID %s) — ein zweiter Lauf schreibt vermutlich mit.",
+                            (aktuell or {}).get("host", "?"),
+                            (aktuell or {}).get("pid", "?"),
+                        )
+                        return
+                    eigene["lebt"] = datetime.now(timezone.utc).isoformat()
+                    storage._write_text(pfad, json.dumps(eigene))
+                except Exception as exc:  # noqa: BLE001 - ein Aussetzer ist kein Abbruch
+                    log.warning("Lebenszeichen der Sperre nicht geschrieben: %s", exc)
+
+    puls = threading.Thread(target=_puls, name="materialise-lock-puls", daemon=True)
+    puls.start()
     try:
         yield
     finally:
+        with schreibt:
+            stopp.set()
+        puls.join(timeout=60)
         # **Auch nach einem Fehler.** Eine Sperre, die einen Absturz
         # ueberlebt, blockiert die naechste Nacht — und der Betreiber sieht nur
-        # eine Kette, die nichts tut.
+        # eine Kette, die nichts tut. **Aber nur die eigene.**
         try:
-            storage.delete_tree(pfad)
+            aktuell = _sperre_lesen(pfad)
+            if aktuell is not None and aktuell.get("token") == eigene["token"]:
+                storage.delete_tree(pfad)
+            elif aktuell is not None:
+                log.warning(
+                    "Materialisierungs-Sperre gehoert inzwischen %s (PID %s) — bleibt stehen.",
+                    aktuell.get("host", "?"),
+                    aktuell.get("pid", "?"),
+                )
         except Exception:  # noqa: BLE001 - der Lauf ist wichtiger als sein Aufraeumen
             log.warning("Materialisierungs-Sperre liess sich nicht loeschen: %s", pfad)
 
