@@ -37,3 +37,15 @@ def synthetic_md() -> MarketData:
         provider="synthetic",
         frame=combined,
     )
+
+
+@pytest.fixture(autouse=True)
+def _api_prozess_darf_pumpen(monkeypatch):
+    """Tests laufen als API-Prozess, auch wenn ein Test ``worker.main`` importiert.
+
+    ``worker/main.py`` setzt beim Import ``QUANTRACE_QUEUE_PUMPE=0`` — der Worker
+    ist die Spur, nicht ihr Dispatcher (#335). In einer Testsitzung ist das ein
+    Prozess für alles; ohne diese Zeile hinge, ob die Schlange pumpt, davon ab,
+    welcher Test vorher den Worker importiert hat.
+    """
+    monkeypatch.setenv("QUANTRACE_QUEUE_PUMPE", "1")

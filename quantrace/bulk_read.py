@@ -826,7 +826,7 @@ def _apply_actions(
                 # **Entschiedenes hat Vorrang vor Automatik.** Ein Eintrag in
                 # `data/corrections/` ist von jemandem angesehen worden; die
                 # Klassifikation ist es nicht.
-                schlecht = (k["art"] == AUSSCHLAG).to_numpy()
+                schlecht = (k["art"] == AUSSCHLAG).to_numpy(copy=True)
                 # **Woher eine verworfene Zeile kommt, gehört in die Meldung.**
                 # Sonst steht dort „auf falscher Stückzahl (#324)" über Zeilen,
                 # die ein Mensch im Register entschieden hat — und die Suche

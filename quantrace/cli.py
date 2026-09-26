@@ -131,6 +131,24 @@ def _coverage_melden(md: MarketData) -> None:
             console.print(f"[dim]  … und {len(md.unusable_symbols) - 5} weitere[/dim]")
 
 
+def _herkunft(universe: str, cfg: dict, md: MarketData):
+    """Der Herkunftsstempel dieses Laufs (#342).
+
+    **Nach dem Laden, vor dem Rechnen.** Dann beschreibt er den Stand, der
+    gelesen wurde — nicht den, der nach einem stundenlangen Sweep zufällig
+    daliegt. Die Symbolliste ist die deklarierte, nicht die geladene: eine
+    Korrektur zu einem Papier, das dieses Mal verworfen wurde, betrifft den
+    Lauf trotzdem, weil sie ihn beim nächsten Mal anders ausgehen liesse.
+    """
+    from quantrace import herkunft
+
+    return herkunft.stempel(
+        universe=universe,
+        symbole=[str(s) for s in (cfg.get("symbols") or [])],
+        provider=md.provider,
+    )
+
+
 @app.command()
 def fetch(
     universe: str = typer.Option(..., help="Name in data/universes/*.yaml"),
@@ -215,7 +233,9 @@ def backtest(
     else:
         params = _legacy_params(strategy, fast, slow, lookback, entry_z, exit_z)
     strategy_id, spec = _resolve_spec(strategy, graph_spec, universe, cfg, params)
+    stempel = _herkunft(universe, cfg, md)
     result = run_backtest(spec, md, _backtest_config(cost_model, capital_model, delisting_return))
+    result = result.model_copy(update={"gerechnet_mit": stempel})
 
     # Attach regime-conditioned performance metrics while equity_curve is in memory.
     if result.equity_curve is not None:
@@ -302,6 +322,7 @@ def sweep(
         param_space = _default_param_space(strategy)
 
     spec = spec.model_copy(update={"param_space": param_space})
+    stempel = _herkunft(universe, cfg, md)
 
     console.print(
         f"[bold]Sweep:[/bold] {label} × {sum(1 for _ in __import__('itertools').product(*param_space.values()))}"
@@ -316,6 +337,7 @@ def sweep(
         # 0 heißt „entscheide selbst" — Typer kennt kein optionales int ohne Wert.
         max_workers=workers or None,
     )
+    result = result.model_copy(update={"gerechnet_mit": stempel})
 
     _print_sweep_result(result)
 
@@ -483,6 +505,7 @@ def walkforward(
         param_space = _default_param_space(strategy)
 
     spec = spec.model_copy(update={"param_space": param_space})
+    stempel = _herkunft(universe, cfg, md)
 
     console.print(
         f"[bold]Walk-Forward:[/bold] {label} über {folds} Folds (train={train_ratio:.0%})"
@@ -497,6 +520,7 @@ def walkforward(
         rank_by=rank_by,
         max_workers=workers or None,
     )
+    result = result.model_copy(update={"gerechnet_mit": stempel})
 
     _print_walkforward_result(result)
 
@@ -994,6 +1018,13 @@ _ERLAUBTES_PREFIX = ("python", "-m", "quantrace")
 #: Requests kostet.
 HEARTBEAT_SEKUNDEN = 300.0
 
+#: Wohin die drei Rechenbefehle ihr JSON schreiben — die Vorgaben von ``--out``.
+_AUSGABE_JE_BEFEHL: dict[str, str] = {
+    "backtest": "backtests/results",
+    "sweep": "backtests/sweeps",
+    "walkforward": "backtests/walkforward",
+}
+
 
 @app.command("run-local")
 def run_local(
@@ -1019,9 +1050,11 @@ def run_local(
     import os
     import shlex
     import subprocess
+    import time
 
     import httpx
 
+    from quantrace import herkunft
     from quantrace.local_env import load_local_env
 
     basis = api_url.rstrip("/")
@@ -1090,6 +1123,7 @@ def run_local(
     # Außerhalb des Clients: der Lauf dauert Minuten bis Stunden, und eine
     # offene Verbindung so lange zu halten hat keinen Zweck. Stattdessen alle
     # `HEARTBEAT_SEKUNDEN` eine kurze Meldung — siehe unten, warum.
+    gestartet = time.time()
     prozess = subprocess.Popen(cmd, cwd=str(Path.cwd()))
     verwaist = False
     while True:
@@ -1113,7 +1147,14 @@ def run_local(
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         if rc == 0:
-            melden(client, status="done")
+            # Der Stempel aus dem Ergebnis-JSON — derselbe, der in der Note
+            # steht (#342). Der Ausgabeordner folgt aus dem Unterbefehl; die
+            # Befehle vom Server setzen kein `--out`.
+            ordner = _AUSGABE_JE_BEFEHL.get(cmd[3] if len(cmd) > 3 else "", "")
+            stempel = (
+                herkunft.aus_neuen_ergebnissen(Path.cwd() / ordner, gestartet) if ordner else None
+            )
+            melden(client, status="done", provenance=stempel)
             console.print("[green]Fertig — das Ergebnis steht in der Webapp.")
         else:
             melden(

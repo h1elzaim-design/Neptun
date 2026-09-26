@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from quantrace.calendars import DEFAULT_CALENDAR, get_calendar
 from quantrace.calendars import periods_per_year as _ppy
+from quantrace.herkunft import Herkunft
 from quantrace.vault_layout import DEFAULT_PURPOSE, Purpose, note_path
 
 if TYPE_CHECKING:
@@ -436,6 +437,31 @@ class BacktestConfig(BaseModel):
             "look-ahead. Set 0 only for signals already lagged upstream."
         ),
     )
+    #: Risikofreier Zins — **gegen 0**, für Sharpe *und* Cash (#316, Befund 4).
+    #:
+    #: Sharpe ist ``μ/σ·√P`` ohne Abzug, und vectorbt verzinst unangelegtes
+    #: Kapital nicht. Beides stimmt, solange man es weiss, und beides verzerrt
+    #: über 2000–2026 *regimeabhängig*: bei 5 % Zins sieht dieselbe Strategie um
+    #: ``rf/σ`` besser aus, eine defensive verliert den Zinsertrag, den sie real
+    #: gehabt hätte.
+    #:
+    #: **Warum ein Feld, das nur einen Wert kennt.** Bis hierher stand die
+    #: Annahme im Docstring von ``annualised_sharpe`` und nirgends sonst — ein
+    #: Ergebnis-JSON sagte nicht, wogegen seine Sharpe gemessen war. Jetzt trägt
+    #: es sie. Ein anderer Wert ist nicht implementiert und wird **abgelehnt**,
+    #: statt still ignoriert zu werden: eine Zahl im JSON, mit der nicht
+    #: gerechnet wurde, wäre genau die Drift aus #317.
+    #:
+    #: Wer die Zinsreihe einbaut (FRED DGS3MO), macht daraus eine Reihe und
+    #: kennzeichnet alte Ergebnisse über den Vorgabewert — sie sind dann als
+    #: „gegen 0" erkennbar.
+    risk_free_rate: Literal[0.0] = Field(
+        0.0,
+        description=(
+            "Risikofreier Zins p.a. für Sharpe-Überschuss und Cash-Verzinsung. "
+            "Implementiert ist nur 0: Sharpe gegen 0, Cash unverzinst."
+        ),
+    )
 
 
 class TradeMetrics(BaseModel):
@@ -494,6 +520,11 @@ class BacktestResult(BaseModel):
     #: gehalten hat, und *unbekannt* ist nicht *vollständig*: die Leser
     #: unterscheiden beide Fälle.
     coverage: DataCoverage | None = None
+
+    #: Womit gerechnet wurde — Code, Lake-Stand, Korrekturen, Universum,
+    #: Rechner (#342). ``None`` auf Alt-Ergebnissen und auf Läufen in einem
+    #: Sweep: dort steht der Stempel einmal oben auf dem Sweep.
+    gerechnet_mit: Herkunft | None = None
 
     # Rohartefakte (optional, nicht serialisiert in JSON)
     equity_curve: Any | None = Field(default=None, exclude=True)  # pd.Series — lazy
@@ -627,6 +658,8 @@ class WalkForwardResult(BaseModel):
     #: schneiden das, was da war. Ob das, was da war, dem entsprach, was
     #: angefordert wurde, steht nur hier.
     coverage: DataCoverage | None = None
+    #: Womit gerechnet wurde (#342). Siehe ``BacktestResult.gerechnet_mit``.
+    gerechnet_mit: Herkunft | None = None
 
     # Aggregierte Metriken
     is_sharpe_mean: float = Field(0.0, description="Durchschnitt Sharpe In-Sample")

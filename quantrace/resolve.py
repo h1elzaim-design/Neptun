@@ -1888,6 +1888,48 @@ def _materialise_unlocked(rows, karte, glob, ziel, ab) -> int:
     con = storage._duckdb_conn()
     try:
         con.register("identitaet", karte)
+        _kopieren(con, glob, ziel, ab, rows)
+    finally:
+        con.close()
+
+    # Was wirklich entstanden ist, sagt der Lake — nicht die Absicht. Bei
+    # einem Instrument ohne passende Kurszeile schreibt DuckDB keine Partition.
+    _drop_materialised_cache()
+    return len(materialised_keys() & {r["instrument"] for r in rows})
+
+
+class MaterialiseUnvollstaendigError(RuntimeError):
+    """Das ``COPY`` ist gescheitert, nachdem die Zielpartitionen geräumt waren.
+
+    **Der Rückweg aus #339, Punkt 3.** Räumen vor dem Schreiben ist richtig
+    (#311, ``code.BP.US.s1``), aber stirbt das ``COPY`` danach, bleiben Löcher —
+    am 2026-09-09 so bei 5.730 Instrumenten, ausgelöst von einem R2-Timeout.
+    Die Löcher selbst lassen sich hier nicht vermeiden, ohne jede Datei doppelt
+    zu schreiben (Staging plus Server-Kopie, ~146.000 Kopien für ``--all``).
+    Was sich vermeiden lässt, ist, dass niemand es merkt: die Meldung nennt die
+    Zahl und den Befehl, der genau diese Instrumente zurückholt.
+    """
+
+    def __init__(self, fehlen: list[str] | None, gesamt: int, ursache: BaseException) -> None:
+        self.fehlen = fehlen
+        self.ursache = ursache
+
+        def _zahl(n: int) -> str:
+            return f"{n:,}".replace(",", ".")
+
+        wie_viele = "unbekannt viele" if fehlen is None else _zahl(len(fehlen))
+        super().__init__(
+            f"Das COPY ist abgebrochen ({type(ursache).__name__}: {ursache}). "
+            f"{wie_viele} von {_zahl(gesamt)} Instrumenten sind geräumt, aber nicht "
+            "neu geschrieben. Rückweg: scripts/build_resolved.py --from-manifest "
+            "--fehlende — schreibt genau die Instrumente der Karte, denen die "
+            "Kursdatei fehlt."
+        )
+
+
+def _kopieren(con, glob: str, ziel: str, ab: str, rows) -> None:
+    """Das ``COPY`` — und wenn es scheitert, die Bilanz der Löcher."""
+    try:
         con.execute(
             f"""
             COPY (
@@ -1908,13 +1950,20 @@ def _materialise_unlocked(rows, karte, glob, ziel, ab) -> int:
             (FORMAT PARQUET, PARTITION_BY (instrument), OVERWRITE_OR_IGNORE)
             """
         )
-    finally:
-        con.close()
-
-    # Was wirklich entstanden ist, sagt der Lake — nicht die Absicht. Bei
-    # einem Instrument ohne passende Kurszeile schreibt DuckDB keine Partition.
-    _drop_materialised_cache()
-    return len(materialised_keys() & {r["instrument"] for r in rows})
+    except Exception as exc:
+        _drop_materialised_cache()
+        try:
+            da = materialised_keys()
+            fehlen: list[str] | None = [
+                str(r["instrument"]) for r in rows if r["instrument"] not in da
+            ]
+        except Exception:  # noqa: BLE001 - die Bilanz darf die Ursache nicht verdecken
+            fehlen = None
+        log.error(
+            "materialise: COPY gescheitert, %s Instrumente ohne Kursdatei",
+            "?" if fehlen is None else len(fehlen),
+        )
+        raise MaterialiseUnvollstaendigError(fehlen, len(rows), exc) from exc
 
 
 @dataclass(frozen=True)

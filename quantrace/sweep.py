@@ -25,6 +25,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from quantrace.backtest_runner import run_backtest
+from quantrace.herkunft import Herkunft
 from quantrace.models import (
     BacktestConfig,
     BacktestResult,
@@ -163,6 +164,9 @@ class SweepResult(BaseModel):
     #: MarketData, und ein gekapptes Fenster kappt jede Kombination gleich.
     #: ``None`` auf Ergebnissen von vor der Einführung.
     coverage: DataCoverage | None = None
+    #: Womit gerechnet wurde (#342) — einmal für den ganzen Sweep, aus
+    #: demselben Grund wie ``coverage``: alle Kombinationen lesen dasselbe.
+    gerechnet_mit: Herkunft | None = None
     # Statistical discipline of the selection, computed at sweep time from the
     # in-memory return paths (exact — no summary-statistics fallback needed):
     # - best_n_obs: T behind the winner (drives the Mertens SE downstream)
