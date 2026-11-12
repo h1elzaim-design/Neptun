@@ -62,6 +62,8 @@ SUBUNITS: dict[str, tuple[str, float]] = {
     "GBp": ("GBP", 0.01),
     "ZAC": ("ZAR", 0.01),
     "ILA": ("ILS", 0.01),
+    # Ein Tausendstel, nicht ein Hundertstel: 1 Kuwait-Dinar sind 1.000 Fils.
+    "KWF": ("KWD", 0.001),
 }
 
 #: So viele führende Zeichen des Firmennamens müssen übereinstimmen.

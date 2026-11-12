@@ -208,7 +208,7 @@ _HANDLER: dict[str, tuple[str, dict[str, Any], Callable[..., Any]]] = {
                 "needs_data": {
                     "type": "array",
                     "items": _STR,
-                    "description": "Schlüssel aus platform_capabilities.data, z.B. 'eod_prices'",
+                    "description": "Schlüssel aus platform_capabilities.data, z.B. 'daily_prices'",
                 },
                 "needs_nodes": {
                     "type": "array",

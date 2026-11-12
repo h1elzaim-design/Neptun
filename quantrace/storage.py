@@ -356,15 +356,52 @@ def delete_tree(path: str) -> int:
     return n
 
 
-def read_parquet(path: str) -> pd.DataFrame:
+def read_parquet(path: str, columns: Sequence[str] | None = None) -> pd.DataFrame:
     # partitioning=None: paths like raw/symbol=TLT/data.parquet would otherwise
     # trigger pandas' automatic hive-partition inference (symbol →
     # dictionary<int32>), which collides with a leftover categorical `symbol`
     # column (dictionary<int8>) in files written by older fetch versions:
     # "ArrowTypeError: Unable to merge: Field symbol has incompatible types".
     if path.startswith("s3://"):
-        return pd.read_parquet(path, storage_options=_s3_storage_options(), partitioning=None)
-    return pd.read_parquet(path, partitioning=None)
+        return pd.read_parquet(
+            path, columns=columns, storage_options=_s3_storage_options(), partitioning=None
+        )
+    return pd.read_parquet(path, columns=columns, partitioning=None)
+
+
+def read_arrow(path: str):
+    """Parquet als ``pyarrow.Table``, ohne den Umweg über pandas.
+
+    Für Dateien mit viel Text: pandas legt je String ein Python-Objekt an, und ein
+    Polymarket-Tag brauchte so 1,8 GB statt der rund 0,5 GB in Arrow.
+    """
+    import pyarrow.parquet as pq
+
+    if path.startswith("s3://"):
+        import fsspec
+
+        with fsspec.open(path, "rb", **_s3_storage_options()) as fh:
+            return pq.read_table(fh, partitioning=None)
+    return pq.read_table(path, partitioning=None)
+
+
+def count_parquet_rows(path: str) -> int:
+    """Zählt die Zeilen und dekodiert dabei wirklich jede Seite.
+
+    Nur den Footer zu lesen bewiese nicht, dass die Daten dahinter lesbar sind.
+    Stückweise, damit die Prüfung nicht so viel Speicher braucht wie die Datei selbst.
+    """
+    import pyarrow.parquet as pq
+
+    def zaehle(quelle) -> int:
+        return sum(b.num_rows for b in pq.ParquetFile(quelle).iter_batches(batch_size=10_000))
+
+    if path.startswith("s3://"):
+        import fsspec
+
+        with fsspec.open(path, "rb", **_s3_storage_options()) as fh:
+            return zaehle(fh)
+    return zaehle(path)
 
 
 def write_parquet(df: pd.DataFrame, path: str) -> None:
@@ -445,6 +482,26 @@ def _write_text(path: str, text: str) -> None:
         return
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(text)
+
+
+def write_bytes(path: str, daten: bytes) -> None:
+    """Fertige Bytes schreiben, etwa ein selbst serialisiertes Parquet.
+
+    Lokal über eine Zwischendatei: ein abgebrochener Lauf hinterlässt keine halbe
+    ``.parquet``, die ein Leser später für vollständig hält. Ein S3-PUT ist von
+    sich aus atomar.
+    """
+    if path.startswith("s3://"):
+        import fsspec
+
+        with fsspec.open(path, "wb", **_s3_storage_options()) as fh:
+            fh.write(daten)
+        return
+    ziel = Path(path)
+    ziel.parent.mkdir(parents=True, exist_ok=True)
+    zwischen = ziel.with_name(ziel.name + ".tmp")
+    zwischen.write_bytes(daten)
+    zwischen.replace(ziel)
 
 
 def read_coverage(symbol: str) -> tuple[date, date] | None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -291,3 +292,19 @@ class TestKeineAuskunftUeberDenBestand:
         antwort = json.loads(tools.call("assess_feasibility", {"needs_data": ["optionsflow"]}))
         assert antwort["feasible"] is False
         assert antwort["missing_data"] == ["optionsflow"]
+
+
+def test_die_beispiele_in_den_beschreibungen_gibt_es_wirklich():
+    """Die Beschreibung nannte `eod_prices`, und genau das lehnte der Server ab.
+
+    Ein aufrufendes Modell übernimmt so ein Beispiel wörtlich. Aufgefallen ist es erst
+    in einer echten Sitzung über das SDK.
+    """
+    from quantrace.mcp_server import tools
+
+    eigenschaften = tools.registry()["assess_feasibility"].parameters["properties"]
+    daten = re.search(r"'(\w+)'", eigenschaften["needs_data"]["description"]).group(1)
+    knoten = re.search(r"'([\w.]+)'", eigenschaften["needs_nodes"]["description"]).group(1)
+    urteil = json.loads(tools.call("assess_feasibility", {"needs_data": [daten], "needs_nodes": [knoten]}))
+    assert urteil["missing_data"] == []
+    assert urteil["missing_nodes"] == []

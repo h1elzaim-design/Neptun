@@ -54,6 +54,26 @@ This generates synthetic price data in-memory, runs an SMA-crossover backtest
 through the real engine, and prints the metrics. It proves the whole pipeline
 works on a fresh clone with zero configuration.
 
+## Use it from an agent (MCP)
+
+Neptun includes an [MCP](https://modelcontextprotocol.io) server, so Claude or any other
+MCP client can ask what the engine can do and check an idea before anything is computed.
+
+```bash
+pip install -e ".[mcp]"
+claude mcp add neptun -- "$(pwd)/.venv/bin/python" -m quantrace.mcp_server
+```
+
+| Tool | What it answers |
+|------|-----------------|
+| `platform_capabilities` | Which building blocks and data classes exist |
+| `assess_feasibility` | Can this idea be computed with the history *you* have? |
+| `list_graph_nodes` | The typed signal blocks a strategy can be built from |
+| `validate_graph_strategy` | Does a strategy graph compile? Nothing is executed |
+
+What is callable is listed in `callable_manifest.yaml`. Without that file nothing is.
+Running backtests over MCP is not part of this version.
+
 ## Real data quickstart
 
 ```bash
